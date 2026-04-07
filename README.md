@@ -198,6 +198,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Setlist Builder](https://github.com/byrongamatos/slopsmith-plugin-setlist) | Create ordered playlists with sequential playback | `git clone ...slopsmith-plugin-setlist.git setlist` |
 | [Metronome](https://github.com/byrongamatos/slopsmith-plugin-metronome) | Audible click and visual beat flash synced to song tempo | `git clone ...slopsmith-plugin-metronome.git metronome` |
 | [Tone Player](https://github.com/byrongamatos/slopsmith-plugin-tones) | View amp/pedal/cab signal chains with Rocksmith gear artwork | `git clone ...slopsmith-plugin-tones.git tones` |
+| [Fretboard View](https://github.com/byrongamatos/slopsmith-plugin-fretboard) | Live fretboard overlay showing active notes in real-time | `git clone ...slopsmith-plugin-fretboard.git fretboard` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 
