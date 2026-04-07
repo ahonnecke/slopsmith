@@ -16,6 +16,8 @@ const highway = (() => {
     let anchors = [];
     let chordTemplates = [];
     let lyrics = [];
+    let toneChanges = [];
+    let toneBase = "";
     let ready = false;
     let showLyrics = true;
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
@@ -837,7 +839,7 @@ const highway = (() => {
             this.resize();
             window.addEventListener('resize', () => this.resize());
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = [];
+            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
         },
 
         resize() {
@@ -891,6 +893,7 @@ const highway = (() => {
                         break;
                     case 'chord_templates': chordTemplates = msg.data; break;
                     case 'lyrics': lyrics = msg.data; break;
+                    case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
                     case 'notes': notes = notes.concat(msg.data); break;
                     case 'chords': chords = chords.concat(msg.data); break;
                     case 'ready':
@@ -927,6 +930,8 @@ const highway = (() => {
         getTime() { return currentTime; },
         getNotes() { return notes; },
         getChords() { return chords; },
+        getToneChanges() { return toneChanges; },
+        getToneBase() { return toneBase; },
         addDrawHook(fn) { _drawHooks.push(fn); },
 
         toggleLyrics() {
@@ -944,7 +949,7 @@ const highway = (() => {
             // Close old WS but keep audio + animation running
             if (ws) { ws.close(); ws = null; }
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = [];
+            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);

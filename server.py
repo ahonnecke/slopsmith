@@ -932,6 +932,36 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         if lyrics:
             await websocket.send_json({"type": "lyrics", "data": lyrics})
 
+        # Send tone changes
+        tone_changes = []
+        for xml_path in sorted(Path(tmp).rglob("*.xml")):
+            try:
+                root = ET.parse(xml_path).getroot()
+                if root.tag != "song":
+                    continue
+                tones_el = root.find("tones")
+                if tones_el is not None:
+                    for t in tones_el.findall("tone"):
+                        tc_time = t.get("time")
+                        tc_name = t.get("name", "")
+                        if tc_time and tc_name:
+                            tone_changes.append({
+                                "t": round(float(tc_time), 3),
+                                "name": tc_name,
+                            })
+                    if tone_changes:
+                        # Also send the base tone
+                        tonebase = root.find("tonebase")
+                        base_name = tonebase.text if tonebase is not None and tonebase.text else ""
+                        await websocket.send_json({
+                            "type": "tone_changes",
+                            "base": base_name,
+                            "data": sorted(tone_changes, key=lambda x: x["t"]),
+                        })
+                        break
+            except Exception:
+                pass
+
         # Send notes in chunks
         notes = []
         for n in arr.notes:
