@@ -553,8 +553,8 @@ async function playSong(filename, arrangement) {
     currentFilename = filename;
     showScreen('player');
 
-    // Small delay to ensure player screen is visible before init
-    await new Promise(r => setTimeout(r, 50));
+    // Wait for previous WebSocket to fully close before opening new one
+    await new Promise(r => setTimeout(r, 500));
     highway.init(document.getElementById('highway'));
 
     const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
