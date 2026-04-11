@@ -210,6 +210,8 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [MIDI Capo](https://github.com/masc0t/slopsmith-plugin-midi-capo) | MIDI capo control for real-time transposition | `git clone ...slopsmith-plugin-midi-capo.git midi_capo` |
 | [Note Detection](https://github.com/byrongamatos/slopsmith-plugin-notedetect) | Real-time pitch detection and scoring against highway notes | `git clone ...slopsmith-plugin-notedetect.git note_detect` |
 | [Find More CDLC](https://github.com/masc0t/slopsmith-plugin-find-more) | Search for more CDLC by the same artist | `git clone ...slopsmith-plugin-find-more.git find_more` |
+| [Piano Highway](https://github.com/byrongamatos/slopsmith-plugin-piano) | Scrolling piano/keyboard view for Keys arrangements with MIDI input | `git clone ...slopsmith-plugin-piano.git piano` |
+| [Studio](https://github.com/byrongamatos/slopsmith-plugin-studio) | Collaborative band recording and multi-track mixing | `git clone ...slopsmith-plugin-studio.git studio` |
 | [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
