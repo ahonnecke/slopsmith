@@ -2,7 +2,7 @@
  * Canvas-based Rocksmith highway renderer.
  * Receives note data via WebSocket, renders on requestAnimationFrame.
  */
-const highway = (() => {
+function createHighway() {
     let canvas, ctx, ws;
     let currentTime = 0;
     let animFrame = null;
@@ -22,6 +22,8 @@ const highway = (() => {
     let showLyrics = true;
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
+    let _inverted = localStorage.getItem('invertHighway') === 'true';
+    function si(s) { return _inverted ? 5 - s : s; }  // string index mapper for inversion
 
     // Rendering config
     const VISIBLE_SECONDS = 3.0;
@@ -203,7 +205,8 @@ const highway = (() => {
         const strBot = H * 0.95;
         const margin = W * 0.03;
         for (let i = 0; i < 6; i++) {
-            const y = strBot - (i / 5) * (strBot - strTop);
+            const yi = _inverted ? 5 - i : i;
+            const y = strTop + (yi / 5) * (strBot - strTop);
             ctx.strokeStyle = STRING_COLORS[i];
             ctx.lineWidth = 3;
             ctx.beginPath();
@@ -577,7 +580,7 @@ const highway = (() => {
             const p = project(ch.t - currentTime);
             if (!p) continue;
 
-            const sorted = [...ch.notes].sort((a, b) => a.s - b.s);
+            const sorted = [...ch.notes].sort((a, b) => _inverted ? b.s - a.s : a.s - b.s);
             const sz = Math.max(10, 28 * p.scale * (H / 900));
             const spread = sz * 0.85;
             const totalH = spread * (sorted.length - 1);
@@ -863,6 +866,9 @@ const highway = (() => {
 
         getRenderScale() { return _renderScale; },
 
+        getInverted() { return _inverted; },
+        setInverted(v) { _inverted = v; localStorage.setItem('invertHighway', v); },
+
         connect(wsUrl) {
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
@@ -1034,4 +1040,5 @@ const highway = (() => {
             document.getElementById('btn-play').textContent = '▶ Play';
         },
     };
-})();
+}
+const highway = createHighway();
