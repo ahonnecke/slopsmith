@@ -113,6 +113,10 @@ volumes:
   slopsmith-config:
 ```
 
+## Windows 11 install tutorial
+
+https://youtu.be/bIz8pbTFiV8
+
 ## Plugins
 
 Slopsmith supports a plugin system for extending functionality. Plugins can add navigation links, screens, settings sections, and API routes — all discovered automatically at startup.
