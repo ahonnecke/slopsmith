@@ -221,6 +221,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) | Convert PSARC to .sloppak with Demucs stem splitting | `git clone ...slopsmith-plugin-sloppak-converter.git sloppak_converter` |
 | [Stems Mixer](https://github.com/topkoa/slopsmith-plugin-stems) | Per-stem mute/volume controls for .sloppak songs | `git clone ...slopsmith-plugin-stems.git stems` |
 | [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
+| [Jumping Tab](https://github.com/renanboni/slopsmith-plugin-jumpingtab) | Yousician-style 2D horizontal tab with trajectory arcs and hopping ball | `git clone ...slopsmith-plugin-jumpingtab.git jumpingtab` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 
