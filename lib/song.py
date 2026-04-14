@@ -416,31 +416,37 @@ def parse_arrangement(xml_path: str) -> Arrangement:
 
 
 def _convert_sng_to_xml(extracted_dir: str):
-    """If no arrangement XMLs exist but SNG files do, convert them via RsCli."""
+    """If no arrangement XMLs exist but SNG files do, convert them via RsCli.
+    Also converts vocals SNG → XML when no vocals XML is present, so lyrics
+    are available for official DLC (which ships SNG-only)."""
     d = Path(extracted_dir)
     # Check if we already have arrangement XMLs (not just showlights/vocals)
     xml_files = list(d.rglob("*.xml"))
     has_arrangement_xml = False
+    has_vocals_xml = False
     for xf in xml_files:
         try:
             root = ET.parse(xf).getroot()
+            if root.tag == "vocals":
+                has_vocals_xml = True
+                continue
             if root.tag == "song":
                 el = root.find("arrangement")
                 if el is not None and el.text:
                     low = el.text.lower().strip()
                     if low not in ("vocals", "showlights", "jvocals"):
                         has_arrangement_xml = True
-                        break
+                    elif low == "vocals":
+                        has_vocals_xml = True
                 else:
                     has_arrangement_xml = True
-                    break
         except Exception:
             continue
 
-    if has_arrangement_xml:
-        return  # Already have XMLs
+    if has_arrangement_xml and has_vocals_xml:
+        return  # Already have everything
 
-    # Find SNG files (skip vocals)
+    # Find SNG files
     sng_files = list(d.rglob("*.sng"))
     if not sng_files:
         return
@@ -478,7 +484,11 @@ def _convert_sng_to_xml(extracted_dir: str):
 
     for sng_path in sng_files:
         stem = sng_path.stem
+        # Vocals SNGs are not decoded via RsCli (unsupported) — they're parsed
+        # directly in server.py via lib/sng_vocals.parse_vocals_sng().
         if "vocals" in stem.lower():
+            continue
+        if has_arrangement_xml:
             continue
         xml_out = arr_dir / f"{stem}.xml"
         try:

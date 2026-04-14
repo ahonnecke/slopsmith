@@ -366,7 +366,7 @@ def _tuning_name(offsets: list[int]) -> str:
 
 def _extract_meta_fast(psarc_path: Path) -> dict:
     """Extract metadata from a PSARC using in-memory reading (no disk I/O)."""
-    files = read_psarc_entries(str(psarc_path), ["*.json", "*.xml"])
+    files = read_psarc_entries(str(psarc_path), ["*.json", "*.xml", "*vocals*.sng"])
 
     title = artist = album = year = ""
     duration = 0.0
@@ -415,17 +415,19 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
         except Exception:
             continue
 
-    # Check XMLs for vocals
+    # Check XMLs for vocals (CDLC), or fall back to vocals SNG (official DLC)
     for path, data in files.items():
-        if not path.lower().endswith(".xml"):
-            continue
-        try:
-            root = ET.fromstring(data)
-            if root.tag == "vocals":
-                has_lyrics = True
-                break
-        except Exception:
-            continue
+        if path.lower().endswith(".xml"):
+            try:
+                root = ET.fromstring(data)
+                if root.tag == "vocals":
+                    has_lyrics = True
+                    break
+            except Exception:
+                continue
+        elif path.lower().endswith(".sng") and "vocals" in path.lower():
+            has_lyrics = True
+            break
 
     # Sort arrangements: Lead > Combo > Rhythm > Bass
     priority = {"Lead": 0, "Combo": 1, "Rhythm": 2, "Bass": 3}
@@ -1280,6 +1282,17 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                         break
                 except Exception:
                     pass
+            if not lyrics:
+                # SNG-only PSARC (official DLC) — decode vocals SNG directly.
+                from lib.sng_vocals import parse_vocals_sng
+                for sng_path in sorted(Path(tmp).rglob("*vocals*.sng")):
+                    plat = "mac" if "/macos/" in str(sng_path).replace("\\", "/").lower() else "pc"
+                    try:
+                        lyrics = parse_vocals_sng(str(sng_path), plat)
+                    except Exception:
+                        lyrics = []
+                    if lyrics:
+                        break
         if lyrics:
             await websocket.send_json({"type": "lyrics", "data": lyrics})
 
