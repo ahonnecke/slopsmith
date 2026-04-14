@@ -1284,15 +1284,18 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                     pass
             if not lyrics:
                 # SNG-only PSARC (official DLC) — decode vocals SNG directly.
-                from lib.sng_vocals import parse_vocals_sng
-                for sng_path in sorted(Path(tmp).rglob("*vocals*.sng")):
-                    plat = "mac" if "/macos/" in str(sng_path).replace("\\", "/").lower() else "pc"
-                    try:
-                        lyrics = parse_vocals_sng(str(sng_path), plat)
-                    except Exception:
-                        lyrics = []
-                    if lyrics:
-                        break
+                try:
+                    from lib.sng_vocals import parse_vocals_sng
+                    for sng_path in sorted(Path(tmp).rglob("*vocals*.sng")):
+                        plat = "mac" if "/macos/" in str(sng_path).replace("\\", "/").lower() else "pc"
+                        try:
+                            lyrics = parse_vocals_sng(str(sng_path), plat)
+                        except Exception:
+                            lyrics = []
+                        if lyrics:
+                            break
+                except ImportError:
+                    pass
         if lyrics:
             await websocket.send_json({"type": "lyrics", "data": lyrics})
 
@@ -1302,7 +1305,52 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             xml_paths = []
         else:
             xml_paths = sorted(Path(tmp).rglob("*.xml"))
-        for xml_path in xml_paths:
+
+        # Build tone ID→name map from manifest JSON matching selected arrangement
+        tone_id_map = {}  # {0: "Tone_A_name", 1: "Tone_B_name", ...}
+        arr_name_lower = arr.name.lower() if arr else ""
+        for jf in sorted(Path(tmp).rglob("*.json")):
+            try:
+                # Prefer manifest matching selected arrangement
+                if arr_name_lower and arr_name_lower not in jf.stem.lower():
+                    continue
+                jdata = json.loads(jf.read_text())
+                for entry in (jdata.get("Entries") or {}).values():
+                    attrs = entry.get("Attributes") or {}
+                    for idx, key in enumerate(["Tone_A", "Tone_B", "Tone_C", "Tone_D"]):
+                        val = attrs.get(key, "")
+                        if val:
+                            tone_id_map[idx] = val
+                    if tone_id_map:
+                        break
+            except Exception:
+                continue
+            if tone_id_map:
+                break
+        # Fallback: try any manifest if arrangement-specific one not found
+        if not tone_id_map:
+            for jf in sorted(Path(tmp).rglob("*.json")):
+                try:
+                    jdata = json.loads(jf.read_text())
+                    for entry in (jdata.get("Entries") or {}).values():
+                        attrs = entry.get("Attributes") or {}
+                        for idx, key in enumerate(["Tone_A", "Tone_B", "Tone_C", "Tone_D"]):
+                            val = attrs.get(key, "")
+                            if val:
+                                tone_id_map[idx] = val
+                        if tone_id_map:
+                            break
+                except Exception:
+                    continue
+                if tone_id_map:
+                    break
+
+        # Parse XMLs — prefer the one matching selected arrangement, fall back to any
+        # Try arrangement-matching XML first, then fall back to any
+        def _xml_matches_arr(xp):
+            return arr_name_lower and arr_name_lower in xp.stem.lower()
+        sorted_xml = sorted(xml_paths, key=lambda xp: (0 if _xml_matches_arr(xp) else 1, xp.name))
+        for xml_path in sorted_xml:
             try:
                 root = ET.parse(xml_path).getroot()
                 if root.tag != "song":
@@ -1312,15 +1360,21 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                     for t in tones_el.findall("tone"):
                         tc_time = t.get("time")
                         tc_name = t.get("name", "")
+                        tc_id = t.get("id", "")
+                        # Resolve "N/A" or empty names using tone ID map
+                        if (not tc_name or tc_name == "N/A") and tc_id:
+                            tc_name = tone_id_map.get(int(tc_id), f"Tone {tc_id}")
                         if tc_time and tc_name:
                             tone_changes.append({
                                 "t": round(float(tc_time), 3),
                                 "name": tc_name,
                             })
                     if tone_changes:
-                        # Also send the base tone
                         tonebase = root.find("tonebase")
                         base_name = tonebase.text if tonebase is not None and tonebase.text else ""
+                        # If base name not in XML, use Tone_A from tone_id_map (same arrangement)
+                        if not base_name:
+                            base_name = tone_id_map.get(0, "")
                         await websocket.send_json({
                             "type": "tone_changes",
                             "base": base_name,

@@ -1075,3 +1075,4 @@ function createHighway() {
     };
 }
 const highway = createHighway();
+window.highway = highway; // expose for plugins
