@@ -227,6 +227,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
 | [Jumping Tab](https://github.com/renanboni/slopsmith-plugin-jumpingtab) | Yousician-style 2D horizontal tab with trajectory arcs and hopping ball | `git clone ...slopsmith-plugin-jumpingtab.git jumpingtab` |
 | [Lyrics Sync](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync) | Generate synced LRC lyrics from text + vocals stem via Whisper alignment | `git clone ...slopsmith-plugin-lyrics-sync.git lyrics_sync` |
+| [NAM Tone Engine](https://github.com/byrongamatos/slopsmith-plugin-nam-tone) | In-browser amp modeling with NAM WASM, cabinet IRs, tone auto-switching | `git clone ...slopsmith-plugin-nam-tone.git nam_tone` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
 
