@@ -58,8 +58,19 @@ def _install_requirements(plugin_dir: Path, plugin_id: str):
 
 
 def load_plugins(app: FastAPI, context: dict):
-    """Discover and load all plugins from the plugins/ directory."""
-    if not PLUGINS_DIR.is_dir():
+    """Discover and load all plugins from built-in and user directories."""
+
+    # Collect plugin directories — user plugins first so they override built-in
+    plugin_dirs = []
+    user_plugins_dir = os.environ.get("SLOPSMITH_PLUGINS_DIR")
+    if user_plugins_dir:
+        user_path = Path(user_plugins_dir)
+        if user_path.is_dir() and user_path != PLUGINS_DIR:
+            plugin_dirs.append(user_path)
+    if PLUGINS_DIR.is_dir():
+        plugin_dirs.append(PLUGINS_DIR)
+
+    if not plugin_dirs:
         return
 
     # Add persistent pip target to sys.path
@@ -67,58 +78,102 @@ def load_plugins(app: FastAPI, context: dict):
     if _PIP_TARGET.exists() and pip_target not in sys.path:
         sys.path.insert(0, pip_target)
 
-    for plugin_dir in sorted(PLUGINS_DIR.iterdir()):
-        manifest_path = plugin_dir / "plugin.json"
-        if not manifest_path.exists():
-            continue
+    loaded_ids = set()
 
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except Exception as e:
-            print(f"[Plugin] Failed to read {manifest_path}: {e}")
-            continue
+    for plugins_base_dir in plugin_dirs:
+        for plugin_dir in sorted(plugins_base_dir.iterdir()):
+            if not plugin_dir.is_dir():
+                continue
 
-        plugin_id = manifest.get("id")
-        if not plugin_id:
-            continue
+            manifest_path = plugin_dir / "plugin.json"
+            if not manifest_path.exists():
+                continue
 
-        # Install plugin requirements if present
-        _install_requirements(plugin_dir, plugin_id)
-
-        # Add plugin directory to sys.path so it can import its own modules
-        plugin_dir_str = str(plugin_dir)
-        if plugin_dir_str not in sys.path:
-            sys.path.insert(0, plugin_dir_str)
-
-        # Load routes using importlib to avoid module name collisions
-        routes_file = manifest.get("routes")
-        if routes_file:
             try:
-                module_name = f"plugin_{plugin_id}_routes"
-                spec = importlib.util.spec_from_file_location(
-                    module_name, str(plugin_dir / routes_file))
-                routes_module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = routes_module
-                spec.loader.exec_module(routes_module)
-                if hasattr(routes_module, "setup"):
-                    routes_module.setup(app, context)
-                    print(f"[Plugin] Loaded routes for '{plugin_id}'")
+                manifest = json.loads(manifest_path.read_text())
             except Exception as e:
-                print(f"[Plugin] Failed to load routes for '{plugin_id}': {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[Plugin] Failed to read {manifest_path}: {e}")
+                continue
 
-        LOADED_PLUGINS.append({
-            "id": plugin_id,
-            "name": manifest.get("name", plugin_id),
-            "nav": manifest.get("nav"),
-            "has_screen": bool(manifest.get("screen")),
-            "has_script": bool(manifest.get("script")),
-            "has_settings": bool(manifest.get("settings")),
-            "_dir": plugin_dir,
-            "_manifest": manifest,
-        })
-        print(f"[Plugin] Registered '{plugin_id}' ({manifest.get('name', '')})")
+            plugin_id = manifest.get("id")
+            if not plugin_id:
+                continue
+
+            if plugin_id in loaded_ids:
+                print(f"[Plugin] Skipping duplicate '{plugin_id}' from {plugins_base_dir}")
+                continue
+            loaded_ids.add(plugin_id)
+
+            # Install plugin requirements if present
+            _install_requirements(plugin_dir, plugin_id)
+
+            # Add plugin directory to sys.path so it can import its own modules
+            plugin_dir_str = str(plugin_dir)
+            if plugin_dir_str not in sys.path:
+                sys.path.insert(0, plugin_dir_str)
+
+            # Load routes using importlib to avoid module name collisions
+            routes_file = manifest.get("routes")
+            if routes_file:
+                try:
+                    module_name = f"plugin_{plugin_id}_routes"
+                    spec = importlib.util.spec_from_file_location(
+                        module_name, str(plugin_dir / routes_file))
+                    routes_module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = routes_module
+                    spec.loader.exec_module(routes_module)
+                    if hasattr(routes_module, "setup"):
+                        routes_module.setup(app, context)
+                        print(f"[Plugin] Loaded routes for '{plugin_id}'")
+                except Exception as e:
+                    print(f"[Plugin] Failed to load routes for '{plugin_id}': {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            LOADED_PLUGINS.append({
+                "id": plugin_id,
+                "name": manifest.get("name", plugin_id),
+                "nav": manifest.get("nav"),
+                "has_screen": bool(manifest.get("screen")),
+                "has_script": bool(manifest.get("script")),
+                "has_settings": bool(manifest.get("settings")),
+                "_dir": plugin_dir,
+                "_manifest": manifest,
+            })
+            print(f"[Plugin] Registered '{plugin_id}' ({manifest.get('name', '')})")
+
+
+def _check_plugin_update(plugin_dir: Path) -> dict | None:
+    """Check if a plugin's git repo has updates available."""
+    git_dir = plugin_dir / ".git"
+    if not git_dir.exists():
+        return None
+    try:
+        # Fetch latest from remote (quick, refs only)
+        subprocess.run(
+            ["git", "fetch", "--quiet"],
+            cwd=str(plugin_dir), capture_output=True, timeout=15,
+        )
+        # Compare local HEAD with remote tracking branch
+        result = subprocess.run(
+            ["git", "rev-list", "HEAD..@{u}", "--count"],
+            cwd=str(plugin_dir), capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        behind = int(result.stdout.strip())
+        # Get current and remote commit hashes
+        local = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(plugin_dir), capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        remote = subprocess.run(
+            ["git", "rev-parse", "--short", "@{u}"],
+            cwd=str(plugin_dir), capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return {"behind": behind, "local": local, "remote": remote}
+    except Exception:
+        return None
 
 
 def register_plugin_api(app: FastAPI):
@@ -137,6 +192,52 @@ def register_plugin_api(app: FastAPI):
             }
             for p in LOADED_PLUGINS
         ]
+
+    @app.get("/api/plugins/updates")
+    def check_updates():
+        """Check all plugins for available git updates."""
+        updates = {}
+        for p in LOADED_PLUGINS:
+            info = _check_plugin_update(p["_dir"])
+            if info and info["behind"] > 0:
+                updates[p["id"]] = {
+                    "name": p["name"],
+                    "behind": info["behind"],
+                    "local": info["local"],
+                    "remote": info["remote"],
+                }
+        return {"updates": updates}
+
+    @app.post("/api/plugins/{plugin_id}/update")
+    def update_plugin(plugin_id: str):
+        """Pull latest changes for a plugin. Stashes local edits first."""
+        for p in LOADED_PLUGINS:
+            if p["id"] == plugin_id:
+                git_dir = p["_dir"] / ".git"
+                if not git_dir.exists():
+                    return {"error": "Not a git repository"}
+                cwd = str(p["_dir"])
+                try:
+                    # Stash any local modifications so pull doesn't fail
+                    subprocess.run(
+                        ["git", "stash", "--quiet"],
+                        cwd=cwd, capture_output=True, timeout=10,
+                    )
+                    result = subprocess.run(
+                        ["git", "pull", "--ff-only"],
+                        cwd=cwd, capture_output=True, text=True, timeout=30,
+                    )
+                    if result.returncode != 0:
+                        # Restore stash on failure
+                        subprocess.run(
+                            ["git", "stash", "pop", "--quiet"],
+                            cwd=cwd, capture_output=True, timeout=10,
+                        )
+                        return {"error": result.stderr[:500]}
+                    return {"ok": True, "message": result.stdout.strip()}
+                except Exception as e:
+                    return {"error": str(e)}
+        return {"error": "Plugin not found"}
 
     @app.get("/api/plugins/{plugin_id}/screen.html")
     def plugin_screen_html(plugin_id: str):
