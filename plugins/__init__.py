@@ -245,7 +245,7 @@ def register_plugin_api(app: FastAPI):
             if p["id"] == plugin_id:
                 screen_file = p["_dir"] / p["_manifest"].get("screen", "screen.html")
                 if screen_file.exists():
-                    return HTMLResponse(screen_file.read_text())
+                    return HTMLResponse(screen_file.read_text(encoding="utf-8"))
         return HTMLResponse("", status_code=404)
 
     @app.get("/api/plugins/{plugin_id}/screen.js")
@@ -254,7 +254,7 @@ def register_plugin_api(app: FastAPI):
             if p["id"] == plugin_id:
                 script_file = p["_dir"] / p["_manifest"].get("script", "screen.js")
                 if script_file.exists():
-                    return Response(script_file.read_text(), media_type="application/javascript")
+                    return Response(script_file.read_text(encoding="utf-8"), media_type="application/javascript")
         return Response("", status_code=404)
 
     @app.get("/api/plugins/{plugin_id}/settings.html")
