@@ -7,6 +7,7 @@ function createHighway() {
     let currentTime = 0;
     let animFrame = null;
     let _connectOpts = {};
+    let _resizeContainer = null;
 
     // Song data (populated via WebSocket)
     let songInfo = {};
@@ -120,14 +121,12 @@ function createHighway() {
     }
 
     // ── Drawing ──────────────────────────────────────────────────────────
-    let _drawCount = 0;
     function draw() {
         animFrame = requestAnimationFrame(draw);
         if (!canvas || !ready) return;
         try {
         const W = canvas.width;
         const H = canvas.height;
-        if (_drawCount++ < 3) console.log(`draw: W=${W} H=${H} t=${currentTime.toFixed(2)} notes=${notes.length}`);
         ctx.fillStyle = BG;
         ctx.fillRect(0, 0, W, H);
 
@@ -862,8 +861,9 @@ function createHighway() {
 
     // ── Public API ───────────────────────────────────────────────────────
     return {
-        init(canvasEl) {
+        init(canvasEl, container) {
             canvas = canvasEl;
+            _resizeContainer = container || null;
             ctx = canvas.getContext('2d');
             this.resize();
             window.addEventListener('resize', () => this.resize());
@@ -873,10 +873,17 @@ function createHighway() {
 
         resize() {
             if (!canvas) return;
-            const controls = document.getElementById('player-controls');
-            const controlsH = controls ? controls.offsetHeight : 50;
-            const w = document.documentElement.clientWidth;
-            const h = document.documentElement.clientHeight - controlsH;
+            let w, h;
+            if (_resizeContainer) {
+                const rect = _resizeContainer.getBoundingClientRect();
+                w = rect.width;
+                h = rect.height;
+            } else {
+                const controls = document.getElementById('player-controls');
+                const controlsH = controls ? controls.offsetHeight : 50;
+                w = document.documentElement.clientWidth;
+                h = document.documentElement.clientHeight - controlsH;
+            }
             canvas.style.width = w + 'px';
             canvas.style.height = h + 'px';
             canvas.width = Math.round(w * _renderScale);
