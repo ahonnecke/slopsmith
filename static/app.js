@@ -484,6 +484,18 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
+    // Native folder picker — only present when running inside slopsmith-desktop.
+    if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
+        document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
+    }
+}
+
+// Open a native OS folder picker via the Electron bridge (desktop only) and
+// stash the chosen path into the DLC input. User still has to hit Save.
+async function pickDlcFolder() {
+    if (!window.slopsmithDesktop?.pickDirectory) return;
+    const path = await window.slopsmithDesktop.pickDirectory();
+    if (path) document.getElementById('dlc-path').value = path;
 }
 
 async function saveSettings() {
