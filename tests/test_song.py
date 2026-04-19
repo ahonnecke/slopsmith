@@ -1,5 +1,7 @@
 """Tests for lib/song.py wire-format serialization (pure, no fixtures)."""
 
+import json
+
 import pytest
 
 from song import (
@@ -208,3 +210,75 @@ def test_chord_default_high_density_is_false():
     c = Chord(time=0.0, chord_id=0)
     assert c.high_density is False
     assert c.notes == []
+
+
+# ── JSON-safety (#41) ────────────────────────────────────────────────────────
+# The *_to_wire functions are documented as producing "JSON-ready" dicts that
+# the highway WebSocket streams to the client. These tests catch things the
+# Python-level round-trip tests above don't: non-JSON-native values (Path,
+# Decimal, dataclass, set), and tuples (which JSON coerces to lists, failing
+# the round-trip equality check).
+
+def test_note_to_wire_is_json_safe():
+    n = Note(
+        time=0.5, string=0, fret=3,
+        sustain=0.25, slide_to=7, slide_unpitch_to=9, bend=1.0,
+        hammer_on=True, pull_off=True,
+        harmonic=True, harmonic_pinch=True,
+        palm_mute=True, mute=True,
+        tremolo=True, accent=True, tap=True,
+    )
+    wire = note_to_wire(n)
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_chord_to_wire_is_json_safe():
+    c = Chord(
+        time=2.0, chord_id=5, high_density=True,
+        notes=[
+            Note(time=2.0, string=0, fret=3, palm_mute=True),
+            Note(time=2.0, string=1, fret=5),
+            Note(time=2.0, string=2, fret=5),
+        ],
+    )
+    wire = chord_to_wire(c)
+    assert json.loads(json.dumps(wire)) == wire
+
+
+def test_arrangement_to_wire_is_json_safe():
+    # Same shape as test_arrangement_full_round_trip — exercises every nested
+    # list / dict / int / str / bool path the wire format emits.
+    arr = Arrangement(
+        name="Rhythm",
+        tuning=[-2, 0, 0, 0, 0, 0],
+        capo=2,
+        notes=[
+            Note(time=1.0, string=0, fret=3, palm_mute=True),
+            Note(time=1.5, string=1, fret=5, hammer_on=True),
+        ],
+        chords=[
+            Chord(
+                time=2.0, chord_id=1, high_density=True,
+                notes=[
+                    Note(time=2.0, string=0, fret=0),
+                    Note(time=2.0, string=1, fret=2),
+                ],
+            ),
+        ],
+        anchors=[
+            Anchor(time=0.0, fret=1, width=4),
+            Anchor(time=10.0, fret=7, width=5),
+        ],
+        hand_shapes=[
+            HandShape(chord_id=1, start_time=2.0, end_time=2.5),
+        ],
+        chord_templates=[
+            ChordTemplate(
+                name="Em",
+                fingers=[-1, -1, 2, 3, -1, -1],
+                frets=[0, 2, 2, 0, 0, 0],
+            ),
+        ],
+    )
+    wire = arrangement_to_wire(arr)
+    assert json.loads(json.dumps(wire)) == wire
