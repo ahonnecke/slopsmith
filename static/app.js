@@ -5816,79 +5816,13 @@ async function _scheduleStartupRehydration() {
     }
 }
 
-async function bootstrapPluginsAndUi() {
-    setPluginLoadingState(true, 'Loading plugins...');
-    const startup = await waitForPluginStartupComplete();
-    if (startup && (startup.phase === 'error' || startup.phase === 'timeout')) {
-        const msg = startup.error || startup.message || 'Plugin startup failed';
-        setPluginLoadingState(false, '');
-        console.warn('Plugin startup reported error:', msg);
-        // On timeout the backend may still be loading. Continue polling in the
-        // background so plugins are hydrated once startup eventually completes.
-        if (startup.phase === 'timeout') {
-            _scheduleStartupRehydration();
-        }
-    }
-    const plugins = await loadPlugins();
-    return plugins;
-}
-
 // Load library on start. loadSettings is awaited alongside so persisted
-// values (A/V offset, mastery, etc.) are applied to the highway + HUD
-// before any playSong runs — otherwise a fast click could start
-// playback with stale settings before /api/settings returned.
-(async () => {
-    // Splitscreen pop-out windows (`?ssFollower=1`) load this same app but
-    // get driven into "follower mode" by the splitscreen plugin once it
-    // loads — which is *after* this init runs. Without this, the library
-    // (`#home`, marked `active` in index.html) renders and paints first, so
-    // the popup briefly flashes the song grid before swapping to the player.
-    // Switch to the player screen up front so the popup shows player chrome
-    // (empty, then populated by the plugin) the whole time. The wasted
-    // library fetch below is negligible next to the whole-app + every-plugin
-    // re-load a popup already does.
-    const isFollowerWindow = (() => {
-        try { return new URLSearchParams(location.search).get('ssFollower') === '1'; }
-        catch (_) { return false; }
-    })();
-    if (isFollowerWindow) {
-        // Await it — showScreen is async, so a bare call would turn even a
-        // synchronous DOM error into an unhandled rejection that this try
-        // couldn't catch. Surface failures (e.g. `#player` missing/renamed)
-        // instead of silently bringing the library flash back.
-        try { await showScreen('player'); }
-        catch (e) { console.warn('[slopsmith] follower-window: showScreen("player") failed:', e); }
-    }
-    // Restore library-filter UI state from localStorage before the first
-    // grid fetch so the badge/chips are accurate immediately
-    // (slopsmith#129).
-    _renderLibFilterChips();
-    _updateLibFiltersBadge();
-    // Restore the persisted sort and format-filter dropdowns BEFORE
-    // the first setLibView() call — setLibView triggers loadLibrary,
-    // which reads `lib-sort` / `lib-format` to build the API query
-    // string. Without this, the first page would always load with
-    // "Artist A-Z" / "All formats" regardless of what the user had
-    // picked previously.
-    const savedSort = _readPersistedChoice(_LIB_SORT_KEY, _LIB_SORT_VALUES, 'artist');
-    const savedFormat = _readPersistedChoice(_LIB_FORMAT_KEY, _LIB_FORMAT_VALUES, '');
-    const sortEl = document.getElementById('lib-sort');
-    const fmtEl = document.getElementById('lib-format');
-    if (sortEl) sortEl.value = savedSort;
-    if (fmtEl) fmtEl.value = savedFormat;
-    // Treat the initial page load the same as a screen entry so the
-    // restored selection scrolls into view exactly once on hard
-    // reload. Without this, the scroll-on-screen-entry flag only
-    // ever triggered when the user navigated away and back via
-    // showScreen — a hard refresh in tree mode would land on the
-    // top of the tree and force the user to scroll back to find
-    // their selection.
-    _libScrollOnNextRender.home = true;
-    // `libView` was already initialized from localStorage at module
-    // load; passing it through setLibView replays the visibility
-    // toggling and triggers the initial load.
-    setLibView(libView);
-    try { await loadSettings(); } catch (e) { console.warn('initial loadSettings failed:', e); }
+// values (A/V offset, default arrangement, etc.) are applied to the
+// highway + HUD before any playSong runs — otherwise the setting would
+// only "take effect" after the user visited the Settings screen.
+loadPlugins().then(() => {
+    setLibView('grid');
+    loadSettings().catch(e => console.warn('initial loadSettings failed:', e));
     checkScanAndLoad();
 
     const plugins = await bootstrapPluginsAndUi();
