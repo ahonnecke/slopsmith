@@ -719,6 +719,10 @@ def get_settings():
 
 @app.post("/api/settings")
 def save_settings(data: dict):
+    """Partial-update semantics: only keys present in `data` are written.
+    Missing keys are left untouched. Allows lightweight clients (e.g. a
+    live-tuning A/V offset shortcut) to patch a single field without
+    clobbering the others."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_file = CONFIG_DIR / "config.json"
     cfg = {}
@@ -729,17 +733,31 @@ def save_settings(data: dict):
             pass
 
     messages = []
-    dlc_path = data.get("dlc_dir", "")
-    if dlc_path:
-        if Path(dlc_path).is_dir():
-            cfg["dlc_dir"] = dlc_path
-            count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
-            messages.append(f"DLC folder: {count} .psarc files found")
+    if "dlc_dir" in data:
+        dlc_path = data["dlc_dir"] or ""
+        if dlc_path:
+            if Path(dlc_path).is_dir():
+                cfg["dlc_dir"] = dlc_path
+                count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
+                messages.append(f"DLC folder: {count} .psarc files found")
+            else:
+                return {"error": f"DLC directory not found: {dlc_path}"}
         else:
-            return {"error": f"DLC directory not found: {dlc_path}"}
+            cfg.pop("dlc_dir", None)
 
-    cfg["default_arrangement"] = data.get("default_arrangement", "")
-    cfg["demucs_server_url"] = data.get("demucs_server_url", "")
+    if "default_arrangement" in data:
+        cfg["default_arrangement"] = data["default_arrangement"] or ""
+
+    if "demucs_server_url" in data:
+        cfg["demucs_server_url"] = data["demucs_server_url"] or ""
+
+    if "av_offset_ms" in data:
+        # Positive = audio ahead of visuals; the highway adds this to
+        # audio.currentTime to catch the visuals up.
+        try:
+            cfg["av_offset_ms"] = float(data["av_offset_ms"] or 0)
+        except (TypeError, ValueError):
+            cfg["av_offset_ms"] = 0.0
 
     config_file.write_text(json.dumps(cfg, indent=2))
     return {"message": ". ".join(messages) if messages else "Settings saved"}

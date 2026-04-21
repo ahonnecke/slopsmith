@@ -484,10 +484,58 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
+    _avOffsetMs = Number(data.av_offset_ms) || 0;
+    const avSlider = document.getElementById('setting-av-offset');
+    const avVal = document.getElementById('setting-av-offset-val');
+    if (avSlider) avSlider.value = _avOffsetMs;
+    if (avVal) avVal.textContent = Math.round(_avOffsetMs);
     // Native folder picker — only present when running inside slopsmith-desktop.
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
     }
+}
+
+// A/V sync calibration. Positive = audio runs ahead of visuals; we add this
+// to audio.currentTime when driving the highway so the visuals catch up.
+// Persisted via /api/settings as av_offset_ms. Live-tunable from the player
+// screen via [ / ] keys (Shift for ±50 ms); the Settings slider is the same
+// value and stays in sync. Auto-saves (debounced) on every change.
+let _avOffsetMs = 0;
+let _avSaveDebounce = null;
+function setAvOffsetMs(ms) {
+    _avOffsetMs = Number(ms) || 0;
+    // Drive the highway's render-time shift. getTime() still returns the
+    // audio-aligned chart time so plugins (note detection, etc.) keep scoring
+    // against the real chart clock regardless of visual calibration.
+    if (typeof highway !== 'undefined' && highway?.setAvOffset) highway.setAvOffset(_avOffsetMs);
+    // Sync any visible Settings slider
+    const avSlider = document.getElementById('setting-av-offset');
+    if (avSlider) avSlider.value = _avOffsetMs;
+    const avVal = document.getElementById('setting-av-offset-val');
+    if (avVal) avVal.textContent = Math.round(_avOffsetMs);
+    // Update the always-present player HUD readout
+    const hud = document.getElementById('hud-avoffset');
+    if (hud) {
+        hud.textContent = `A/V ${_avOffsetMs >= 0 ? '+' : ''}${Math.round(_avOffsetMs)} ms`;
+        hud.classList.toggle('hidden', _avOffsetMs === 0);
+    }
+}
+function nudgeAvOffsetMs(delta) {
+    setAvOffsetMs(Math.max(-1000, Math.min(1000, _avOffsetMs + delta)));
+    // Debounced persist — POST only the one field; the server merges.
+    if (_avSaveDebounce) clearTimeout(_avSaveDebounce);
+    _avSaveDebounce = setTimeout(async () => {
+        _avSaveDebounce = null;
+        try {
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ av_offset_ms: _avOffsetMs }),
+            });
+        } catch (e) {
+            console.warn('A/V offset save failed:', e);
+        }
+    }, 400);
 }
 
 // Open a native OS folder picker via the Electron bridge (desktop only) and
@@ -506,6 +554,7 @@ async function saveSettings() {
             dlc_dir: document.getElementById('dlc-path').value.trim(),
             default_arrangement: document.getElementById('default-arrangement').value,
             demucs_server_url: document.getElementById('demucs-server-url').value.trim(),
+            av_offset_ms: _avOffsetMs,
         }),
     });
     const data = await resp.json();
@@ -1063,6 +1112,10 @@ document.addEventListener('keydown', e => {
     else if (e.code === 'ArrowLeft') seekBy(-5);
     else if (e.code === 'ArrowRight') seekBy(5);
     else if (e.code === 'Escape') showScreen('home');
+    // A/V offset live-calibration — watch the highway and listen to the audio
+    // while tuning. Shift for coarse ±50 ms, bare key for fine ±10 ms.
+    else if (e.code === 'BracketLeft')  { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ? -50 : -10); }
+    else if (e.code === 'BracketRight') { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ?  50 :  10); }
 });
 
 // ── Edit metadata modal ─────────────────────────────────────────────────
