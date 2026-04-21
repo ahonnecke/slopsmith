@@ -8,3 +8,4 @@ static/art/
 static/audio_*
 plugins/*/
 !plugins/__init__.py
+/.agent-shell/
