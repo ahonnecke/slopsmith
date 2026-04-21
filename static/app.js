@@ -484,11 +484,12 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
-    _avOffsetMs = Number(data.av_offset_ms) || 0;
-    const avSlider = document.getElementById('setting-av-offset');
-    const avVal = document.getElementById('setting-av-offset-val');
-    if (avSlider) avSlider.value = _avOffsetMs;
-    if (avVal) avVal.textContent = Math.round(_avOffsetMs);
+    // Route the loaded value through setAvOffsetMs so the highway's render
+    // clock, the Settings slider, the HUD readout, and the module variable all
+    // pick it up consistently. Setting _avOffsetMs directly used to skip the
+    // highway.setAvOffset call, which looked like "the value didn't save" on
+    // page reload — value was persisted, just not applied.
+    setAvOffsetMs(Number(data.av_offset_ms) || 0);
     // Native folder picker — only present when running inside slopsmith-desktop.
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
