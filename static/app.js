@@ -1919,75 +1919,44 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
-    // Restore master-difficulty slider from persisted value (defaults
-    // to 100 when the key is absent — no behaviour change for users
-    // who've never touched the slider).
-    const masteryPct = typeof data.master_difficulty === 'number'
-        ? Math.max(0, Math.min(100, data.master_difficulty))
-        : 100;
-    const masterySlider = document.getElementById('mastery-slider');
-    const masteryLabel = document.getElementById('mastery-label');
-    if (masterySlider) masterySlider.value = masteryPct;
-    if (masteryLabel) masteryLabel.textContent = masteryPct + '%';
-    highway.setMastery(masteryPct / 100);
-    // Route the loaded value through setAvOffsetMs so the highway's
-    // render clock, the Settings slider, the HUD readout, and the
-    // module variable all pick it up consistently. Pass skipPersist
-    // so we don't echo the loaded value back to the server.
-    setAvOffsetMs(Number(data.av_offset_ms) || 0, /* skipPersist */ true);
-    const psarcPlatformEl = document.getElementById('psarc-platform');
-    if (psarcPlatformEl) psarcPlatformEl.value = data.psarc_platform || 'both';
+    _avOffsetMs = Number(data.av_offset_ms) || 0;
+    const avSlider = document.getElementById('setting-av-offset');
+    const avVal = document.getElementById('setting-av-offset-val');
+    if (avSlider) avSlider.value = _avOffsetMs;
+    if (avVal) avVal.textContent = Math.round(_avOffsetMs);
     // Native folder picker — only present when running inside slopsmith-desktop.
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
     }
 }
 
-// A/V sync calibration. Positive = audio runs ahead of visuals; we
-// add this to audio.currentTime when driving the highway so the
-// visuals catch up. Persisted via /api/settings as av_offset_ms.
-// Live-tunable from the player screen via [ / ] keys (Shift for
-// ±50 ms) and from the Settings slider; both auto-save with the
-// same debounced POST. loadSettings() seeds the value via
-// setAvOffsetMs without saving (skipPersist=true) to avoid an
-// echo-back round-trip.
+// A/V sync calibration. Positive = audio runs ahead of visuals; we add this
+// to audio.currentTime when driving the highway so the visuals catch up.
+// Persisted via /api/settings as av_offset_ms. Live-tunable from the player
+// screen via [ / ] keys (Shift for ±50 ms); the Settings slider is the same
+// value and stays in sync. Auto-saves (debounced) on every change.
 let _avOffsetMs = 0;
 let _avSaveDebounce = null;
-function setAvOffsetMs(ms, skipPersist) {
-    // Clamp to the same bounds the Settings/player-bar sliders enforce
-    // (-1000..1000 ms). Defends against bad values from /api/settings
-    // landing as `value` on <input type=range>.
-    const n = Number(ms);
-    _avOffsetMs = Math.max(-1000, Math.min(1000, Number.isFinite(n) ? n : 0));
-    // Drive the highway's render-time shift. getTime() still returns
-    // the audio-aligned chart time so plugins (note detection, etc.)
-    // keep scoring against the real chart clock regardless of visual
-    // calibration.
+function setAvOffsetMs(ms) {
+    _avOffsetMs = Number(ms) || 0;
+    // Drive the highway's render-time shift. getTime() still returns the
+    // audio-aligned chart time so plugins (note detection, etc.) keep scoring
+    // against the real chart clock regardless of visual calibration.
     if (typeof highway !== 'undefined' && highway?.setAvOffset) highway.setAvOffset(_avOffsetMs);
     // Sync any visible Settings slider
     const avSlider = document.getElementById('setting-av-offset');
     if (avSlider) avSlider.value = _avOffsetMs;
     const avVal = document.getElementById('setting-av-offset-val');
     if (avVal) avVal.textContent = Math.round(_avOffsetMs);
-    // Sync the inline player-bar slider (live-tunable while playing)
-    const playerAvSlider = document.getElementById('player-av-offset-slider');
-    if (playerAvSlider) playerAvSlider.value = _avOffsetMs;
-    const playerAvLabel = document.getElementById('player-av-offset-label');
-    if (playerAvLabel) {
-        const rounded = Math.round(_avOffsetMs);
-        playerAvLabel.textContent = `${rounded >= 0 ? '+' : ''}${rounded}ms`;
-    }
-    // Update the player HUD readout (hidden when offset = 0 to
-    // avoid clutter; the keyboard shortcut is documented in the
-    // Settings help text so it stays discoverable).
+    // Update the always-present player HUD readout
     const hud = document.getElementById('hud-avoffset');
     if (hud) {
         hud.textContent = `A/V ${_avOffsetMs >= 0 ? '+' : ''}${Math.round(_avOffsetMs)} ms`;
         hud.classList.toggle('hidden', _avOffsetMs === 0);
     }
-    if (!skipPersist) _persistAvOffset();
 }
-function _persistAvOffset() {
+function nudgeAvOffsetMs(delta) {
+    setAvOffsetMs(Math.max(-1000, Math.min(1000, _avOffsetMs + delta)));
     // Debounced persist — POST only the one field; the server merges.
     if (_avSaveDebounce) clearTimeout(_avSaveDebounce);
     _avSaveDebounce = setTimeout(async () => {
@@ -2002,9 +1971,6 @@ function _persistAvOffset() {
             console.warn('A/V offset save failed:', e);
         }
     }, 400);
-}
-function nudgeAvOffsetMs(delta) {
-    setAvOffsetMs(Math.max(-1000, Math.min(1000, _avOffsetMs + delta)));
 }
 
 // Open a native OS folder picker via the Electron bridge (desktop only) and
@@ -2024,7 +1990,6 @@ async function saveSettings() {
             default_arrangement: document.getElementById('default-arrangement').value,
             demucs_server_url: document.getElementById('demucs-server-url').value.trim(),
             av_offset_ms: _avOffsetMs,
-            psarc_platform: document.getElementById('psarc-platform')?.value || 'both',
         }),
     });
     const data = await resp.json();
@@ -4997,222 +4962,15 @@ window._isShortcutActive = _isShortcutActive;
 // and before any other keydown listeners.
 
 document.addEventListener('keydown', e => {
-    // Don't intercept if typing in an input field
-    if (_isTextInput(e.target) || _isInsideInteractiveControl(e.target)) return;
-
-    const ctx = _getCurrentContext();
-    const activePanel = _panels.get(_activePanel);
-    const defaultPanel = _panels.get('default');
-    
-    if (!activePanel && !defaultPanel) return;
-
-    if (_DEBUG_SHORTCUTS) {
-        console.log('[Shortcuts] Key pressed:', { key: e.key, code: e.code, ctx, activePanel: _activePanel });
-    }
-
-    // Try active panel first, then fall back to default
-    const panelsToDispatch = [];
-    if (activePanel && activePanel !== defaultPanel) panelsToDispatch.push(activePanel);
-    if (defaultPanel) panelsToDispatch.push(defaultPanel);
-
-    for (const panel of panelsToDispatch) {
-        for (const [, shortcut] of panel.shortcuts) {
-        // Match on both e.key (character produced) and e.code (physical key)
-        if (e.key !== shortcut.key && e.code !== shortcut.key) continue;
-
-        // Check modifier keys if specified
-        if (!_modifiersMatch(e, shortcut.modifiers)) continue;
-
-        if (_DEBUG_SHORTCUTS) {
-            console.log('[Shortcuts] Matched shortcut:', shortcut.key, shortcut);
-        }
-
-        // Check scope
-        if (!_isShortcutActive(shortcut, ctx)) {
-            if (_DEBUG_SHORTCUTS) {
-                console.log('[Shortcuts] Not active - scope mismatch:', shortcut.scope, ctx);
-            }
-            continue;
-        }
-
-        // Check condition callback — guard against plugin errors
-        if (shortcut.condition) {
-            try {
-                if (!shortcut.condition()) {
-                    if (_DEBUG_SHORTCUTS) {
-                        console.log('[Shortcuts] Not active - condition failed');
-                    }
-                    continue;
-                }
-            } catch (err) {
-                console.error('[Shortcuts] condition() threw for key:', shortcut.key, err);
-                continue;
-            }
-        }
-
-        e.preventDefault();
-        if (_DEBUG_SHORTCUTS) {
-            console.log('[Shortcuts] Executing handler for:', shortcut.key);
-        }
-        // Guard handler against plugin errors
-        try {
-            shortcut.handler(e);
-        } catch (err) {
-            console.error('[Shortcuts] handler() threw for key:', shortcut.key, err);
-        }
-        return;
-    }
-}
-
-    if (_DEBUG_SHORTCUTS) {
-        console.log('[Shortcuts] No shortcut matched for:', e.key, e.code);
-    }
-});
-
-// ── Window cleanup ───────────────────────────────────────────────────────────
-// Clean up window-specific shortcuts when a window is closed.
-// This is important for popup windows (e.g., splitscreen plugin) that
-// may be closed by the user.
-
-window.addEventListener('beforeunload', () => {
-    const windowId = window.getShortcutWindowId();
-    const removed = window.clearWindowShortcuts(windowId);
-    if (removed > 0 && _DEBUG_SHORTCUTS) {
-        console.log(`[Shortcuts] Cleaned up ${removed} shortcuts for window ${windowId}`);
-    }
-});
-
-// ── Register built-in shortcuts ───────────────────────────────────────────
-
-// Global shortcuts
-registerShortcut({
-    key: '?',
-    description: 'Show keyboard shortcuts',
-    scope: 'global',
-    handler: () => _openShortcutsModal()
-});
-
-// Library shortcuts
-registerShortcut({
-    key: '/',
-    description: 'Focus search',
-    scope: 'library',
-    handler: () => {
-        const input = _activeSearchInput();
-        if (input) input.focus();
-    }
-});
-
-registerShortcut({
-    key: 'c',
-    description: 'Convert PSARC entry to .sloppak',
-    scope: 'library',
-    handler: () => {
-        // Handled by library navigation - this is for documentation only
-    }
-});
-
-registerShortcut({
-    key: 'f',
-    description: 'Toggle favorite',
-    scope: 'library',
-    handler: () => {
-        // Handled by library navigation - this is for documentation only
-    }
-});
-
-registerShortcut({
-    key: 'e',
-    description: 'Edit metadata',
-    scope: 'library',
-    handler: () => {
-        // Handled by library navigation - this is for documentation only
-    }
-});
-
-// Player shortcuts
-registerShortcut({
-    key: 'Space',
-    description: 'Play/Pause',
-    scope: 'player',
-    handler: () => togglePlay()
-});
-
-registerShortcut({
-    key: 'ArrowLeft',
-    description: 'Seek back 5 seconds',
-    scope: 'player',
-    handler: () => seekBy(-5)
-});
-
-registerShortcut({
-    key: 'ArrowRight',
-    description: 'Seek forward 5 seconds',
-    scope: 'player',
-    handler: () => seekBy(5)
-});
-
-registerShortcut({
-    key: 'Escape',
-    description: 'Back to library',
-    scope: 'player',
-    handler: () => showScreen(_playerOriginScreen || 'home')
-});
-
-registerShortcut({
-    key: 'Escape',
-    description: 'Go back to previous screen',
-    scope: 'settings',
-    handler: () => showScreen(_settingsOriginScreen || 'home')
-});
-
-registerShortcut({
-    key: '[',
-    description: 'Offset audio back (Shift: 50ms, else 10ms)',
-    scope: 'player',
-    handler: (e) => nudgeAvOffsetMs(e.shiftKey ? -50 : -10)
-});
-
-registerShortcut({
-    key: ']',
-    description: 'Offset audio forward (Shift: 50ms, else 10ms)',
-    scope: 'player',
-    handler: (e) => nudgeAvOffsetMs(e.shiftKey ? 50 : 10)
-});
-
-registerShortcut({
-    key: '+',
-    description: 'Volume up',
-    scope: 'player',
-    modifiers: { ctrl: false, alt: false, meta: false },
-    handler: () => _adjustSongVolume(1)
-});
-
-// Layout-portable alias — matches the physical "=/+" key (e.code === 'Equal')
-// regardless of keyboard layout or shift state, so non-US layouts that
-// don't map Shift+= to '+' still work.
-registerShortcut({
-    key: 'Equal',
-    description: 'Volume up',
-    scope: 'player',
-    modifiers: { ctrl: false, alt: false, meta: false },
-    handler: () => _adjustSongVolume(1)
-});
-
-registerShortcut({
-    key: '-',
-    description: 'Volume down',
-    scope: 'player',
-    modifiers: { ctrl: false, alt: false, meta: false },
-    handler: () => _adjustSongVolume(-1)
-});
-
-registerShortcut({
-    key: 'Minus',
-    description: 'Volume down',
-    scope: 'player',
-    modifiers: { ctrl: false, alt: false, meta: false },
-    handler: () => _adjustSongVolume(-1)
+    if (!document.getElementById('player').classList.contains('active')) return;
+    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+    else if (e.code === 'ArrowLeft') seekBy(-5);
+    else if (e.code === 'ArrowRight') seekBy(5);
+    else if (e.code === 'Escape') showScreen('home');
+    // A/V offset live-calibration — watch the highway and listen to the audio
+    // while tuning. Shift for coarse ±50 ms, bare key for fine ±10 ms.
+    else if (e.code === 'BracketLeft')  { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ? -50 : -10); }
+    else if (e.code === 'BracketRight') { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ?  50 :  10); }
 });
 
 // ── Edit metadata modal ─────────────────────────────────────────────────

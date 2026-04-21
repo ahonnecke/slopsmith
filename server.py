@@ -2354,9 +2354,10 @@ def get_settings():
 
 @app.post("/api/settings")
 def save_settings(data: dict):
-    # Partial-update: merge only keys present in the request body so
-    # single-key POSTs (like the difficulty slider's oninput) don't
-    # clobber unrelated settings on disk.
+    """Partial-update semantics: only keys present in `data` are written.
+    Missing keys are left untouched. Allows lightweight clients (e.g. a
+    live-tuning A/V offset shortcut) to patch a single field without
+    clobbering the others."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_file = CONFIG_DIR / "config.json"
     # Seed defaults when config.json is missing, unreadable, or parses
@@ -2371,82 +2372,30 @@ def save_settings(data: dict):
 
     messages = []
     if "dlc_dir" in data:
-        dlc_path = data["dlc_dir"]
-        # null / missing is no-op (preserve on-disk value). Only an
-        # explicit empty string means "clear". Non-string values are
-        # rejected so Path(...) can't be surprised by non-str JSON.
-        if dlc_path is None:
-            pass
-        elif not isinstance(dlc_path, str):
-            return {"error": "dlc_dir must be a string path or empty"}
-        elif dlc_path == "":
-            cfg["dlc_dir"] = ""
-        else:
+        dlc_path = data["dlc_dir"] or ""
+        if dlc_path:
             if Path(dlc_path).is_dir():
                 cfg["dlc_dir"] = dlc_path
                 count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
                 messages.append(f"DLC folder: {count} .psarc files found")
             else:
                 return {"error": f"DLC directory not found: {dlc_path}"}
+        else:
+            cfg.pop("dlc_dir", None)
 
-    # Both of these are consumed downstream as strings (e.g.
-    # demucs_server_url.rstrip('/') in lib/sloppak_convert.py), so
-    # reject non-string shapes here. Matches the dlc_dir pattern above:
-    # null is no-op, empty string clears, non-string is a structured
-    # error that preserves the on-disk value.
-    for key in ("default_arrangement", "demucs_server_url"):
-        if key in data:
-            raw = data[key]
-            if raw is None:
-                pass
-            elif not isinstance(raw, str):
-                return {"error": f"{key} must be a string or empty"}
-            else:
-                cfg[key] = raw
-    if "master_difficulty" in data:
-        # Coerce defensively — public endpoint, so `null`, `""`, or a
-        # non-numeric string shouldn't 500 the request. float() accepts
-        # both integer and float-shaped strings; anything else returns
-        # a structured error like the dlc_dir branch above.
-        raw = data["master_difficulty"]
-        # Reject bool explicitly: Python makes bool a subclass of int, so
-        # True/False would otherwise coerce to 1/0 and persist as a valid
-        # difficulty. Caller almost certainly means "bad input".
-        if isinstance(raw, bool):
-            return {"error": "master_difficulty must be a number between 0 and 100"}
-        try:
-            cfg["master_difficulty"] = max(0, min(100, int(float(raw))))
-        except (TypeError, ValueError, OverflowError):
-            # OverflowError covers int(float("inf")) / int(float("1e309"))
-            # which Python raises distinctly from ValueError.
-            return {"error": "master_difficulty must be a number between 0 and 100"}
+    if "default_arrangement" in data:
+        cfg["default_arrangement"] = data["default_arrangement"] or ""
+
+    if "demucs_server_url" in data:
+        cfg["demucs_server_url"] = data["demucs_server_url"] or ""
 
     if "av_offset_ms" in data:
-        # Audio-output pipeline latency compensation. Positive values
-        # mean audio is running ahead of visuals; the highway adds
-        # this to its render clock to catch the visuals up. Clamped
-        # to ±1000 ms to mirror the client-side slider — a direct
-        # POST shouldn't be able to persist `1e9`. Same defensive
-        # coercion shape as master_difficulty above (reject bool,
-        # cover OverflowError, structured 4xx-style return on bad
-        # input rather than 500).
-        raw = data["av_offset_ms"]
-        if isinstance(raw, bool):
-            return {"error": "av_offset_ms must be a number between -1000 and 1000"}
+        # Positive = audio ahead of visuals; the highway adds this to
+        # audio.currentTime to catch the visuals up.
         try:
-            cfg["av_offset_ms"] = max(-1000.0, min(1000.0, float(raw)))
-        except (TypeError, ValueError, OverflowError):
-            return {"error": "av_offset_ms must be a number between -1000 and 1000"}
-
-    if "psarc_platform" in data:
-        raw = data["psarc_platform"]
-        # null is a no-op (preserves on-disk value), matching the
-        # dlc_dir / default_arrangement contract. Non-string and
-        # out-of-range strings are rejected with a structured error.
-        if raw is not None:
-            if not isinstance(raw, str) or raw not in ("both", "pc", "mac"):
-                return {"error": "psarc_platform must be 'both', 'pc', or 'mac'"}
-            cfg["psarc_platform"] = raw
+            cfg["av_offset_ms"] = float(data["av_offset_ms"] or 0)
+        except (TypeError, ValueError):
+            cfg["av_offset_ms"] = 0.0
 
     config_file.write_text(json.dumps(cfg, indent=2))
     return {"message": ". ".join(messages) if messages else "Settings saved"}
