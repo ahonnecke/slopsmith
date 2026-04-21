@@ -37,6 +37,7 @@ CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(Path.home() / ".local" / "sha
 # Writable cache directories (use CONFIG_DIR, not STATIC_DIR which may be read-only)
 ART_CACHE_DIR = CONFIG_DIR / "art_cache"
 AUDIO_CACHE_DIR = CONFIG_DIR / "audio_cache"
+SLOPPAK_CACHE_DIR = CONFIG_DIR / "sloppak_cache"
 
 
 # ── SQLite metadata cache ─────────────────────────────────────────────────────
@@ -1048,9 +1049,6 @@ def _get_or_extract(filename, psarc_path):
         _extract_cache[filename] = (tmp, song, _t.time())
 
     return tmp, song, True  # True = freshly extracted
-
-
-SLOPPAK_CACHE_DIR = STATIC_DIR / "sloppak_cache"
 
 
 @app.get("/api/sloppak/{filename:path}/file/{rel_path:path}")
