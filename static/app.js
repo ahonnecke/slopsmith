@@ -1418,8 +1418,12 @@ async function loadPlugins() {
     }
 }
 
-// Load library on start
+// Load library on start. loadSettings is awaited alongside so persisted
+// values (A/V offset, default arrangement, etc.) are applied to the
+// highway + HUD before any playSong runs — otherwise the setting would
+// only "take effect" after the user visited the Settings screen.
 loadPlugins().then(() => {
     setLibView('grid');
+    loadSettings().catch(e => console.warn('initial loadSettings failed:', e));
     checkScanAndLoad();
 });
