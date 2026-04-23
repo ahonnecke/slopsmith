@@ -904,7 +904,140 @@ if (window.slopsmith) {
     window.slopsmith.on('song:ready', (e) => {
         _applyMasteryAvailability(!!e.detail?.hasPhraseData);
     });
+    // Highway signals when it's auto-reverted to the default renderer
+    // after a broken plugin (init failure or repeated draw failures).
+    // Sync the picker + persisted selection so the UI stops advertising
+    // the broken choice and the user doesn't hit the same failure on
+    // next reload.
+    window.slopsmith.on('viz:reverted', (e) => {
+        const sel = document.getElementById('viz-picker');
+        if (sel) sel.value = 'default';
+        try { localStorage.setItem('vizSelection', 'default'); } catch (_) {}
+        console.warn(
+            `viz picker: reverted to default renderer (${e.detail?.reason || 'unknown'}).`
+        );
+    });
 }
+
+// ── Visualization picker (slopsmith#36) ─────────────────────────────────
+//
+// Discovers viz plugins via /api/plugins and adds them to the #viz-picker
+// dropdown. A viz plugin declares itself by setting `"type": "visualization"`
+// in its plugin.json AND exposing a factory function on
+// window.slopsmithViz_<id> that returns an object matching the setRenderer
+// contract ({init, draw, resize, destroy}).
+//
+// The "default" option in the dropdown is the built-in 2D highway that
+// lives inside createHighway(); selecting it calls setRenderer(null) which
+// restores the default renderer.
+async function _populateVizPicker(plugins) {
+    const sel = document.getElementById('viz-picker');
+    if (!sel) return;
+    // Clear any previously-appended plugin options so calling this
+    // function more than once (e.g. from DevTools, or a hot-reloaded
+    // plugin) doesn't produce duplicates. The built-in "default"
+    // option is static markup, preserve it.
+    Array.from(sel.options).forEach(opt => {
+        if (opt.value !== 'default') sel.removeChild(opt);
+    });
+    // Accept a pre-fetched plugins array (normal startup path reuses
+    // loadPlugins' fetch). Fall back to our own fetch if called
+    // standalone — e.g. from the DevTools console for debugging.
+    if (!Array.isArray(plugins)) {
+        plugins = [];
+        try {
+            const resp = await fetch('/api/plugins');
+            if (resp.ok) plugins = await resp.json();
+        } catch (e) {
+            console.warn('viz picker: /api/plugins fetch failed', e);
+        }
+    }
+    const vizPlugins = plugins.filter(p => p && p.type === 'visualization');
+    // "default" is the reserved id for the built-in 2D renderer option
+    // already in the <select>. A plugin with id: "default" would collide
+    // with it — the restore-from-localStorage lookup would still find
+    // the built-in entry, dragging the plugin into never-selected land
+    // silently. Fail loudly instead.
+    const RESERVED_IDS = new Set(['default']);
+    for (const p of vizPlugins) {
+        if (RESERVED_IDS.has(p.id)) {
+            console.error(`viz picker: plugin id '${p.id}' is reserved for the built-in renderer; rename the plugin's id in plugin.json to include it in the picker.`);
+            continue;
+        }
+        // Skip entries where the plugin script hasn't exposed a factory —
+        // likely means the script failed to load, or the plugin declared
+        // itself as a viz without shipping the factory yet.
+        const factoryName = 'slopsmithViz_' + p.id;
+        if (typeof window[factoryName] !== 'function') {
+            console.warn(`viz picker: plugin '${p.id}' has type=visualization but ${factoryName} is not a function; skipping`);
+            continue;
+        }
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name || p.id;
+        sel.appendChild(opt);
+    }
+    // Restore previous selection if still available. Direct option
+    // scan instead of a CSS-selector lookup so we don't depend on
+    // CSS.escape (missing in some test environments / older runtimes)
+    // and so a weird saved string (e.g. with a quote) can't throw.
+    // localStorage.getItem can itself throw when storage is blocked
+    // (private mode, sandboxed iframes, some strict test runners);
+    // fall back to null so the startup chain doesn't abort.
+    let saved = null;
+    try { saved = localStorage.getItem('vizSelection'); }
+    catch (e) { console.warn('viz picker: unable to read vizSelection', e); }
+    const savedMatches = saved && Array.from(sel.options).some(opt => opt.value === saved);
+    if (savedMatches) {
+        sel.value = saved;
+        if (saved !== 'default') setViz(saved);
+    }
+}
+
+function setViz(id) {
+    // Helper: reset the UI and persisted selection to the built-in
+    // "default" entry. Called whenever the requested viz can't be
+    // applied (missing factory, factory threw, factory returned a
+    // non-conforming renderer) so the picker, localStorage, and the
+    // highway's active renderer stay in sync.
+    const fallbackToDefault = () => {
+        try { localStorage.setItem('vizSelection', 'default'); } catch (_) {}
+        const sel = document.getElementById('viz-picker');
+        if (sel) sel.value = 'default';
+        highway.setRenderer(null);
+    };
+
+    if (id === 'default' || !id) {
+        try { localStorage.setItem('vizSelection', id || 'default'); } catch (_) {}
+        highway.setRenderer(null);
+        return;
+    }
+    const factory = window['slopsmithViz_' + id];
+    if (typeof factory !== 'function') {
+        console.error(`viz picker: factory slopsmithViz_${id} not available`);
+        fallbackToDefault();
+        return;
+    }
+    let renderer;
+    try { renderer = factory(); }
+    catch (e) {
+        console.error(`viz picker: factory slopsmithViz_${id} threw`, e);
+        fallbackToDefault();
+        return;
+    }
+    // Validate shape — highway.setRenderer will itself fall back to
+    // default on a bad renderer, but without this check the UI and
+    // localStorage would still advertise the broken selection.
+    if (!renderer || typeof renderer.draw !== 'function') {
+        console.error(`viz picker: factory slopsmithViz_${id} returned an invalid renderer (missing draw)`);
+        fallbackToDefault();
+        return;
+    }
+    // Persist only once we know the renderer is valid.
+    try { localStorage.setItem('vizSelection', id); } catch (_) {}
+    highway.setRenderer(renderer);
+}
+
 function formatTime(s) { return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
 
 // ── A-B Loop ────────────────────────────────────────────────────────────
@@ -1337,9 +1470,10 @@ async function checkScanAndLoad() {
 
 // ── Plugin loader ───────────────────────────────────────────────────────
 async function loadPlugins() {
+    let plugins;
     try {
         const resp = await fetch('/api/plugins');
-        const plugins = await resp.json();
+        plugins = await resp.json();
 
         const navContainer = document.getElementById('nav-plugins');
         const mobileNavContainer = document.getElementById('mobile-nav-plugins');
@@ -1426,13 +1560,20 @@ async function loadPlugins() {
         }
     } catch (e) {
         console.error('Failed to load plugins:', e);
+        return null;
     }
+    return plugins;
 }
 
 // Load library on start
-loadPlugins().then(() => {
+loadPlugins().then((plugins) => {
     setLibView('grid');
     checkScanAndLoad();
+    // Viz picker depends on plugin scripts having loaded (to find
+    // window.slopsmithViz_<id> factories), so run it after loadPlugins.
+    // Reuse the plugin list loadPlugins just fetched — no need to
+    // round-trip /api/plugins a second time.
+    _populateVizPicker(plugins);
     fetch('/api/version')
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(d => {

@@ -307,6 +307,11 @@
                 <option value="0.75">Medium</option>
                 <option value="0.5">Low</option>
             </select>
+            <span id="viz-picker-label" class="text-xs text-gray-500 ml-1 sr-only">Visualization</span>
+            <select id="viz-picker" onchange="setViz(this.value)" class="bg-dark-600 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-gray-300 outline-none" aria-labelledby="viz-picker-label" title="Visualization">
+                <option value="default">Highway</option>
+                <!-- Additional entries populated on load from /api/plugins (slopsmith#36) -->
+            </select>
             <span class="text-gray-700 mx-1">|</span>
             <button onclick="setLoopStart()" id="btn-loop-a" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition" title="Set loop start at current time">A</button>
             <button onclick="setLoopEnd()" id="btn-loop-b" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition" title="Set loop end at current time">B</button>

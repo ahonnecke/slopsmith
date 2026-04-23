@@ -142,6 +142,12 @@ def load_plugins(app: FastAPI, context: dict):
                 "id": plugin_id,
                 "name": manifest.get("name", plugin_id),
                 "nav": manifest.get("nav"),
+                # `type` is an optional manifest hint for the frontend —
+                # e.g. "visualization" lets the highway viz picker know
+                # this plugin offers a renderer. Absent → no declared
+                # role; plugin is still loaded and scripts run, it just
+                # doesn't show up in role-specific UIs. See slopsmith#36.
+                "type": manifest.get("type"),
                 "has_screen": bool(manifest.get("screen")),
                 "has_script": bool(manifest.get("script")),
                 "has_settings": bool(manifest.get("settings")),
@@ -194,6 +200,11 @@ def register_plugin_api(app: FastAPI):
                 "id": p["id"],
                 "name": p["name"],
                 "nav": p["nav"],
+                # type is None for plugins without the manifest hint —
+                # frontend filters like "give me all type=visualization"
+                # work via identity comparison; absent is treated as
+                # "no declared role".
+                "type": p.get("type"),
                 "has_screen": p["has_screen"],
                 "has_script": p["has_script"],
                 "has_settings": p["has_settings"],

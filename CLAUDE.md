@@ -37,6 +37,7 @@ Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` 
   "name": "My Plugin",
   "version": "1.0.0",
   "private": false,
+  "type": "visualization",
   "nav": { "label": "My Plugin", "screen": "plugin-my_plugin" },
   "screen": "screen.html",
   "script": "screen.js",
@@ -48,6 +49,10 @@ Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` 
 All fields except `id` and `name` are optional. Plugins can have any combination of frontend (screen/script), backend (routes), and settings.
 
 `version` and `private` are advisory metadata — the plugin loader does not currently consume them, but plugins commonly include them for publishing/tooling purposes.
+
+`type` is an optional role hint (slopsmith#36). Supported values:
+- `"visualization"` — plugin provides a highway renderer. Declaring this makes the plugin eligible for the main-player viz picker (and, once Wave C lands, splitscreen's per-panel picker too). Must pair with a `window.slopsmithViz_<id>` factory exporting the setRenderer contract below.
+- Absent → no declared role; plugin is loaded and its script runs, but it doesn't appear in role-specific UIs.
 
 **Backend routes** — `routes.py` must export a `setup(app, context)` function. The `context` dict provides:
 - `config_dir` — persistent config path
@@ -62,11 +67,72 @@ All fields except `id` and `name` are optional. Plugins can have any combination
 
 ## Plugin Best Practices
 
-### Visualization plugins MUST export a factory function
+### Visualization plugins — two complementary contracts
 
-Any plugin that renders a visualization (tab view, note display, 3D highway, etc.) **must** export a factory function on `window` so the [Split Screen plugin](https://github.com/topkoa/slopsmith-plugin-splitscreen) can embed it as a per-panel pane.
+Slopsmith supports two ways for a plugin to provide a visualization. They coexist; new plugins should prefer the setRenderer contract where it fits.
 
-**The contract:**
+#### 1. setRenderer contract (slopsmith#36) — preferred
+
+Plugins that want to replace the main highway's draw function (per panel, per session) export a renderer factory on `window.slopsmithViz_<id>` where `<id>` matches the `id` in `plugin.json` (`type: "visualization"` required). The factory returns an object matching this shape:
+
+```js
+window.slopsmithViz_my_viz = function () {
+    return {
+        init(canvas, bundle) {
+            // One-time setup. Own your getContext() call here —
+            // acquire '2d' or 'webgl' depending on the renderer.
+            this.ctx = canvas.getContext('2d');
+        },
+        draw(bundle) {
+            // Called each requestAnimationFrame tick by the factory.
+            // `bundle` is a snapshot with: currentTime, songInfo, isReady,
+            // notes, chords, anchors (all difficulty-filter-aware),
+            // beats, sections, chordTemplates, lyrics, toneChanges,
+            // toneBase, mastery, hasPhraseData, inverted, lefty,
+            // renderScale, lyricsVisible, plus the 2D coordinate
+            // helpers project and fretX. If your renderer needs
+            // lefty-aware text rendering, check bundle.lefty and
+            // apply the mirror transform yourself — a bundle-level
+            // helper isn't provided because it would need your
+            // renderer's own context, not the factory's.
+        },
+        resize(w, h) {
+            // Optional. Canvas dims already updated; re-create WebGL
+            // framebuffers / reset 2D transforms here.
+        },
+        destroy() {
+            // Optional. Release resources, remove DOM nodes, null refs.
+            // Called before setRenderer() swaps to another renderer
+            // and on highway.stop().
+        },
+    };
+};
+```
+
+Selecting this plugin in the main-player viz picker (or, after Wave C, in splitscreen's per-panel picker) calls `highway.setRenderer(factory())` on the existing highway instance. The built-in 2D highway is the default renderer and is restored by `setRenderer(null)`.
+
+**Lifecycle contract.** The factory returns a single renderer instance that may go through multiple `init() → ... → destroy()` cycles as the user navigates between songs or screens. Specifically:
+
+- `init(canvas, bundle)` runs when the highway has a canvas and the renderer takes over drawing. This is when to acquire `getContext()`, build shaders / meshes / DOM nodes, and register listeners.
+- `draw(bundle)` runs every rAF frame until the renderer is replaced or the highway stops.
+- `destroy()` runs when the renderer is replaced via another `setRenderer(...)` call, OR when `highway.stop()` is called (e.g. the user navigates away from the player). It releases everything `init()` acquired.
+- **After `destroy()`, the same instance may receive another `init()` call** — this happens on `playSong()` which does `stop()` → `init()` to reuse the same canvas element for the next song. Renderers must tolerate `init()` being called again on an instance that was previously destroyed. Practically: null your refs in destroy, re-acquire them in init.
+- `destroy()` is skipped when it would run on an un-init'd renderer — if a caller does `setRenderer(x)` before the highway ever init'd (possible when restoring a saved picker selection at page load), `x.destroy()` is not called until `x.init()` has run at least once.
+- `resize(w, h)` is optional; runs after init and whenever the canvas dimensions change.
+
+**Key rules:**
+- The factory **returns a fresh object on each call** — important for splitscreen, where multiple panels will each get an independent instance.
+- The renderer **owns its own rendering context** (2D or WebGL). Factory will not call getContext for you.
+- **Canvas context caveat — "first context wins".** Browsers lock a canvas element to the first context type successfully acquired for its lifetime: once `getContext('2d')` succeeds, `getContext('webgl')` on that same canvas returns `null`, and vice versa. This produces two asymmetric cases with the renderer picker:
+  - A WebGL renderer *can* work if it is selected **before** `createHighway().init()` has a chance to acquire a 2D context — the restore-saved-selection path in app.js calls `setRenderer` at page load, which stashes the choice; the first `highway.init()` that follows will then install the WebGL renderer directly, and `_defaultRenderer` never grabs a 2D context on that canvas.
+  - But if the default renderer already owns the canvas (the usual case — user picks WebGL from the dropdown mid-session), switching to WebGL on that same canvas fails. The reverse fails too: a canvas that started with a WebGL renderer can't switch back to the default 2D.
+  Supporting arbitrary swaps between 2D and WebGL therefore requires recreating or replacing the canvas element when the context type changes — out of scope for Wave A, but the restore-at-load path is a viable escape hatch for WebGL viz authors today.
+- `draw(bundle)` receives difficulty-filtered arrays — never read from `_filteredNotes` or other internals.
+- `_drawHooks` fire only for the default 2D renderer. Custom renderers handling their own compositing should not expect them.
+
+#### 2. Standalone pane contract — used by splitscreen today
+
+Plugins that want to be their own fully self-contained pane (own WebSocket, own canvas, own rAF loop) — the model splitscreen uses for Tab view and similar — export a factory on `window.createMyVisualization`:
 
 ```js
 window.createMyVisualization = function ({ container }) {
@@ -93,6 +159,8 @@ See the full integration guide: [Integrating Your Plugin With Split Screen](http
 Reference implementations:
 - **Lyrics pane** — `createLyricsPane()` in splitscreen's screen.js (DOM-based, simplest example)
 - **Jumping Tab** — `window.createJumpingTabPane()` in the [Jumping Tab plugin](https://github.com/renanboni/slopsmith-plugin-jumpingtab) (canvas-based with context-swap)
+
+**Why both?** setRenderer plugs into an existing highway, reusing its WebSocket and data parsing — zero boilerplate for the common "I want a different look for the same data" case. The pane contract is for panels that need their own lifecycle (e.g. Tab view fetches GP5 separately, has no highway data) or for splitscreen's per-panel setup today. A future wave will unify: splitscreen will use setRenderer on its per-panel highway instances, and the pane contract will become the minority path for truly data-independent viz.
 
 ### General plugin guidelines
 

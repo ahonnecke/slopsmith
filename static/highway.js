@@ -131,7 +131,11 @@ function createHighway() {
 
     /** Call while lefty mirror transform is active; keeps glyphs readable. */
     function fillTextReadable(text, x, y) {
-        if (!canvas) return;
+        // ctx may be null when the 2D context was never acquired
+        // (canvas already locked to WebGL). No-op in that case —
+        // alternatives would be throwing, which breaks plugin hooks
+        // that call this after a context-type mismatch.
+        if (!canvas || !ctx) return;
         const W = canvas.width;
         if (!_lefty) {
             ctx.fillText(text, x, y);
@@ -144,46 +148,312 @@ function createHighway() {
     }
 
     // ── Drawing ──────────────────────────────────────────────────────────
+    //
+    // slopsmith#36 — swappable renderers.
+    //
+    // The default renderer below is the original 2D canvas highway. Its
+    // methods still reach into the factory closure (ctx, beats, notes,
+    // _drawHooks, etc.) to avoid rewriting every helper; it's not
+    // "isolated," just shaped as the contract. Custom renderers from
+    // plugins (3D, tab, fretboard, future "keys"/"drums") pass through
+    // setRenderer() and consume the bundle instead of the closure —
+    // they stay self-contained and never touch the factory's `ctx`.
+    //
+    // Lifecycle: setRenderer(r) -> previous.destroy() -> r.init(canvas,
+    // bundle) -> per frame r.draw(bundle) -> on resize r.resize(w, h) ->
+    // on stop or swap r.destroy(). Renderer owns its rendering context
+    // (2D, WebGL, DOM overlay). Factory owns canvas element, rAF, WS,
+    // data state, resize subscription, _drawHooks for 2D compositing.
+    //
+    // Contract for setRenderer(r): r is an object with at minimum
+    // {draw(bundle)}. init / resize / destroy are optional. Pass null
+    // or undefined to restore the default renderer.
+    //
+    // The bundle (see _makeBundle) is a per-frame snapshot of factory
+    // state — includes difficulty-filtered note / chord / anchor arrays
+    // so renderers never touch _filteredX internals directly. Arrays
+    // are live references (performance), NOT copies — renderers must
+    // treat them as read-only.
+    let _renderer = null;
+
+    function _makeBundle() {
+        // Snapshot of current factory state passed to each renderer call.
+        // Arrays and songInfo are LIVE references, not copies — the bundle
+        // itself is rebuilt each frame but its `notes`, `chords`,
+        // `anchors`, `beats`, etc. point at closure state. Renderers
+        // MUST NOT mutate these; treat them as read-only. We don't
+        // Object.freeze or deep-copy for per-frame allocation cost reasons.
+        return {
+            // Timing
+            currentTime,
+            songInfo,
+            isReady: ready,
+
+            // Chart content (filter-aware — difficulty-filtered arrays
+            // preferred; raw arrays are the fallback when no ladder data).
+            notes: _filteredNotes !== null ? _filteredNotes : notes,
+            chords: _filteredChords !== null ? _filteredChords : chords,
+            anchors: _filteredAnchors !== null ? _filteredAnchors : anchors,
+            beats,
+            sections,
+            chordTemplates,
+            lyrics,
+            toneChanges,
+            toneBase,
+
+            // Master-difficulty (slopsmith#48)
+            mastery: _mastery,
+            hasPhraseData: !!(_phrases && _phrases.length > 0),
+
+            // Display flags
+            inverted: _inverted,
+            lefty: _lefty,
+            renderScale: _renderScale,
+            lyricsVisible: showLyrics,
+
+            // 2D-style helpers (renderers that don't need these can ignore).
+            // `fillTextUnmirrored` is deliberately NOT exposed here —
+            // the factory-level version writes to the default renderer's
+            // closure ctx, which is null for custom renderers. Renderers
+            // that need lefty-aware text should check `bundle.lefty` and
+            // apply the mirror transform themselves on their own context.
+            project,
+            fretX,
+        };
+    }
+
+    const _defaultRenderer = {
+        _ctxWarned: false,
+        init(canvasEl /* , bundle */) {
+            // getContext('2d') returns null when the canvas is already
+            // locked to another context type (e.g. a WebGL viz plugin
+            // grabbed it first). Once that happens the 2D renderer can't
+            // recover on the same canvas — surface a single clear error
+            // and skip drawing. A future revision will recreate the
+            // canvas element on renderer-type swap to avoid this.
+            ctx = canvasEl.getContext('2d');
+            if (!ctx && !this._ctxWarned) {
+                console.error(
+                    'Default 2D renderer: canvas.getContext("2d") returned null ' +
+                    '— the canvas is locked to another context type. ' +
+                    'Reload the page to restore the highway.'
+                );
+                this._ctxWarned = true;
+            }
+        },
+        draw(/* bundle */) {
+            // Still reads from the factory closure directly — the bundle
+            // is shaped for custom renderers, not used here. Keeping the
+            // default renderer's body unchanged from the pre-refactor
+            // draw() preserves pixel-level parity with current main.
+            if (!canvas || !ready || !ctx) return;
+            try {
+                const W = canvas.width;
+                const H = canvas.height;
+                ctx.fillStyle = BG;
+                ctx.fillRect(0, 0, W, H);
+
+                const anchor = getAnchorAt(currentTime);
+                updateSmoothAnchor(anchor, 1 / 60);
+
+                ctx.save();
+                if (_lefty) {
+                    ctx.translate(W, 0);
+                    ctx.scale(-1, 1);
+                }
+
+                drawHighway(W, H);
+                drawFretLines(W, H);
+                drawBeats(W, H);
+                drawStrings(W, H);
+                drawSustains(W, H);
+                drawNowLine(W, H);
+                drawNotes(W, H);
+                drawChords(W, H);
+                drawFretNumbers(W, H);
+
+                // Plugin draw hooks (same coordinate system as the highway).
+                // Hooks are a 2D-only contract — the default renderer owns
+                // their invocation. Custom renderers on non-2D contexts
+                // (e.g. WebGL) don't call them; the factory doesn't
+                // invoke hooks on their behalf.
+                for (const hook of _drawHooks) {
+                    try { hook(ctx, W, H); } catch (e) { /* ignore */ }
+                }
+
+                ctx.restore();
+
+                // Lyrics: drawn unmirrored so lines stay left-to-right readable (layout is center-symmetric)
+                if (showLyrics) drawLyrics(W, H);
+            } catch (e) {
+                console.error('draw error:', e);
+            }
+        },
+        resize(/* w, h */) {
+            // no-op; canvas dimension change is handled by the factory,
+            // and the 2D context doesn't maintain persistent state we'd
+            // need to rebuild here.
+        },
+        destroy() {
+            // Leave ctx intact. Helper paths like fillTextReadable /
+            // api.fillTextUnmirrored may still be called while another
+            // renderer is active or after stop() (e.g. a residual draw
+            // hook, plugin cleanup code). Forcing ctx to null would
+            // make those calls throw. A subsequent init() re-assigns
+            // ctx via canvasEl.getContext('2d') — the browser returns
+            // the same cached context for the same canvas, so there's
+            // nothing to "refresh" by nulling. Reset the warn-once
+            // guard so a fresh init on a fresh canvas is a new
+            // opportunity to succeed or fail.
+            this._ctxWarned = false;
+        },
+    };
+
+    // Tracks consecutive renderer.draw failures so a permanently broken
+    // renderer auto-reverts to default instead of spamming the console
+    // every frame. Reset on every successful draw and whenever a new
+    // renderer is installed.
+    let _rendererDrawFailures = 0;
+    const MAX_RENDERER_DRAW_FAILURES = 3;
+
+    // True only while the current renderer has had a successful init
+    // since its last destroy (or was freshly installed but never init'd
+    // because canvas was null). Gates destroy calls so an uninit'd
+    // renderer doesn't receive spurious destroys — the restore-on-
+    // page-load flow relies on this: setRenderer can run before init.
+    let _rendererInited = false;
+
+    function _destroyCurrentIfInited() {
+        if (_renderer && _rendererInited && typeof _renderer.destroy === 'function') {
+            try { _renderer.destroy(); }
+            catch (e) { console.error('renderer destroy:', e); }
+        }
+        _rendererInited = false;
+    }
+
+    function _emitVizReverted(reason) {
+        // Notify listeners (e.g. app.js's viz picker, splitscreen's
+        // per-panel picker in Wave C) that the factory auto-reverted
+        // to the default renderer — so the UI / persisted selection
+        // don't keep advertising the broken plugin.
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            try { window.slopsmith.emit('viz:reverted', { reason }); }
+            catch (e) { console.error('viz:reverted emit:', e); }
+        }
+    }
+
+    function _setRenderer(r) {
+        _destroyCurrentIfInited();
+        // null/undefined reverts to default. Anything else must provide
+        // at minimum a draw(bundle) function — without it the rAF loop
+        // would throw every frame. Log once and fall back to default
+        // rather than accepting a broken renderer.
+        let next;
+        if (r == null) {
+            next = _defaultRenderer;
+        } else if (typeof r.draw === 'function') {
+            next = r;
+        } else {
+            console.error('setRenderer: renderer missing draw(bundle) function; reverting to default.');
+            next = _defaultRenderer;
+        }
+        _renderer = next;
+        _rendererDrawFailures = 0;
+        // Defer init/resize until the canvas is available. setRenderer
+        // can legitimately be called before api.init() runs (e.g. app.js
+        // restoring a saved picker selection at page load, before any
+        // song has been played). api.init() will re-run these when it
+        // assigns the canvas.
+        if (!canvas) return;
+        const bundle = _makeBundle();
+        // A renderer without an init() function is treated as ready
+        // by default (it simply has no setup to do). If an init()
+        // exists, only flip the flag true when it returns without
+        // throwing — otherwise a later destroy would run on an
+        // effectively-uninitialized renderer.
+        let initSucceeded = typeof _renderer.init !== 'function';
+        if (typeof _renderer.init === 'function') {
+            try {
+                _renderer.init(canvas, bundle);
+                initSucceeded = true;
+            }
+            catch (e) {
+                console.error('renderer init:', e);
+                // Init may have partially allocated GPU/DOM resources
+                // before throwing. Run destroy best-effort to release
+                // whatever it got — renderer's destroy contract already
+                // requires handling partial state gracefully. Then
+                // revert to the default renderer so the user isn't
+                // stranded on a broken viz, and notify the UI so the
+                // picker + localStorage sync back to 'default'.
+                if (_renderer !== _defaultRenderer) {
+                    if (typeof _renderer.destroy === 'function') {
+                        try { _renderer.destroy(); }
+                        catch (destroyErr) {
+                            console.error('renderer destroy after init failure:', destroyErr);
+                        }
+                    }
+                    _renderer = _defaultRenderer;
+                    _emitVizReverted('init-failure');
+                    if (typeof _renderer.init === 'function') {
+                        try {
+                            _renderer.init(canvas, _makeBundle());
+                            initSucceeded = true;
+                        }
+                        catch (e2) {
+                            console.error('default renderer init after revert:', e2);
+                        }
+                    } else {
+                        initSucceeded = true;
+                    }
+                }
+            }
+        }
+        _rendererInited = initSucceeded;
+        if (!_rendererInited) return;
+        if (typeof _renderer.resize === 'function') {
+            try { _renderer.resize(canvas.width, canvas.height); }
+            catch (e) { console.error('renderer resize:', e); }
+        }
+    }
+
     function draw() {
         animFrame = requestAnimationFrame(draw);
-        if (!canvas || !ready) return;
+        if (!canvas || !_renderer) return;
+        // Match pre-refactor behaviour: skip draw until WS ready fires.
+        // This gates out the brief "arrays cleared, WS reconnecting"
+        // window during playSong / reconnect. Renderers that want to
+        // draw a loading state can still opt in via the `isReady`
+        // field on the bundle passed to a custom pre-ready handler —
+        // we'd need to widen the contract to support that, out of
+        // scope here. Default 2D renderer also checks `ready` in its
+        // draw body (defence in depth).
+        if (!ready) return;
+        // Skip bundle allocation when the default renderer is active —
+        // it reads closure state directly and ignores the bundle.
+        // _makeBundle at 60fps was a steady GC churn for the common
+        // case where no custom renderer is installed.
+        const bundle = _renderer === _defaultRenderer ? undefined : _makeBundle();
         try {
-        const W = canvas.width;
-        const H = canvas.height;
-        ctx.fillStyle = BG;
-        ctx.fillRect(0, 0, W, H);
-
-        const anchor = getAnchorAt(currentTime);
-        updateSmoothAnchor(anchor, 1 / 60);
-
-        ctx.save();
-        if (_lefty) {
-            ctx.translate(W, 0);
-            ctx.scale(-1, 1);
-        }
-
-        drawHighway(W, H);
-        drawFretLines(W, H);
-        drawBeats(W, H);
-        drawStrings(W, H);
-        drawSustains(W, H);
-        drawNowLine(W, H);
-        drawNotes(W, H);
-        drawChords(W, H);
-        drawFretNumbers(W, H);
-
-        // Plugin draw hooks (same coordinate system as the highway)
-        for (const hook of _drawHooks) {
-            try { hook(ctx, W, H); } catch (e) { /* ignore */ }
-        }
-
-        ctx.restore();
-
-        // Lyrics: drawn unmirrored so lines stay left-to-right readable (layout is center-symmetric)
-        if (showLyrics) drawLyrics(W, H);
-
+            _renderer.draw(bundle);
+            _rendererDrawFailures = 0;
         } catch (e) {
-            console.error('draw error:', e);
+            _rendererDrawFailures += 1;
+            console.error('renderer draw:', e);
+            // Self-heal: a plugin whose draw() throws every frame
+            // would otherwise spam the console and leave the canvas
+            // blank indefinitely. After a short streak of failures,
+            // revert to the built-in renderer so the user at least
+            // gets the default highway back. 2D default is known-safe.
+            if (_rendererDrawFailures >= MAX_RENDERER_DRAW_FAILURES &&
+                _renderer !== _defaultRenderer) {
+                console.error(
+                    'renderer draw: failed ' + _rendererDrawFailures +
+                    ' frames in a row; reverting to default renderer.'
+                );
+                _setRenderer(_defaultRenderer);
+                _emitVizReverted('draw-failure');
+            }
         }
     }
 
@@ -1046,8 +1316,25 @@ function createHighway() {
         init(canvasEl, container) {
             canvas = canvasEl;
             _resizeContainer = container || null;
-            ctx = canvas.getContext('2d');
+            // Size the canvas BEFORE installing the renderer so
+            // _setRenderer's init/resize calls see the real dimensions
+            // instead of the default 300x150 backing store. Otherwise
+            // WebGL renderers would allocate framebuffers at the wrong
+            // size and immediately have to tear them down when
+            // api.resize fires afterwards.
             this.resize();
+            // Install the default renderer on first init. If a caller
+            // pre-selected a custom renderer before init ran (e.g.
+            // app.js restoring a saved viz picker selection at page
+            // load), re-apply that choice now that the canvas is
+            // available instead of clobbering it with the default.
+            // _setRenderer(_renderer) is correct: it re-applies the
+            // selected renderer now that the canvas exists, and only
+            // destroys the previous renderer if it had been
+            // successfully init'd before this mount (so a pre-selected
+            // renderer that never saw a canvas gets init'd fresh, not
+            // destroy+init'd).
+            _setRenderer(_renderer || _defaultRenderer);
             if (_resizeHandler) window.removeEventListener('resize', _resizeHandler);
             _resizeHandler = () => this.resize();
             window.addEventListener('resize', _resizeHandler);
@@ -1081,6 +1368,22 @@ function createHighway() {
             canvas.style.height = h + 'px';
             canvas.width = Math.round(w * _renderScale);
             canvas.height = Math.round(h * _renderScale);
+            // Notify the active renderer so WebGL / offscreen buffers
+            // can recreate their framebuffers. Setting canvas.width
+            // above already invalidates both 2D and WebGL state — any
+            // renderer relying on persistent GPU resources listens here.
+            //
+            // Gated on _rendererInited: a renderer pre-selected via
+            // setRenderer before api.init has run is stashed but not
+            // initialized yet. Calling resize() on it would violate
+            // the init-before-resize contract and can break renderers
+            // that assume resize() means "canvas dims changed after
+            // setup." The subsequent api.init will call its resize()
+            // once init succeeds.
+            if (_renderer && _rendererInited && typeof _renderer.resize === 'function') {
+                try { _renderer.resize(canvas.width, canvas.height); }
+                catch (e) { console.error('renderer resize:', e); }
+            }
         },
 
         setRenderScale(scale) {
@@ -1377,8 +1680,33 @@ function createHighway() {
                 window.removeEventListener('resize', _resizeHandler);
                 _resizeHandler = null;
             }
+            // Release the renderer's GPU / DOM / event-listener resources
+            // when leaving the player — anything it allocated in init()
+            // should be torn down here so navigating away doesn't leak.
+            // Crucially we KEEP `_renderer` (the instance/selection) so
+            // that the next api.init() can re-apply the same visualization
+            // on the new canvas. _rendererInited flips to false so
+            // _setRenderer knows not to call destroy() again on this
+            // already-destroyed instance.
+            _destroyCurrentIfInited();
             ready = false;
         },
+
+        /**
+         * Install a custom renderer. Contract (slopsmith#36):
+         *   r.init(canvas, bundle) — one-time setup; owns getContext().
+         *   r.draw(bundle)         — per rAF frame.
+         *   r.resize(w, h)         — optional; called when canvas dims change.
+         *   r.destroy()            — optional; release resources.
+         * Pass null or undefined to restore the default renderer.
+         *
+         * Custom renderers receive a data bundle (see _makeBundle) that
+         * already applies the master-difficulty filter — the notes /
+         * chords / anchors arrays are the right set to render regardless
+         * of slider position. Use _drawHooks only for the default
+         * renderer; they're a 2D-only contract.
+         */
+        setRenderer(r) { _setRenderer(r); },
     };
     return api;
 }
