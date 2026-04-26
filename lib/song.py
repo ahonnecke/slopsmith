@@ -253,6 +253,81 @@ def phrase_from_wire(d: dict) -> Phrase:
     )
 
 
+def arrangement_string_count(arr: Arrangement) -> int:
+    """Derive the active arrangement's string count.
+
+    Used by the server to emit ``stringCount`` in the song_info
+    WebSocket payload (slopsmith-plugin-3dhighway#7).
+
+    The RS XML schema always emits 6 ``<tuning>`` slots regardless
+    of instrument (bass charts populate `string0`–`string3` and pad
+    `string4`/`string5` with zeros), so ``len(arr.tuning)`` is not
+    a reliable signal. Two independent signals get combined:
+
+    1. **Notes-derived lower bound.** The highest string index
+       referenced anywhere in notes + chord-notes, +1. A GP-imported
+       7-string guitar with notes on strings 0..6 reports 7 here.
+       But this is a LOWER BOUND only — a 6-string lead chart that
+       never plays string 5 reports 5, undercounting by 1.
+
+    2. **Name-based fallback.** Arrangements named "Bass" (case-
+       insensitive substring match) default to 4; everything else
+       defaults to 6. This catches the partial-string-usage case
+       where notes don't span all the instrument's strings.
+
+    A third signal — ``len(arr.tuning)`` when it isn't the RS-XML
+    padded value of 6 — folds in for sloppak / GP-imported sources
+    where the tuning array is explicitly trimmed (4 for bass, 5 for
+    5-string bass, 7 for 7-string guitar, etc.). RS-XML / PSARC
+    sources always emit length 6 regardless of instrument, so we
+    deliberately ignore that exact value to avoid mis-classifying
+    bass arrangements as guitar. ``< 6`` and ``> 6`` are both
+    trustworthy signals.
+
+    The result is ``max(notes_count, name_based, tuning_count)``
+    where ``tuning_count`` is ``len(arr.tuning)`` when ``!= 6``,
+    else 0. Worked examples:
+
+    * RS XML 4-string bass, full usage (tuning len 6, notes 0..3) →
+      max(4, 4, 0) = 4
+    * RS XML 4-string bass, sparse usage (tuning len 6, notes 0..2) →
+      max(3, 4, 0) = 4
+    * RS XML 6-string lead, full usage (tuning len 6, notes 0..5) →
+      max(6, 6, 0) = 6
+    * RS XML 6-string lead, sparse usage (tuning len 6, notes 0..4) →
+      max(5, 6, 0) = 6
+    * Sloppak 5-string bass, sparse usage (tuning len 5, notes 0..3) →
+      max(4, 4, 5) = 5
+    * GP 7-string guitar (tuning len 7, notes 0..6) → max(7, 6, 7) = 7
+    * GP 5-string bass (tuning len 5, notes 0..4) → max(5, 4, 5) = 5
+    * Empty arrangement named "Bass" (tuning len 6) →
+      max(0, 4, 0) = 4
+    * Empty arrangement named "Lead" (tuning len 6) →
+      max(0, 6, 0) = 6
+
+    Topkoa's issue argues plugins shouldn't do arrangement-name
+    matching; server-side fallback IS the right place for it
+    because it gives plugins a single reliable ``stringCount`` to
+    consume.
+    """
+    max_s = -1
+    for n in arr.notes:
+        if n.string > max_s:
+            max_s = n.string
+    for ch in arr.chords:
+        for cn in ch.notes:
+            if cn.string > max_s:
+                max_s = cn.string
+    notes_count = max_s + 1 if max_s >= 0 else 0
+    name_based = 4 if "bass" in arr.name.lower() else 6
+    # Tuning-length signal — only trustworthy when NOT the RS-XML
+    # padded value of 6. Length 4/5 indicates explicit bass / 5-string
+    # bass; length 7/8 indicates an extended-range guitar from GP.
+    tuning_len = len(arr.tuning)
+    tuning_count = tuning_len if tuning_len != 6 else 0
+    return max(notes_count, name_based, tuning_count)
+
+
 def arrangement_to_wire(arr: Arrangement) -> dict:
     """Serialize an Arrangement into a JSON-ready dict matching the wire format."""
     out = {

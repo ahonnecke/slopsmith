@@ -91,14 +91,17 @@ window.slopsmithViz_my_viz = function () {
             // Called each requestAnimationFrame tick by the factory.
             // `bundle` is a snapshot with: currentTime, songInfo, isReady,
             // notes, chords, anchors (all difficulty-filter-aware),
-            // beats, sections, chordTemplates, lyrics, toneChanges,
-            // toneBase, mastery, hasPhraseData, inverted, lefty,
-            // renderScale, lyricsVisible, plus the 2D coordinate
-            // helpers project and fretX. If your renderer needs
-            // lefty-aware text rendering, check bundle.lefty and
-            // apply the mirror transform yourself — a bundle-level
-            // helper isn't provided because it would need your
-            // renderer's own context, not the factory's.
+            // beats, sections, chordTemplates, stringCount, lyrics,
+            // toneChanges, toneBase, mastery, hasPhraseData, inverted,
+            // lefty, renderScale, lyricsVisible, plus the 2D coordinate
+            // helpers project and fretX. `stringCount` is the active
+            // arrangement's string count (4 for bass, 6 for guitar,
+            // 7+ for extended-range GP imports — size string-indexed
+            // geometry against this, not a hardcoded 6). If your
+            // renderer needs lefty-aware text rendering, check
+            // bundle.lefty and apply the mirror transform yourself —
+            // a bundle-level helper isn't provided because it would
+            // need your renderer's own context, not the factory's.
         },
         resize(w, h) {
             // Optional. Canvas dims already updated; re-create WebGL
@@ -163,6 +166,7 @@ Plugins that add a layer on top of whichever visualization is active — HUDs, f
 - `highway.getNotes()` / `highway.getChords()` — difficulty-filter-aware arrays
 - `highway.getChordTemplates()` — chord shape lookup table; index by `chord.id` from `getChords()` to get `{ name, fingers, frets }`. `fingers` and `frets` are per-string arrays (length matches the tuning's string count); within `fingers`, `-1` = unused, `0` = open string, `n > 0` = finger number. RS XML sources populate real fingerings; GP imports currently emit all `-1` since pre-import sources don't carry finger data. Not filter-aware: templates are static metadata, every `chord_id` referenced by `getChords()` is guaranteed valid
 - `highway.getSongInfo()` — tuning, arrangement, capo
+- `highway.getStringCount()` — number of strings on the active arrangement (4 for bass, 6 for guitar, 7+ for extended-range GP imports). Derived server-side as `max(notes-max-string + 1, name-based fallback, len(tuning))` where the tuning length only contributes when it isn't the RS-XML padded 6-string form (sloppak / GP-imported sources carry trimmed tuning lengths). The name-based fallback is 4 for arrangements containing "bass" (case-insensitive) and 6 otherwise. This combination handles partial-string-usage charts (a 6-string lead that never plays string 5), extended-range GP imports (5-string bass, 7-string guitar), and sloppaks that explicitly encode the instrument range — without requiring plugins to do their own arrangement-name matching
 - `highway.getLefty()` / `highway.getInverted()` — mirror + invert state
 
 Overlays do NOT appear in the viz picker and do NOT declare `"type": "visualization"` in `plugin.json`. They coexist with whichever renderer (default 2D, 3D highway, piano, ...) the user has picked.

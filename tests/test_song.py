@@ -14,6 +14,7 @@ from song import (
     Phrase,
     PhraseLevel,
     arrangement_from_wire,
+    arrangement_string_count,
     arrangement_to_wire,
     chord_from_wire,
     chord_to_wire,
@@ -466,3 +467,155 @@ def test_chord_with_empty_notes_list_round_trips():
     # A chord with no notes (unusual but valid input) should survive round-trip.
     c = Chord(time=1.0, chord_id=3, notes=[])
     assert chord_from_wire(chord_to_wire(c)) == c
+
+
+# ── arrangement_string_count (slopsmith-plugin-3dhighway#7) ──────────────────
+
+def test_string_count_4_for_bass_arrangement_with_full_string_usage():
+    # 4-string bass: notes reference strings 0..3.
+    arr = Arrangement(
+        name="Bass",
+        notes=[
+            Note(time=0.0, string=0, fret=3),
+            Note(time=1.0, string=2, fret=5),
+            Note(time=2.0, string=3, fret=0),
+        ],
+    )
+    assert arrangement_string_count(arr) == 4
+
+
+def test_string_count_4_for_bass_with_sparse_string_usage():
+    # 4-string bass with notes only on strings 0..2. Notes-derived
+    # gives 3, but the name-based fallback bumps it to 4. This is
+    # the case codex flagged as broken under the pure notes-derived
+    # approach — a real-world bass line that doesn't touch the high
+    # G string still has 4 strings on the instrument.
+    arr = Arrangement(
+        name="Bass",
+        notes=[
+            Note(time=0.0, string=0, fret=3),
+            Note(time=1.0, string=1, fret=5),
+            Note(time=2.0, string=2, fret=0),
+        ],
+    )
+    assert arrangement_string_count(arr) == 4
+
+
+def test_string_count_6_for_standard_guitar_with_full_string_usage():
+    # Notes spread across all 6 strings.
+    arr = Arrangement(
+        name="Lead",
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(6)],
+    )
+    assert arrangement_string_count(arr) == 6
+
+
+def test_string_count_6_for_guitar_with_sparse_string_usage():
+    # 6-string lead chart with notes only on strings 0..4 (never
+    # touches string 5, the highest-index string in RS indexing).
+    # Notes-derived gives 5; name-based fallback (anything-not-bass
+    # = 6) bumps to the correct 6.
+    arr = Arrangement(
+        name="Lead",
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(5)],
+    )
+    assert arrangement_string_count(arr) == 6
+
+
+def test_string_count_uses_chord_notes_when_higher_than_single_notes():
+    # Single notes only touch strings 0–2; the chord touches string 5.
+    arr = Arrangement(
+        name="Rhythm",
+        notes=[Note(time=0.0, string=0, fret=0), Note(time=1.0, string=2, fret=3)],
+        chords=[Chord(time=2.0, chord_id=0, notes=[
+            Note(time=2.0, string=4, fret=0),
+            Note(time=2.0, string=5, fret=0),
+        ])],
+    )
+    assert arrangement_string_count(arr) == 6
+
+
+def test_string_count_empty_bass_arrangement_returns_4():
+    # Empty arrangement named "Bass" — name-based fallback wins.
+    arr = Arrangement(name="Bass")
+    assert arrangement_string_count(arr) == 4
+
+
+def test_string_count_empty_non_bass_arrangement_returns_6():
+    # Empty non-bass arrangement defaults to the canonical 6.
+    arr = Arrangement(name="Lead")
+    assert arrangement_string_count(arr) == 6
+
+
+def test_string_count_7_for_extended_range_guitar():
+    # 7-string guitar (GP-imported sources may carry these). Notes
+    # span 0..6, so the notes-derived count is 7. The name-based
+    # fallback gives 6, but max() picks the higher value — extended-
+    # range arrangements are correctly handled WITHOUT having to
+    # special-case "7-string" in the name.
+    arr = Arrangement(
+        name="Lead",
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(7)],
+    )
+    assert arrangement_string_count(arr) == 7
+
+
+def test_string_count_5_for_extended_range_bass():
+    # 5-string bass via GP import — notes span 0..4. Notes-derived
+    # gives 5; name-based gives 4; max picks 5. No special-casing
+    # for "5-string" in the arrangement name needed.
+    arr = Arrangement(
+        name="Bass",
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(5)],
+    )
+    assert arrangement_string_count(arr) == 5
+
+
+def test_string_count_name_match_is_case_insensitive():
+    arr_lower = Arrangement(name="bass")
+    arr_upper = Arrangement(name="BASS")
+    arr_mixed = Arrangement(name="Combo Bass")  # substring match
+    assert arrangement_string_count(arr_lower) == 4
+    assert arrangement_string_count(arr_upper) == 4
+    assert arrangement_string_count(arr_mixed) == 4
+
+
+def test_string_count_uses_tuning_length_for_sparse_extended_range_bass():
+    # A sloppak / GP-imported 5-string bass may encode the
+    # instrument range in tuning even if the chart never touches
+    # the highest string index. tuning_count (5) wins over
+    # notes_count (4) AND name_based (4) — extended-range bass
+    # without name-based hints still resolves correctly.
+    arr = Arrangement(
+        name="Bass",
+        tuning=[0, 0, 0, 0, 0],
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(4)],
+    )
+    assert arrangement_string_count(arr) == 5
+
+
+def test_string_count_uses_tuning_length_for_sparse_7_string_guitar():
+    # 7-string GP-imported guitar where the chart only uses
+    # strings 0..5 (sparse top-string usage). tuning_count (7) is
+    # the only reliable signal; notes_count gives 6 and name_based
+    # gives 6.
+    arr = Arrangement(
+        name="Lead",
+        tuning=[0, 0, 0, 0, 0, 0, 0],
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(6)],
+    )
+    assert arrangement_string_count(arr) == 7
+
+
+def test_string_count_ignores_rs_padded_tuning_for_bass():
+    # RS-XML bass: tuning is padded to length 6 with zeros at
+    # indices 4-5. Even though len(tuning) == 6, we MUST NOT use
+    # that as a 6-string signal (would mis-classify bass as
+    # guitar). arrangement_string_count's `tuning_count = 0 if
+    # tuning_len == 6 else tuning_len` rule takes care of this.
+    arr = Arrangement(
+        name="Bass",
+        tuning=[0, -5, -10, -15, 0, 0],  # bass with RS XML padding
+        notes=[Note(time=float(i), string=i, fret=0) for i in range(4)],
+    )
+    assert arrangement_string_count(arr) == 4

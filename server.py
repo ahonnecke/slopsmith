@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
 from psarc import unpack_psarc, read_psarc_entries
-from song import load_song, phrase_to_wire
+from song import load_song, phrase_to_wire, arrangement_string_count
 from audio import find_wem_files, convert_wem
 from tunings import tuning_name
 import sloppak as sloppak_mod
@@ -1322,6 +1322,19 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             "audio_url": audio_url,
             "audio_error": audio_error,
             "tuning": arr.tuning,
+            # Number of strings on the active arrangement
+            # (slopsmith-plugin-3dhighway#7). RS XML / PSARC sources
+            # always emit `tuning` as length 6 with zero-padding for
+            # unused string slots, so `len(arr.tuning)` is unreliable
+            # there; sloppak / GP-imported sources may instead carry
+            # a trimmed list. arrangement_string_count() combines a
+            # notes-derived lower bound, a name-based fallback (4 for
+            # "bass" arrangements), and the tuning length (when it
+            # disagrees with the RS-XML padded 6) into a single
+            # reliable signal. Plugins should size string-indexed UI
+            # / geometry against THIS rather than assuming 6 or
+            # using `tuning.length` directly.
+            "stringCount": arrangement_string_count(arr),
             "capo": arr.capo,
             "format": "sloppak" if is_slop else "psarc",
             "stems": stems_payload,

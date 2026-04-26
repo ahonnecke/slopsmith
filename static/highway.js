@@ -19,6 +19,12 @@ function createHighway() {
     let sections = [];
     let anchors = [];
     let chordTemplates = [];
+    // Number of strings on the active arrangement. Updated from the
+    // `stringCount` field in each `song_info` WS message; falls back
+    // to `tuning.length` (works for older servers that don't yet emit
+    // stringCount) then to 6 (final safety). 4 = bass, 6 = guitar,
+    // 7+ = extended-range GP imports.
+    let stringCount = 6;
     let lyrics = [];
     let toneChanges = [];
     let toneBase = "";
@@ -44,7 +50,6 @@ function createHighway() {
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
     let _inverted = localStorage.getItem('invertHighway') === 'true';
-    function si(s) { return _inverted ? 5 - s : s; }  // string index mapper for inversion
     let _lefty = localStorage.getItem('lefty') === '1';
     let _lastChordOnFretLine = null;  // chord object currently shown on fret line
     let _chordFretLineNotes = [];  // notes to render on fret line
@@ -60,17 +65,24 @@ function createHighway() {
     const Z_MAX = 10.0;
     const BG = '#080810';
 
+    // String color palettes. Indices 0–5 cover guitar / bass; 6–7
+    // are added for extended-range GP imports (7-string, 8-string).
+    // Lookups still use `|| '#888'` as a safety fallback for any
+    // out-of-range index.
     const STRING_COLORS = [
         '#cc0000', '#cca800', '#0066cc',
         '#cc6600', '#00cc66', '#9900cc',
+        '#cc00aa', '#00cccc',  // 7th = magenta, 8th = teal
     ];
     const STRING_DIM = [
         '#520000', '#524200', '#002952',
         '#522900', '#005229', '#3d0052',
+        '#520042', '#005252',
     ];
     const STRING_BRIGHT = [
         '#ff3c3c', '#ffe040', '#3c9cff',
         '#ff9c3c', '#3cff9c', '#cc3cff',
+        '#ff3ce0', '#3ce0e0',
     ];
 
     // ── Projection ───────────────────────────────────────────────────────
@@ -213,6 +225,7 @@ function createHighway() {
             beats,
             sections,
             chordTemplates,
+            stringCount,
             lyrics,
             toneChanges,
             toneBase,
@@ -537,10 +550,17 @@ function createHighway() {
         const strTop = H * 0.83;
         const strBot = H * 0.95;
         const margin = W * 0.03;
-        for (let i = 0; i < 6; i++) {
-            const yi = _inverted ? 5 - i : i;
-            const y = strTop + (yi / 5) * (strBot - strTop);
-            ctx.strokeStyle = STRING_COLORS[i];
+        // Adapt to the active arrangement's string count: 4 for bass,
+        // 6 for guitar, 7+ for extended-range GP imports. The visible
+        // band [strTop..strBot] gets divided into (stringCount - 1)
+        // slots, so 4 strings spread across the full band rather than
+        // using the upper 4/6ths of the 6-string layout. The Math.max
+        // guards against a hypothetical 1-string instrument (denom=0).
+        const span = Math.max(1, stringCount - 1);
+        for (let i = 0; i < stringCount; i++) {
+            const yi = _inverted ? (stringCount - 1 - i) : i;
+            const y = strTop + (yi / span) * (strBot - strTop);
+            ctx.strokeStyle = STRING_COLORS[i] || '#888';
             ctx.lineWidth = 3;
             ctx.beginPath();
             ctx.moveTo(margin, y);
@@ -1671,6 +1691,7 @@ function createHighway() {
             window.addEventListener('resize', _resizeHandler);
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            stringCount = 6;  // default until song_info arrives
             // Reset phrase ladder + filter (slopsmith#48). _mastery
             // persists across arrangement switches — the slider's
             // position stays put. Filter rebuilds on the next `ready`
@@ -1776,6 +1797,44 @@ function createHighway() {
                         break;
                     case 'song_info':
                         songInfo = msg;
+                        // Pick up the active arrangement's string count.
+                        // Prefer the explicit `stringCount` field (added
+                        // in slopsmith-plugin-3dhighway#7); fall back to
+                        // `tuning.length` for older servers that haven't
+                        // started emitting it (works correctly for
+                        // GP-imported sources where tuning is already
+                        // truncated, and for sloppaks loaded against an
+                        // updated lib/song.py); final fallback is 6 for
+                        // safety so a missing/malformed payload doesn't
+                        // surface as 0 strings.
+                        //
+                        // Clamp to [1, MAX_STRINGS] before storing —
+                        // stringCount drives loop bounds in drawStrings
+                        // and downstream plugins. A malformed payload
+                        // (huge or zero / negative) would otherwise hang
+                        // the UI or render no strings at all. 8 covers
+                        // every real-world instrument we ship colors
+                        // for; values above that fall back to '#888'
+                        // anyway via the STRING_COLORS lookup so
+                        // capping the loop bound costs nothing visible.
+                        const MAX_STRINGS = 8;
+                        let _sc;
+                        if (typeof msg.stringCount === 'number' && msg.stringCount > 0) {
+                            _sc = msg.stringCount;
+                        } else if (Array.isArray(msg.tuning) && msg.tuning.length > 0) {
+                            _sc = msg.tuning.length;
+                        } else {
+                            _sc = 6;
+                        }
+                        // Math.trunc(_sc) (with finite check) instead of
+                        // `_sc | 0` — bitwise-OR forces 32-bit signed
+                        // conversion, so any value ≥ 2^31 wraps negative
+                        // and the Math.max(1, ...) clamp would land at
+                        // 1 string. Math.trunc preserves the magnitude;
+                        // the Math.min(MAX_STRINGS, ...) below caps it
+                        // safely.
+                        const _scTrunc = Number.isFinite(_sc) ? Math.trunc(_sc) : 1;
+                        stringCount = Math.max(1, Math.min(MAX_STRINGS, _scTrunc));
                         if (opts.onSongInfo) {
                             opts.onSongInfo(msg);
                         } else {
@@ -1977,6 +2036,13 @@ function createHighway() {
         getToneBase() { return toneBase; },
         getSections() { return sections; },
         getSongInfo() { return songInfo; },
+        // Number of strings on the active arrangement
+        // (slopsmith-plugin-3dhighway#7). 4 for bass, 6 for guitar,
+        // 7+ for extended-range GP imports. Plugins should size
+        // string-indexed UI / geometry against THIS rather than
+        // assuming 6. Defaults to 6 between songs (until the next
+        // song_info message arrives).
+        getStringCount() { return stringCount; },
         addDrawHook(fn) { _drawHooks.push(fn); },
         removeDrawHook(fn) { _drawHooks = _drawHooks.filter(h => h !== fn); },
         project(tOffset) { return project(tOffset); },
@@ -2003,6 +2069,7 @@ function createHighway() {
             if (ws) { ws.close(); ws = null; }
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            stringCount = 6;  // default until song_info arrives
             // Reset phrase ladder + filter (slopsmith#48). _mastery
             // persists across arrangement switches — the slider's
             // position stays put. Filter rebuilds on the next `ready`
