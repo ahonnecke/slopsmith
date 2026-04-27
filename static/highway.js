@@ -1129,19 +1129,30 @@ function createHighway() {
         getAvOffset() { return avOffsetSec * 1000; },
 
         getBPM(t) {
-            // Calculate BPM from beat intervals near time t
+            // Calculate BPM from beat intervals near time t.
+            //
+            // Filter pathological intervals (< 0.2s or > 2.0s) before
+            // averaging. Real music sits in 30-300 BPM, i.e. intervals
+            // 0.2s to 2.0s; values outside that band are chart-data
+            // artifacts (section silence, missing beat extensions, sparse
+            // intro markers). Without filtering, a single 5-second gap in
+            // the beat track near `t` corrupts the average and returns
+            // ~12 BPM — which made the A-B loop count-in stretch to 20+
+            // seconds at certain loop starts (4 beats × 5s).
             if (beats.length < 2) return 120;
             let closest = 0;
             for (let i = 1; i < beats.length; i++) {
                 if (Math.abs(beats[i].time - t) < Math.abs(beats[closest].time - t)) closest = i;
             }
-            // Average interval from nearby beats
             const start = Math.max(0, closest - 2);
             const end = Math.min(beats.length - 1, closest + 2);
             let sum = 0, count = 0;
             for (let i = start; i < end; i++) {
-                sum += beats[i + 1].time - beats[i].time;
-                count++;
+                const interval = beats[i + 1].time - beats[i].time;
+                if (interval >= 0.2 && interval <= 2.0) {
+                    sum += interval;
+                    count++;
+                }
             }
             return count > 0 ? 60 / (sum / count) : 120;
         },
