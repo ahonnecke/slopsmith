@@ -812,6 +812,14 @@ async function playSong(filename, arrangement) {
     if (artAbortController) artAbortController.abort();
     artAbortController = null;
 
+    // Ensure AudioContext exists so audio output latency is measurable when
+    // the chart sync loop starts polling. Without this the context is created
+    // lazily on the first count-in click, and pre-click runs read latency=0.
+    if (!_audioCtx) {
+        try { _audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+        catch { /* AudioContext unsupported — fall through with latency=0 */ }
+    }
+
     highway.stop();
     audio.pause();
     audio.src = '';
@@ -1088,6 +1096,22 @@ function startCountIn() {
 
 // Time display + highway sync
 let lastAudioTime = 0;
+
+// Audio output latency compensation. `audio.currentTime` is the playback-buffer
+// position, not the position of the sample currently reaching the speaker —
+// the OS audio device adds an output buffer (typically 50-300 ms depending on
+// driver / sample rate / WebAudio implementation). Without compensation, the
+// chart clock advances `outputLatency` seconds ahead of what the user hears,
+// which makes plugins see plucks as "early" and shifts the visual highway
+// ahead of the audio. AudioContext.outputLatency exposes this measurement;
+// when unsupported, the value is 0 and behavior matches the old code.
+function getAudioOutputLatencySec() {
+    if (!_audioCtx) return 0;
+    const v = _audioCtx.outputLatency;
+    return (typeof v === 'number' && v >= 0) ? v : 0;
+}
+let _loggedOutputLatency = false;
+
 setInterval(() => {
     if (audio.duration && !_countingIn) {
         // A-B loop: count-in then seek back to A
@@ -1103,7 +1127,14 @@ setInterval(() => {
         lastAudioTime = audio.currentTime;
         document.getElementById('hud-time').textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
     }
-    if (!_countingIn) highway.setTime(audio.currentTime);
+    if (!_countingIn) {
+        const latencySec = getAudioOutputLatencySec();
+        if (latencySec > 0 && !_loggedOutputLatency) {
+            console.log(`[slopsmith] audio output latency = ${(latencySec * 1000).toFixed(0)} ms (chart clock compensated)`);
+            _loggedOutputLatency = true;
+        }
+        highway.setTime(Math.max(0, audio.currentTime - latencySec));
+    }
 }, 1000 / 60);
 
 // Keyboard shortcuts (player only)
