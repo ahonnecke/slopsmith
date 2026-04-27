@@ -812,25 +812,12 @@ async function playSong(filename, arrangement) {
     if (artAbortController) artAbortController.abort();
     artAbortController = null;
 
-    // Ensure AudioContext exists and the <audio> element is routed through it
-    // so AudioContext.outputLatency measures the FULL audio path (not just the
-    // context's silent destination). createMediaElementSource can be called at
-    // most once per element per context, so guard with _audioElementRouted.
+    // Ensure AudioContext exists so audio output latency is measurable when
+    // the chart sync loop starts polling. Without this the context is created
+    // lazily on the first count-in click, and pre-click runs read latency=0.
     if (!_audioCtx) {
         try { _audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
         catch { /* AudioContext unsupported — fall through with latency=0 */ }
-    }
-    if (_audioCtx && !_audioElementRouted) {
-        try {
-            const source = _audioCtx.createMediaElementSource(audio);
-            source.connect(_audioCtx.destination);
-            _audioElementRouted = true;
-        } catch (e) {
-            // Already routed in a different code path, or unsupported state.
-            // outputLatency will still report the context-destination latency,
-            // which is a usable lower bound on the real audio path.
-            console.warn('[slopsmith] could not route <audio> through AudioContext:', e?.message || e);
-        }
     }
 
     highway.stop();
@@ -1024,7 +1011,6 @@ async function deleteSelectedLoop() {
 
 // ── Count-in click sound (Web Audio API) ────────────────────────────────
 let _audioCtx = null;
-let _audioElementRouted = false;
 function playClick(high = false) {
     if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = _audioCtx.createOscillator();
