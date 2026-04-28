@@ -505,9 +505,10 @@ let _avOffsetMs = 0;
 let _avSaveDebounce = null;
 function setAvOffsetMs(ms) {
     _avOffsetMs = Number(ms) || 0;
-    // Drive the highway's render-time shift. getTime() still returns the
-    // audio-aligned chart time so plugins (note detection, etc.) keep scoring
-    // against the real chart clock regardless of visual calibration.
+    // Drive the highway's chart-time shift. As of fix/loop-count-in-bpm
+    // @ 8d8c299, getTime() returns chartTime = audio.currentTime + avOffsetSec
+    // so visuals AND plugin scoring share the same audio-aligned clock —
+    // tuning avOffset (or running the plugin's auto-calibrator) shifts both.
     if (typeof highway !== 'undefined' && highway?.setAvOffset) highway.setAvOffset(_avOffsetMs);
     // Sync any visible Settings slider
     const avSlider = document.getElementById('setting-av-offset');
