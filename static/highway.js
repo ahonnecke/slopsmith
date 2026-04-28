@@ -4,14 +4,19 @@
  */
 function createHighway() {
     let canvas, ctx, ws;
-    // Two notions of "now" — kept deliberately separate:
-    //   chartTime — audio-aligned clock. What getTime() exposes to plugins
-    //               (scoring, note detection, etc.) and what setTime() receives.
-    //   currentTime — rendering clock. Equal to chartTime + avOffsetSec, so the
-    //                 draw code can shift visual notes forward to compensate
-    //                 for audio-output pipeline latency without plugins having
-    //                 to care about the offset.
-    // avOffsetSec is set by setAvOffset(ms); default 0 means old behavior.
+    // Single audio-aligned clock — both render and plugin scoring share it.
+    //   chartTime  — what getTime() exposes to plugins (scoring, note
+    //                detection). The "where in the song are we right now"
+    //                clock that should match what the user actually HEARS.
+    //   currentTime — rendering clock. Kept equal to chartTime so visuals
+    //                 and plugins agree on time.
+    // setTime(t) is fed audio.currentTime by app.js. That value is the
+    // playback-buffer position — about output-latency seconds AHEAD of what
+    // the user hears (typical 50-300 ms depending on driver). avOffsetSec
+    // is the user's measurement of that lag (tuned with [/] keys until
+    // visuals match audio); we apply it here so chartTime — and therefore
+    // every plugin built on top of getTime() — also matches what the user
+    // hears. Default 0 means uncompensated; both clocks lead audio output.
     let chartTime = 0;
     let currentTime = 0;
     let avOffsetSec = 0;
@@ -1124,8 +1129,16 @@ function createHighway() {
             };
         },
 
-        setTime(t) { chartTime = t; currentTime = t + avOffsetSec; },
-        setAvOffset(ms) { avOffsetSec = (Number(ms) || 0) / 1000; currentTime = chartTime + avOffsetSec; },
+        setTime(t) { chartTime = t + avOffsetSec; currentTime = chartTime; },
+        setAvOffset(ms) {
+            const prev = avOffsetSec;
+            avOffsetSec = (Number(ms) || 0) / 1000;
+            // Shift both clocks by the delta so adjustments take effect
+            // immediately rather than waiting for the next setTime poll.
+            const delta = avOffsetSec - prev;
+            chartTime += delta;
+            currentTime = chartTime;
+        },
         getAvOffset() { return avOffsetSec * 1000; },
 
         getBPM(t) {

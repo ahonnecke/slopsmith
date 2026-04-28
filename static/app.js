@@ -1097,63 +1097,10 @@ function startCountIn() {
 // Time display + highway sync
 let lastAudioTime = 0;
 
-// Audio output latency compensation. `audio.currentTime` is the playback-buffer
-// position, not the position of the sample currently reaching the speaker —
-// the OS audio device adds an output buffer (typically 50-300 ms depending on
-// driver / sample rate / WebAudio implementation). Without compensation the
-// chart clock advances `outputLatency` seconds ahead of what the user hears,
-// which makes plugins see plucks as "early" and shifts the visual highway
-// ahead of the audio.
-//
-// Two compensation sources, in priority order:
-//   1. window.audioLatencyMsOverride (manual): the user can set this from
-//      the console (`setAudioLatencyMs(250)`) when AudioContext.outputLatency
-//      reports 0 / undershoots. Persists across reloads via localStorage.
-//      The plugin / plugin classifier auto-aligns chart-vs-audio offset on
-//      every recorded session, so you can tune this until that auto-align
-//      reports ≈0.
-//   2. AudioContext.outputLatency (automatic): used when no override is set.
-//      Some browsers / drivers report 0 here; the override exists for that
-//      case. Routing the <audio> element through the context gives a more
-//      accurate reading but caused playback to freeze on some configurations
-//      and was reverted; this manual override is the safer alternative.
-function getAudioOutputLatencySec() {
-    if (typeof window.audioLatencyMsOverride === 'number'
-            && window.audioLatencyMsOverride >= 0) {
-        return window.audioLatencyMsOverride / 1000;
-    }
-    if (!_audioCtx) return 0;
-    const v = _audioCtx.outputLatency;
-    return (typeof v === 'number' && v >= 0) ? v : 0;
-}
-
-window.setAudioLatencyMs = function setAudioLatencyMs(ms) {
-    if (ms === null || ms === undefined) {
-        delete window.audioLatencyMsOverride;
-        try { localStorage.removeItem('audioLatencyMs'); } catch {}
-        console.log('[slopsmith] audio latency override cleared (using AudioContext.outputLatency)');
-        return;
-    }
-    const n = Number(ms);
-    if (!Number.isFinite(n) || n < 0) {
-        console.warn('[slopsmith] setAudioLatencyMs requires a non-negative number');
-        return;
-    }
-    window.audioLatencyMsOverride = n;
-    try { localStorage.setItem('audioLatencyMs', String(n)); } catch {}
-    console.log(`[slopsmith] audio latency override set to ${n} ms`);
-};
-
-// Restore the override on page load if persisted.
-try {
-    const saved = localStorage.getItem('audioLatencyMs');
-    if (saved !== null) {
-        const n = Number(saved);
-        if (Number.isFinite(n) && n >= 0) window.audioLatencyMsOverride = n;
-    }
-} catch {}
-
-let _loggedOutputLatency = false;
+// Clear any leftover override from the previous (deleted) setAudioLatencyMs
+// console API. The avOffset slider/[/] keys handle this now — applied inside
+// highway.setTime so plugins and visuals share the same audio-aligned clock.
+try { localStorage.removeItem('audioLatencyMs'); } catch {}
 
 setInterval(() => {
     if (audio.duration && !_countingIn) {
@@ -1170,17 +1117,7 @@ setInterval(() => {
         lastAudioTime = audio.currentTime;
         document.getElementById('hud-time').textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
     }
-    if (!_countingIn) {
-        const latencySec = getAudioOutputLatencySec();
-        if (latencySec > 0 && !_loggedOutputLatency) {
-            const source = (typeof window.audioLatencyMsOverride === 'number')
-                ? 'manual override (setAudioLatencyMs)'
-                : 'AudioContext.outputLatency';
-            console.log(`[slopsmith] audio latency = ${(latencySec * 1000).toFixed(0)} ms (${source})`);
-            _loggedOutputLatency = true;
-        }
-        highway.setTime(Math.max(0, audio.currentTime - latencySec));
-    }
+    if (!_countingIn) highway.setTime(audio.currentTime);
 }, 1000 / 60);
 
 // Keyboard shortcuts (player only)
