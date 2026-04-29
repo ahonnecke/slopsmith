@@ -948,6 +948,16 @@ window.setActiveLoop = function(startSec, endSec) {
     return true;
 };
 
+// Return the current A-B loop, or null when no loop is set. Plugin-facing:
+// notedetect uses this to filter coaching feedback to the loop range so
+// suggestions reflect the section the player is actually drilling — works
+// regardless of whether the loop was set via setActiveLoop, manual A/B,
+// or the saved-loops dropdown.
+window.getActiveLoop = function() {
+    if (loopA === null || loopB === null) return null;
+    return { startSec: loopA, endSec: loopB };
+};
+
 function updateLoopUI() {
     const label = document.getElementById('loop-label');
     const hasLoop = loopA !== null && loopB !== null;
@@ -1138,6 +1148,63 @@ setInterval(() => {
     }
     if (!_countingIn) highway.setTime(audio.currentTime);
 }, 1000 / 60);
+
+// ── Clock drift instrumentation (phase A of A/V drift investigation) ──────
+// Captures the four time sources once per second so we can see whether
+// <audio>.currentTime drifts vs AudioContext.currentTime vs wall clock.
+// If they all advance 1:1, the manual A/V calibration drift is NOT a clock
+// problem (look at count-in / seek paths instead). If they diverge linearly,
+// we have a rate mismatch and need to anchor chart time to AudioContext.
+//
+// Toggle: localStorage.clockDebug = '1' (default on for now); '0' to disable.
+// Dump:   slopsmith.dumpClockLog()  → prints CSV to console for paste-back.
+const _clockLog = [];  // ring buffer of {t_wall, audio, ctx, outLat, baseLat}
+let _clockAnchor = null;  // {wall, audio, ctx} captured on play
+function _clockDebugEnabled() {
+    const v = localStorage.getItem('clockDebug');
+    return v === null ? true : v === '1';
+}
+audio.addEventListener('play', () => {
+    if (!_clockDebugEnabled()) return;
+    _clockAnchor = {
+        wall: performance.now(),
+        audio: audio.currentTime,
+        ctx: _audioCtx ? _audioCtx.currentTime : null,
+    };
+    _clockLog.length = 0;
+    console.log('[clock] anchor reset on play', _clockAnchor);
+});
+setInterval(() => {
+    if (!_clockDebugEnabled() || !_clockAnchor || !isPlaying || _countingIn) return;
+    const wall = performance.now();
+    const a = audio.currentTime;
+    const c = _audioCtx ? _audioCtx.currentTime : null;
+    const dWall = (wall - _clockAnchor.wall) / 1000;
+    const dAudio = a - _clockAnchor.audio;
+    const dCtx = c !== null && _clockAnchor.ctx !== null ? c - _clockAnchor.ctx : null;
+    const driftAudio = (dAudio - dWall) * 1000;  // ms; positive = audio.currentTime ahead of wall
+    const driftCtx = dCtx !== null ? (dCtx - dWall) * 1000 : null;
+    const outLat = _audioCtx?.outputLatency != null ? _audioCtx.outputLatency * 1000 : null;
+    const baseLat = _audioCtx?.baseLatency != null ? _audioCtx.baseLatency * 1000 : null;
+    _clockLog.push({ t_wall: dWall, audio: dAudio, ctx: dCtx, outLat, baseLat, driftAudio, driftCtx });
+    if (_clockLog.length > 600) _clockLog.shift();  // 10 min cap
+    console.log(
+        `[clock] t=${dWall.toFixed(1)}s  audio=${dAudio.toFixed(3)}s  ctx=${dCtx === null ? 'n/a' : dCtx.toFixed(3) + 's'}  ` +
+        `driftAudio=${driftAudio.toFixed(1)}ms  driftCtx=${driftCtx === null ? 'n/a' : driftCtx.toFixed(1) + 'ms'}  ` +
+        `outLat=${outLat === null ? 'n/a' : outLat.toFixed(1) + 'ms'}  baseLat=${baseLat === null ? 'n/a' : baseLat.toFixed(1) + 'ms'}`
+    );
+}, 1000);
+window.slopsmith = window.slopsmith || {};
+window.slopsmith.dumpClockLog = () => {
+    const header = 't_wall_s,audio_s,ctx_s,driftAudio_ms,driftCtx_ms,outLat_ms,baseLat_ms';
+    const rows = _clockLog.map(r =>
+        `${r.t_wall.toFixed(3)},${r.audio.toFixed(3)},${r.ctx === null ? '' : r.ctx.toFixed(3)},` +
+        `${r.driftAudio.toFixed(2)},${r.driftCtx === null ? '' : r.driftCtx.toFixed(2)},` +
+        `${r.outLat === null ? '' : r.outLat.toFixed(2)},${r.baseLat === null ? '' : r.baseLat.toFixed(2)}`
+    );
+    console.log([header, ...rows].join('\n'));
+    return _clockLog.length;
+};
 
 // Keyboard shortcuts (player only)
 document.addEventListener('keydown', e => {
