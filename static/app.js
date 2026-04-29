@@ -4322,62 +4322,23 @@ function clearLoop() {
     document.getElementById('saved-loops').value = '';
 }
 
-// Resync #saved-loops + #btn-loop-delete with the currently-active
-// loopA/loopB. Used by both setLoop's success path (so plugin-driven
-// loops show up correctly in the dropdown) and loadSavedLoop's
-// failure path (so a cancelled selection reverts to the still-active
-// loop). Without this sync, deleteSelectedLoop could target a stale
-// option that doesn't match the active loop.
-function _syncSavedLoopSelection() {
-    const sel = document.getElementById('saved-loops');
-    const delBtn = document.getElementById('btn-loop-delete');
-    if (!sel || !delBtn) return;
-    let selected = '';
-    if (loopA !== null && loopB !== null) {
-        for (const opt of sel.options) {
-            if (Number(opt.dataset.start) === loopA && Number(opt.dataset.end) === loopB) {
-                selected = opt.value;
-                break;
-            }
-        }
-    }
-    sel.value = selected;
-    delBtn.classList.toggle('hidden', !selected);
-}
-
-// Programmatically set both loop endpoints and seek to A. The dropdown
-// path (loadSavedLoop) and the plugin-API path (window.slopsmith.setLoop)
-// both funnel through here so the UI state stays canonical regardless of
-// who triggered the loop.
-//
-// Returns true if the seek landed at A and the loop is now active;
-// returns false if the seek was cancelled by teardown or landed off-target
-// (JUCE clamp / HTML5 snap > 50ms from A). On false, loopA/loopB are NOT
-// committed and the UI is not painted — the prior loop (if any) stays
-// active. Throws on invalid inputs.
-async function setLoop(a, b) {
-    const aNum = Number(a);
-    const bNum = Number(b);
-    if (!Number.isFinite(aNum) || !Number.isFinite(bNum) || bNum <= aNum) {
-        throw new Error(`setLoop: requires finite a and b with b > a (got a=${a}, b=${b})`);
-    }
-    // Don't arm loopA/loopB before the seek lands — the 60Hz tick's wrap
-    // detector (`ct >= loopB`) would trigger startCountIn against
-    // half-applied state.
-    const r = await _audioSeek(aNum, 'loop-set');
-    if (!r.completed || Math.abs(r.to - aNum) > 0.05) return false;
-    loopA = aNum;
-    loopB = bNum;
-    document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
-    document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+// Plugin-facing API: set the live A-B loop and seek to its start.
+// Called from notedetect's "Practice this hotspot" banner so the player
+// can engage with a suggested loop in one click instead of replicating
+// the boundaries manually with setLoopStart/setLoopEnd.
+window.setActiveLoop = function(startSec, endSec) {
+    if (typeof startSec !== 'number' || typeof endSec !== 'number') return false;
+    if (endSec <= startSec) return false;
+    loopA = Math.max(0, startSec);
+    loopB = endSec;
+    audio.currentTime = loopA;
+    document.getElementById('btn-loop-a').className =
+        'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    document.getElementById('btn-loop-b').className =
+        'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
-    // Sync the saved-loops dropdown so a plugin-driven setLoop call
-    // surfaces the matching saved option (and Delete button) — otherwise
-    // the dropdown can stay on a stale selection and deleteSelectedLoop
-    // would target the wrong record.
-    _syncSavedLoopSelection();
     return true;
-}
+};
 
 function updateLoopUI() {
     const label = document.getElementById('loop-label');
