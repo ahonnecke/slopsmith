@@ -4340,6 +4340,16 @@ window.setActiveLoop = function(startSec, endSec) {
     return true;
 };
 
+// Return the current A-B loop, or null when no loop is set. Plugin-facing:
+// notedetect uses this to filter coaching feedback to the loop range so
+// suggestions reflect the section the player is actually drilling — works
+// regardless of whether the loop was set via setActiveLoop, manual A/B,
+// or the saved-loops dropdown.
+window.getActiveLoop = function() {
+    if (loopA === null || loopB === null) return null;
+    return { startSec: loopA, endSec: loopB };
+};
+
 function updateLoopUI() {
     const label = document.getElementById('loop-label');
     const hasLoop = loopA !== null && loopB !== null;
@@ -4637,307 +4647,64 @@ setInterval(() => {
     if (!_countingIn) highway.setTime(audio.currentTime);
 }, 1000 / 60);
 
-// ── Centralized Keyboard Shortcut Registry ───────────────────────────────
+// ── Clock drift instrumentation (phase A of A/V drift investigation) ──────
+// Captures the four time sources once per second so we can see whether
+// <audio>.currentTime drifts vs AudioContext.currentTime vs wall clock.
+// If they all advance 1:1, the manual A/V calibration drift is NOT a clock
+// problem (look at count-in / seek paths instead). If they diverge linearly,
+// we have a rate mismatch and need to anchor chart time to AudioContext.
 //
-// Plugins can register keyboard shortcuts via window.registerShortcut().
-// Shortcuts are scope-aware (global, player, library, plugin-specific) and
-// support optional condition callbacks for dynamic enable/disable.
-//
-// Panel-scoped shortcuts:
-//   - Each panel has its own shortcut registry
-//   - Use window.createShortcutPanel(id) to create a panel
-//   - Use window.setActiveShortcutPanel(id) to set the active panel
-//   - Shortcuts are registered to the active panel
-//   - This allows multiple panels (e.g., splitscreen) to have their own shortcuts
-//
-// API:
-//   window.registerShortcut({
-//     key: string,              // Required: key value (e.key) or key code (e.code)
-//     description: string,     // Required: shown in help panel
-//     scope: 'global' | 'player' | 'library' | 'settings' | 'plugin-{id}',  // Default: 'global'
-//     condition: () => boolean,  // Optional: dynamic enable/disable guard
-//     handler: (e) => void,    // Required: callback when shortcut triggers
-//     modifiers: {              // Optional: require modifier keys
-//       ctrl?: boolean,
-//       alt?: boolean,
-//       shift?: boolean,
-//       meta?: boolean
-//     }
-//   });
-//
-// Panel API:
-//   window.createShortcutPanel(id) - Create a new panel
-//   window.setActiveShortcutPanel(id) - Set the active panel for registration
-//   window.getActiveShortcutPanel() - Get the current active panel
-//   window.isInShortcutPanel() - Check if running in a panel (not default)
-//   window.getGlobalShortcutContext() - Get default panel for truly global shortcuts
-//
-// Note: The handler receives the KeyboardEvent, so you can check
-// e.shiftKey, e.altKey, etc. directly in your handler if you need
-// behavior that depends on modifier state (e.g., different actions
-// for Shift+key vs key alone). Use the modifiers option when you
-// want the shortcut to ONLY fire with specific modifiers.
-//
-// See CLAUDE.md for full documentation.
-
-// ── Window ID system for per-window shortcuts ────────────────────────────────
-// Each window gets a unique ID so plugins can register window-specific shortcuts.
-// This is useful for popup windows (e.g., splitscreen plugin) that need their
-// own keyboard shortcuts.
-
-let _shortcutWindowId = null;
-
-window.getShortcutWindowId = () => {
-    if (_shortcutWindowId) return _shortcutWindowId;
-    // Generate a unique ID for this window
-    _shortcutWindowId = 'win-' + Math.random().toString(36).substr(2, 9);
-    return _shortcutWindowId;
-};
-
-// ── Shortcut registry ───────────────────────────────────────────────────────
-
-// ── Panel-scoped shortcut system ───────────────────────────────────────────
-// Each panel has its own shortcut registry. This allows multiple panels
-// (e.g., splitscreen) to have their own keyboard shortcuts without collisions.
-
-class ShortcutPanel {
-    constructor(id) {
-        this.id = id;
-        this.shortcuts = new Map();
-    }
-    
-    _compositeKey(key, scope) {
-        return `${scope}::${key}`;
-    }
-    
-    registerShortcut(options) {
-        const { key, description, scope = 'global', condition = null, handler, modifiers = null } = options;
-        
-        if (!key || !handler) {
-            console.error(`registerShortcut: key and handler are required`);
-            return;
-        }
-        
-        // Validate scope
-        const validScopes = ['global', 'player', 'library', 'settings'];
-        const isValidScope = validScopes.includes(scope) || 
-                             scope.startsWith('plugin-');
-        if (!isValidScope) {
-            console.warn(`registerShortcut: invalid scope '${scope}'. Valid scopes are: global, player, library, settings, or plugin-{id}`);
-        }
-        
-        // Conflict detection: warn if key+scope is already registered
-        const compositeKey = this._compositeKey(key, scope);
-        if (this.shortcuts.has(compositeKey)) {
-            console.warn(`registerShortcut [${this.id}]: '${key}' in scope '${scope}' is already registered; overwriting. Previous:`, this.shortcuts.get(compositeKey));
-        }
-        
-        this.shortcuts.set(compositeKey, { key, description, scope, condition, handler, modifiers });
-    }
-    
-    unregisterShortcut(key, scope) {
-        return this.shortcuts.delete(this._compositeKey(key, scope));
-    }
-    
-    clearShortcuts() {
-        this.shortcuts.clear();
-    }
-    
-    listShortcuts() {
-        return Array.from(this.shortcuts.entries()).map(([ck, s]) => [s.key, s]);
-    }
+// Toggle: localStorage.clockDebug = '1' (default on for now); '0' to disable.
+// Dump:   slopsmith.dumpClockLog()  → prints CSV to console for paste-back.
+const _clockLog = [];  // ring buffer of {t_wall, audio, ctx, outLat, baseLat}
+let _clockAnchor = null;  // {wall, audio, ctx} captured on play
+function _clockDebugEnabled() {
+    const v = localStorage.getItem('clockDebug');
+    return v === null ? true : v === '1';
 }
-
-// Global panel management
-const _panels = new Map();
-let _activePanel = null;
-let _defaultPanel = null;
-
-// Create default panel on init
-const defaultPanel = new ShortcutPanel('default');
-_panels.set('default', defaultPanel);
-_defaultPanel = 'default';
-_activePanel = 'default';
-
-// ── Panel API ───────────────────────────────────────────────────────────────
-
-window.createShortcutPanel = (id) => {
-    if (_panels.has(id)) {
-        console.warn(`createShortcutPanel: panel '${id}' already exists`);
-        return _panels.get(id);
-    }
-    const panel = new ShortcutPanel(id);
-    _panels.set(id, panel);
-    return panel;
-};
-
-window.setActiveShortcutPanel = (id) => {
-    if (!_panels.has(id)) {
-        console.error(`setActiveShortcutPanel: panel '${id}' does not exist`);
-        return;
-    }
-    _activePanel = id;
-};
-
-window.getActiveShortcutPanel = () => _activePanel;
-
-window.isInShortcutPanel = () => {
-    return _activePanel !== 'default';
-};
-
-window.getGlobalShortcutContext = () => {
-    console.warn('getGlobalShortcutContext: Global shortcuts are exceptional. Consider using panel-scoped shortcuts instead.');
-    return _panels.get('default');
-};
-
-// ── Shortcut registry (routes to active panel) ───────────────────────────────
-
-window.registerShortcut = (options) => {
-    const panelId = _activePanel || _defaultPanel || 'default';
-    const panel = _panels.get(panelId);
-    
-    if (!panel) {
-        console.error(`registerShortcut: No panel found for registration: ${panelId}`);
-        return;
-    }
-    
-    panel.registerShortcut(options);
-};
-
-window.unregisterShortcut = (key, scope) => {
-    // Try the active panel first to preserve panel isolation; fall back to
-    // other panels so a shortcut registered before a panel switch is still
-    // removable.
-    const resolvedScope = scope || 'global';
-    const activePanelId = _activePanel || _defaultPanel || 'default';
-    const activePanel = _panels.get(activePanelId);
-    if (activePanel && activePanel.unregisterShortcut(key, resolvedScope)) {
-        return true;
-    }
-    for (const [panelId, panel] of _panels) {
-        if (panelId === activePanelId) continue;
-        if (panel.unregisterShortcut(key, resolvedScope)) {
-            return true;
-        }
-    }
-    return false;
-};
-
-window.clearWindowShortcuts = (windowId) => {
-    // Remove all shortcuts registered for a specific window
-    // This is for backward compatibility with window-specific shortcuts
-    let removed = 0;
-    for (const [panelId, panel] of _panels) {
-        if (panelId.startsWith(`window-${windowId}`)) {
-            panel.clearShortcuts();
-            _panels.delete(panelId);
-            removed++;
-        }
-    }
-    return removed;
-};
-
-function _getCurrentContext() {
-    const currentScreen = document.querySelector('.screen.active')?.id;
-    return {
-        screen: currentScreen,
-        windowId: window.getShortcutWindowId(),
-        activePanel: _activePanel,
-        isPlayer: currentScreen === 'player',
-        isLibrary: ['home', 'favorites'].includes(currentScreen),
-        isSettings: currentScreen === 'settings',
-        isPlugin: currentScreen?.startsWith('plugin-')
+audio.addEventListener('play', () => {
+    if (!_clockDebugEnabled()) return;
+    _clockAnchor = {
+        wall: performance.now(),
+        audio: audio.currentTime,
+        ctx: _audioCtx ? _audioCtx.currentTime : null,
     };
-}
-
-function _isShortcutActive(shortcut, ctx) {
-    if (shortcut.scope === 'global') return true;
-    if (shortcut.scope === 'player' && ctx.isPlayer) return true;
-    if (shortcut.scope === 'library' && ctx.isLibrary) return true;
-    if (shortcut.scope === 'settings' && ctx.isSettings) return true;
-    if (shortcut.scope.startsWith('plugin-')) {
-        const pluginId = shortcut.scope.replace('plugin-', '');
-        return ctx.screen === `plugin-${pluginId}`;
-    }
-    return false;
-}
-
-function _modifiersMatch(e, modifiers) {
-    if (!modifiers) return true;
-    if (modifiers.ctrl !== undefined && modifiers.ctrl !== e.ctrlKey) return false;
-    if (modifiers.alt !== undefined && modifiers.alt !== e.altKey) return false;
-    if (modifiers.shift !== undefined && modifiers.shift !== e.shiftKey) return false;
-    if (modifiers.meta !== undefined && modifiers.meta !== e.metaKey) return false;
-    return true;
-}
-
-// Debug mode for keyboard shortcuts
-let _DEBUG_SHORTCUTS = false;
-
-window._setDebugShortcuts = (enabled) => {
-    _DEBUG_SHORTCUTS = enabled;
-    console.log(`[Shortcuts] Debug mode ${enabled ? 'ENABLED' : 'DISABLED'}`);
+    _clockLog.length = 0;
+    console.log('[clock] anchor reset on play', _clockAnchor);
+});
+setInterval(() => {
+    if (!_clockDebugEnabled() || !_clockAnchor || !isPlaying || _countingIn) return;
+    const wall = performance.now();
+    const a = audio.currentTime;
+    const c = _audioCtx ? _audioCtx.currentTime : null;
+    const dWall = (wall - _clockAnchor.wall) / 1000;
+    const dAudio = a - _clockAnchor.audio;
+    const dCtx = c !== null && _clockAnchor.ctx !== null ? c - _clockAnchor.ctx : null;
+    const driftAudio = (dAudio - dWall) * 1000;  // ms; positive = audio.currentTime ahead of wall
+    const driftCtx = dCtx !== null ? (dCtx - dWall) * 1000 : null;
+    const outLat = _audioCtx?.outputLatency != null ? _audioCtx.outputLatency * 1000 : null;
+    const baseLat = _audioCtx?.baseLatency != null ? _audioCtx.baseLatency * 1000 : null;
+    _clockLog.push({ t_wall: dWall, audio: dAudio, ctx: dCtx, outLat, baseLat, driftAudio, driftCtx });
+    if (_clockLog.length > 600) _clockLog.shift();  // 10 min cap
+    console.log(
+        `[clock] t=${dWall.toFixed(1)}s  audio=${dAudio.toFixed(3)}s  ctx=${dCtx === null ? 'n/a' : dCtx.toFixed(3) + 's'}  ` +
+        `driftAudio=${driftAudio.toFixed(1)}ms  driftCtx=${driftCtx === null ? 'n/a' : driftCtx.toFixed(1) + 'ms'}  ` +
+        `outLat=${outLat === null ? 'n/a' : outLat.toFixed(1) + 'ms'}  baseLat=${baseLat === null ? 'n/a' : baseLat.toFixed(1) + 'ms'}`
+    );
+}, 1000);
+window.slopsmith = window.slopsmith || {};
+window.slopsmith.dumpClockLog = () => {
+    const header = 't_wall_s,audio_s,ctx_s,driftAudio_ms,driftCtx_ms,outLat_ms,baseLat_ms';
+    const rows = _clockLog.map(r =>
+        `${r.t_wall.toFixed(3)},${r.audio.toFixed(3)},${r.ctx === null ? '' : r.ctx.toFixed(3)},` +
+        `${r.driftAudio.toFixed(2)},${r.driftCtx === null ? '' : r.driftCtx.toFixed(2)},` +
+        `${r.outLat === null ? '' : r.outLat.toFixed(2)},${r.baseLat === null ? '' : r.baseLat.toFixed(2)}`
+    );
+    console.log([header, ...rows].join('\n'));
+    return _clockLog.length;
 };
 
-window._listShortcuts = () => {
-    console.log('=== Registered Shortcuts ===');
-    for (const [panelId, panel] of _panels) {
-        console.log(`Panel: ${panelId}`);
-        for (const [, s] of panel.shortcuts) {
-            console.log(`  ${s.key.padEnd(15)} | ${s.scope.padEnd(10)} | ${s.description}`);
-        }
-    }
-    console.log('=== End ===');
-};
-
-window._testShortcut = (key, scope) => {
-    // Mirror the dispatcher: try the active panel first, then default.
-    const resolvedScope = scope || 'global';
-    const tried = new Set();
-    const panelOrder = [_activePanel, _defaultPanel, 'default'].filter(id => {
-        if (!id || tried.has(id)) return false;
-        tried.add(id);
-        return true;
-    });
-
-    for (const panelId of panelOrder) {
-        const panel = _panels.get(panelId);
-        if (!panel) continue;
-        const shortcut = panel.shortcuts.get(panel._compositeKey(key, resolvedScope));
-        if (!shortcut) continue;
-
-        const ctx = _getCurrentContext();
-        const active = _isShortcutActive(shortcut, ctx);
-        let conditionMet = true;
-        if (shortcut.condition) {
-            try { conditionMet = !!shortcut.condition(); }
-            catch (err) { conditionMet = `threw: ${err.message}`; }
-        }
-        console.log(`Shortcut '${key}' [${resolvedScope}] [${panelId}]:`, {
-            description: shortcut.description,
-            scope: shortcut.scope,
-            currentContext: ctx,
-            isActive: active,
-            conditionMet
-        });
-        return;
-    }
-
-    console.log(`Shortcut '${key}' (scope: ${resolvedScope}) not registered in any panel`);
-};
-
-// Expose internals for debugging (prefixed with _ to indicate private)
-// These are for development/debugging only and should not be used by plugins.
-window._panels = _panels;
-window._getCurrentContext = _getCurrentContext;
-window._isShortcutActive = _isShortcutActive;
-
-// ── Registry-based keydown handler ─────────────────────────────────────────
-//
-// This handler processes all registered shortcuts through the central registry.
-// It runs after the library navigation handler (which handles /, ?, c, f, e, etc.)
-// and before any other keydown listeners.
-
+// Keyboard shortcuts (player only)
 document.addEventListener('keydown', e => {
     if (!document.getElementById('player').classList.contains('active')) return;
     if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
