@@ -930,6 +930,24 @@ function clearLoop() {
     document.getElementById('saved-loops').value = '';
 }
 
+// Plugin-facing API: set the live A-B loop and seek to its start.
+// Called from notedetect's "Practice this hotspot" banner so the player
+// can engage with a suggested loop in one click instead of replicating
+// the boundaries manually with setLoopStart/setLoopEnd.
+window.setActiveLoop = function(startSec, endSec) {
+    if (typeof startSec !== 'number' || typeof endSec !== 'number') return false;
+    if (endSec <= startSec) return false;
+    loopA = Math.max(0, startSec);
+    loopB = endSec;
+    audio.currentTime = loopA;
+    document.getElementById('btn-loop-a').className =
+        'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    document.getElementById('btn-loop-b').className =
+        'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    updateLoopUI();
+    return true;
+};
+
 function updateLoopUI() {
     const label = document.getElementById('loop-label');
     const hasLoop = loopA !== null && loopB !== null;
