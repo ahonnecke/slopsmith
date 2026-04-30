@@ -1163,58 +1163,112 @@ setInterval(() => {
 }, 1000 / 60);
 
 // ── Clock drift instrumentation (phase A of A/V drift investigation) ──────
-// Captures the four time sources once per second so we can see whether
-// <audio>.currentTime drifts vs AudioContext.currentTime vs wall clock.
-// If they all advance 1:1, the manual A/V calibration drift is NOT a clock
-// problem (look at count-in / seek paths instead). If they diverge linearly,
-// we have a rate mismatch and need to anchor chart time to AudioContext.
+// Captures time sources to test the hypothesis that drift accumulates from
+// pause/resume cycles rather than from continuous-playback clock skew.
 //
-// Toggle: localStorage.clockDebug = '1' (default on for now); '0' to disable.
-// Dump:   slopsmith.dumpClockLog()  → prints CSV to console for paste-back.
-const _clockLog = [];  // ring buffer of {t_wall, audio, ctx, outLat, baseLat}
-let _clockAnchor = null;  // {wall, audio, ctx} captured on play
+// Two anchors:
+//   _sessionAnchor — first play of the session, NEVER reset. Session-wide
+//                    drift is measured against this.
+//   _segmentAnchor — every play (incl. resume after pause). Per-segment
+//                    drift since the last resume.
+//
+// If `driftAudioSession` accumulates each pause boundary while
+// `driftAudioSeg` stays small inside each segment → pause/resume bug
+// confirmed (each resume re-establishes the audio path with a different
+// real latency, but our chart math doesn't notice).
+//
+// pause/resume rows in the log explicitly print outputLatency before/after
+// so we can see if the audio path renegotiates with a different latency.
+//
+// Toggle: localStorage.clockDebug = '1' to enable (default off — set to '1'
+//         in DevTools when you're ready to test, then reload).
+// Dump:   slopsmith.dumpClockLog()  → CSV for paste-back.
+const _clockLog = [];
+let _sessionAnchor = null;
+let _segmentAnchor = null;
+let _lastPauseSnap = null;
 function _clockDebugEnabled() {
-    const v = localStorage.getItem('clockDebug');
-    return v === null ? true : v === '1';
+    return localStorage.getItem('clockDebug') === '1';
 }
-audio.addEventListener('play', () => {
-    if (!_clockDebugEnabled()) return;
-    _clockAnchor = {
+function _snapClocks() {
+    return {
         wall: performance.now(),
         audio: audio.currentTime,
         ctx: _audioCtx ? _audioCtx.currentTime : null,
+        outLat: _audioCtx?.outputLatency != null ? _audioCtx.outputLatency * 1000 : null,
+        baseLat: _audioCtx?.baseLatency != null ? _audioCtx.baseLatency * 1000 : null,
     };
-    _clockLog.length = 0;
-    console.log('[clock] anchor reset on play', _clockAnchor);
+}
+audio.addEventListener('play', () => {
+    if (!_clockDebugEnabled()) return;
+    const snap = _snapClocks();
+    if (!_sessionAnchor) {
+        _sessionAnchor = snap;
+        _clockLog.length = 0;
+        console.log('[clock] session anchor set on first play', snap);
+    } else if (_lastPauseSnap) {
+        const dOut = snap.outLat !== null && _lastPauseSnap.outLat !== null
+            ? snap.outLat - _lastPauseSnap.outLat : null;
+        const dCtxAcrossPause = snap.ctx !== null && _lastPauseSnap.ctx !== null
+            ? (snap.ctx - _lastPauseSnap.ctx) * 1000 : null;
+        const dAudioAcrossPause = (snap.audio - _lastPauseSnap.audio) * 1000;
+        console.log(
+            `[clock] RESUME — outLat ${_lastPauseSnap.outLat?.toFixed(1)}→${snap.outLat?.toFixed(1)}ms ` +
+            `(Δ${dOut === null ? 'n/a' : dOut.toFixed(1) + 'ms'})  ` +
+            `audio.currentTime advanced ${dAudioAcrossPause.toFixed(1)}ms during pause  ` +
+            `ctx advanced ${dCtxAcrossPause === null ? 'n/a' : dCtxAcrossPause.toFixed(1) + 'ms'}`
+        );
+        _clockLog.push({ kind: 'resume', ...snap, dOut, dAudioAcrossPause, dCtxAcrossPause });
+    }
+    _segmentAnchor = snap;
+});
+audio.addEventListener('pause', () => {
+    if (!_clockDebugEnabled() || !_sessionAnchor) return;
+    const snap = _snapClocks();
+    _lastPauseSnap = snap;
+    console.log(`[clock] PAUSE @ audio=${snap.audio.toFixed(3)}s  outLat=${snap.outLat?.toFixed(1)}ms`);
+    _clockLog.push({ kind: 'pause', ...snap });
 });
 setInterval(() => {
-    if (!_clockDebugEnabled() || !_clockAnchor || !isPlaying || _countingIn) return;
-    const wall = performance.now();
-    const a = audio.currentTime;
-    const c = _audioCtx ? _audioCtx.currentTime : null;
-    const dWall = (wall - _clockAnchor.wall) / 1000;
-    const dAudio = a - _clockAnchor.audio;
-    const dCtx = c !== null && _clockAnchor.ctx !== null ? c - _clockAnchor.ctx : null;
-    const driftAudio = (dAudio - dWall) * 1000;  // ms; positive = audio.currentTime ahead of wall
-    const driftCtx = dCtx !== null ? (dCtx - dWall) * 1000 : null;
-    const outLat = _audioCtx?.outputLatency != null ? _audioCtx.outputLatency * 1000 : null;
-    const baseLat = _audioCtx?.baseLatency != null ? _audioCtx.baseLatency * 1000 : null;
-    _clockLog.push({ t_wall: dWall, audio: dAudio, ctx: dCtx, outLat, baseLat, driftAudio, driftCtx });
-    if (_clockLog.length > 600) _clockLog.shift();  // 10 min cap
+    if (!_clockDebugEnabled() || !_sessionAnchor || !isPlaying || _countingIn) return;
+    const snap = _snapClocks();
+    const dWallSession = (snap.wall - _sessionAnchor.wall) / 1000;
+    const dAudioSession = snap.audio - _sessionAnchor.audio;
+    const dCtxSession = snap.ctx !== null && _sessionAnchor.ctx !== null ? snap.ctx - _sessionAnchor.ctx : null;
+    const driftAudioSession = (dAudioSession - dWallSession) * 1000;
+    const driftCtxSession = dCtxSession !== null ? (dCtxSession - dWallSession) * 1000 : null;
+    const dWallSeg = _segmentAnchor ? (snap.wall - _segmentAnchor.wall) / 1000 : 0;
+    const dAudioSeg = _segmentAnchor ? snap.audio - _segmentAnchor.audio : 0;
+    const driftAudioSeg = (dAudioSeg - dWallSeg) * 1000;
+    _clockLog.push({
+        kind: 'tick',
+        t_wall: dWallSession, audio: dAudioSession, ctx: dCtxSession,
+        outLat: snap.outLat, baseLat: snap.baseLat,
+        driftAudioSession, driftCtxSession, driftAudioSeg,
+    });
+    if (_clockLog.length > 1200) _clockLog.shift();
     console.log(
-        `[clock] t=${dWall.toFixed(1)}s  audio=${dAudio.toFixed(3)}s  ctx=${dCtx === null ? 'n/a' : dCtx.toFixed(3) + 's'}  ` +
-        `driftAudio=${driftAudio.toFixed(1)}ms  driftCtx=${driftCtx === null ? 'n/a' : driftCtx.toFixed(1) + 'ms'}  ` +
-        `outLat=${outLat === null ? 'n/a' : outLat.toFixed(1) + 'ms'}  baseLat=${baseLat === null ? 'n/a' : baseLat.toFixed(1) + 'ms'}`
+        `[clock] t=${dWallSession.toFixed(1)}s  ` +
+        `driftSess audio=${driftAudioSession.toFixed(1)}ms ctx=${driftCtxSession === null ? 'n/a' : driftCtxSession.toFixed(1) + 'ms'}  ` +
+        `driftSeg audio=${driftAudioSeg.toFixed(1)}ms  ` +
+        `outLat=${snap.outLat === null ? 'n/a' : snap.outLat.toFixed(1) + 'ms'}`
     );
 }, 1000);
 window.slopsmith = window.slopsmith || {};
 window.slopsmith.dumpClockLog = () => {
-    const header = 't_wall_s,audio_s,ctx_s,driftAudio_ms,driftCtx_ms,outLat_ms,baseLat_ms';
-    const rows = _clockLog.map(r =>
-        `${r.t_wall.toFixed(3)},${r.audio.toFixed(3)},${r.ctx === null ? '' : r.ctx.toFixed(3)},` +
-        `${r.driftAudio.toFixed(2)},${r.driftCtx === null ? '' : r.driftCtx.toFixed(2)},` +
-        `${r.outLat === null ? '' : r.outLat.toFixed(2)},${r.baseLat === null ? '' : r.baseLat.toFixed(2)}`
-    );
+    const header = 'kind,t_wall_s,audio_s,ctx_s,driftAudioSession_ms,driftCtxSession_ms,driftAudioSeg_ms,outLat_ms,baseLat_ms,dOut_ms,dAudioAcrossPause_ms,dCtxAcrossPause_ms';
+    const rows = _clockLog.map(r => {
+        if (r.kind === 'tick') {
+            return `tick,${r.t_wall.toFixed(3)},${r.audio.toFixed(3)},${r.ctx === null ? '' : r.ctx.toFixed(3)},` +
+                `${r.driftAudioSession.toFixed(2)},${r.driftCtxSession === null ? '' : r.driftCtxSession.toFixed(2)},${r.driftAudioSeg.toFixed(2)},` +
+                `${r.outLat === null ? '' : r.outLat.toFixed(2)},${r.baseLat === null ? '' : r.baseLat.toFixed(2)},,,`;
+        }
+        const t = _sessionAnchor ? ((r.wall - _sessionAnchor.wall) / 1000).toFixed(3) : '';
+        const aud = (r.audio - (_sessionAnchor?.audio ?? 0)).toFixed(3);
+        const ctx = r.ctx !== null && _sessionAnchor?.ctx !== null ? (r.ctx - _sessionAnchor.ctx).toFixed(3) : '';
+        return `${r.kind},${t},${aud},${ctx},,,,${r.outLat?.toFixed(2) ?? ''},${r.baseLat?.toFixed(2) ?? ''},` +
+            `${r.dOut?.toFixed(2) ?? ''},${r.dAudioAcrossPause?.toFixed(2) ?? ''},${r.dCtxAcrossPause?.toFixed(2) ?? ''}`;
+    });
     console.log([header, ...rows].join('\n'));
     return _clockLog.length;
 };
