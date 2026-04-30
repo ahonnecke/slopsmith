@@ -1660,6 +1660,14 @@ async function loadPlugins() {
         const mobileNavContainer = document.getElementById('mobile-nav-plugins');
         const settingsContainer = document.getElementById('plugin-settings');
 
+        // Plugin settings area hosts both "Plugin Updates" and per-plugin
+        // collapsibles. Reveal it whenever any plugins are installed —
+        // updates are relevant even for plugins that contribute no settings.
+        if (plugins.length > 0) {
+            const area = document.getElementById('plugin-settings-area');
+            if (area) area.classList.remove('hidden');
+        }
+
         // Build plugin dropdown for desktop nav
         const navPlugins = plugins.filter(p => p.nav);
         if (navPlugins.length > 0) {
@@ -1715,14 +1723,47 @@ async function loadPlugins() {
                 screenDiv.innerHTML = await htmlResp.text();
             }
 
-            // Inject settings section
+            // Inject settings section — wrapped in a collapsible <details>
+            // per plugin so the page stays scannable as plugins accumulate.
+            // Collapsed by default; <details>/<summary> handles state natively.
             if (plugin.has_settings && settingsContainer) {
-                const settingsDiv = document.createElement('div');
-                settingsDiv.id = `plugin-settings-${plugin.id}`;
-                settingsContainer.appendChild(settingsDiv);
+                const details = document.createElement('details');
+                details.className = 'bg-dark-700/40 border border-gray-800 rounded-xl overflow-hidden group';
+
+                const summary = document.createElement('summary');
+                // .plugin-settings-summary class hides the browser's native
+                // disclosure triangle (see style.css) so only our chevron shows.
+                summary.className = 'plugin-settings-summary cursor-pointer select-none px-4 py-3 text-sm font-medium text-gray-300 hover:bg-dark-700/70 transition flex items-center justify-between';
+                const labelSpan = document.createElement('span');
+                labelSpan.textContent = plugin.name || plugin.id;
+                summary.appendChild(labelSpan);
+                // Chevron icon — built via setAttributeNS so the SVG sits in
+                // the SVG namespace and renders correctly. Plugin label is
+                // appended as text above so manifest values can't inject HTML.
+                const svgNS = 'http://www.w3.org/2000/svg';
+                const svg = document.createElementNS(svgNS, 'svg');
+                svg.setAttribute('class', 'w-4 h-4 text-gray-500 transition-transform group-open:rotate-180');
+                svg.setAttribute('fill', 'none');
+                svg.setAttribute('stroke', 'currentColor');
+                svg.setAttribute('viewBox', '0 0 24 24');
+                const path = document.createElementNS(svgNS, 'path');
+                path.setAttribute('stroke-linecap', 'round');
+                path.setAttribute('stroke-linejoin', 'round');
+                path.setAttribute('stroke-width', '2');
+                path.setAttribute('d', 'M19 9l-7 7-7-7');
+                svg.appendChild(path);
+                summary.appendChild(svg);
+                details.appendChild(summary);
+
+                const body = document.createElement('div');
+                body.id = `plugin-settings-${plugin.id}`;
+                body.className = 'px-4 py-4 border-t border-gray-800 space-y-4';
+                details.appendChild(body);
+
+                settingsContainer.appendChild(details);
 
                 const settingsResp = await fetch(`/api/plugins/${plugin.id}/settings.html`);
-                settingsDiv.innerHTML = await settingsResp.text();
+                body.innerHTML = await settingsResp.text();
                 // <script> tags inserted via innerHTML are intentionally
                 // inert per the HTML5 spec — the browser parses them as
                 // DOM nodes but never runs the body. That silently breaks
@@ -1734,7 +1775,7 @@ async function loadPlugins() {
                 // elements created via document.createElement DO execute
                 // when appended — so plugins get the script behavior
                 // they'd expect from a normal HTML document.
-                settingsDiv.querySelectorAll('script').forEach(oldScript => {
+                body.querySelectorAll('script').forEach(oldScript => {
                     const newScript = document.createElement('script');
                     for (const attr of oldScript.attributes) {
                         newScript.setAttribute(attr.name, attr.value);

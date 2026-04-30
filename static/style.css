@@ -2,6 +2,13 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 
+/* Plugin settings collapsibles use a custom SVG chevron — hide the
+   browser's default <summary> disclosure triangle so we don't get
+   two indicators side-by-side. */
+.plugin-settings-summary { list-style: none; }
+.plugin-settings-summary::-webkit-details-marker { display: none; }
+.plugin-settings-summary::marker { content: ''; }
+
 /* Screens */
 .screen { display: none; }
 .screen.active { display: block; }

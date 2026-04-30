@@ -162,68 +162,81 @@
             </button>
             <h2 class="text-3xl font-bold text-white mb-8">Settings</h2>
 
-            <div class="space-y-6">
-                <div>
-                    <label class="text-sm font-medium text-gray-400 mb-2 block">DLC Folder Path</label>
-                    <div class="flex gap-3">
-                        <input type="text" id="dlc-path" placeholder="/path/to/Rocksmith2014/dlc"
-                            class="flex-1 bg-dark-700 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
-                        <button onclick="pickDlcFolder()" id="btn-pick-dlc" class="hidden bg-dark-600 hover:bg-dark-500 px-4 py-2.5 rounded-xl text-sm text-gray-300 transition whitespace-nowrap">📂 Browse</button>
-                        <button onclick="saveSettings()" class="bg-accent hover:bg-accent-light px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition">Save</button>
+            <div class="space-y-10">
+                <!-- ── Core Slopsmith settings ─────────────────────────────── -->
+                <section>
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Slopsmith</h3>
+                    <div class="space-y-6">
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">DLC Folder Path</label>
+                            <div class="flex gap-3">
+                                <input type="text" id="dlc-path" placeholder="/path/to/Rocksmith2014/dlc"
+                                    class="flex-1 bg-dark-700 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+                                <button onclick="pickDlcFolder()" id="btn-pick-dlc" class="hidden bg-dark-600 hover:bg-dark-500 px-4 py-2.5 rounded-xl text-sm text-gray-300 transition whitespace-nowrap">📂 Browse</button>
+                                <button onclick="saveSettings()" class="bg-accent hover:bg-accent-light px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition">Save</button>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="flex items-center gap-3 cursor-pointer select-none">
+                                <input type="checkbox" id="setting-lefty" onchange="highway.setLefty(this.checked)"
+                                    class="rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
+                                <span class="text-sm text-gray-300">Left-handed <span class="text-gray-500">(invert frets on the note highway)</span></span>
+                            </label>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">Default Arrangement</label>
+                            <select id="default-arrangement"
+                                class="bg-dark-700 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-300 outline-none">
+                                <option value="">Auto (most notes)</option>
+                                <option value="Lead">Lead</option>
+                                <option value="Rhythm">Rhythm</option>
+                                <option value="Bass">Bass</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="setting-av-offset" class="text-sm font-medium text-gray-400 mb-2 block">
+                                A/V Sync Offset: <span id="setting-av-offset-val">0</span> ms
+                            </label>
+                            <input type="range" id="setting-av-offset" min="-1000" max="1000" step="1" value="0"
+                                oninput="setAvOffsetMs(this.value)"
+                                class="w-full">
+                            <p class="text-xs text-gray-600 mt-1">Positive = audio plays ahead of visual notes; raise this value to catch the highway up. Adjust live with the [ and ] keys (Shift for ±50 ms). Auto-saves on every change.</p>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">Demucs Server (for stem separation)</label>
+                            <input type="text" id="demucs-server-url" placeholder="http://192.168.1.100:7865"
+                                class="w-full bg-dark-700 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+                            <p class="text-xs text-gray-600 mt-1">Optional. Run slopsmith-demucs-server on your desktop for stem splitting without crashing Docker.</p>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">Library</label>
+                            <div class="flex items-center gap-3">
+                                <button onclick="rescanLibrary()" id="btn-rescan" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Rescan Library</button>
+                                <button onclick="fullRescanLibrary()" id="btn-full-rescan" class="bg-dark-600 hover:bg-red-900/30 px-5 py-2.5 rounded-xl text-sm text-gray-400 transition">Full Rescan</button>
+                                <span id="rescan-status" class="text-xs text-gray-500"></span>
+                            </div>
+                            <p class="text-xs text-gray-600 mt-1">Rescan checks for new songs. Full Rescan clears the cache and re-imports everything.</p>
+                        </div>
+                        <div id="settings-status" class="text-sm text-gray-500"></div>
                     </div>
-                </div>
-                <div>
-                    <label class="flex items-center gap-3 cursor-pointer select-none">
-                        <input type="checkbox" id="setting-lefty" onchange="highway.setLefty(this.checked)"
-                            class="rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
-                        <span class="text-sm text-gray-300">Left-handed <span class="text-gray-500">(invert frets on the note highway)</span></span>
-                    </label>
-                </div>
-                <div>
-                    <label class="text-sm font-medium text-gray-400 mb-2 block">Default Arrangement</label>
-                    <select id="default-arrangement"
-                        class="bg-dark-700 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-300 outline-none">
-                        <option value="">Auto (most notes)</option>
-                        <option value="Lead">Lead</option>
-                        <option value="Rhythm">Rhythm</option>
-                        <option value="Bass">Bass</option>
-                    </select>
-                </div>
-                <div>
-                    <label for="setting-av-offset" class="text-sm font-medium text-gray-400 mb-2 block">
-                        A/V Sync Offset: <span id="setting-av-offset-val">0</span> ms
-                    </label>
-                    <input type="range" id="setting-av-offset" min="-1000" max="1000" step="1" value="0"
-                        oninput="setAvOffsetMs(this.value)"
-                        class="w-full">
-                    <p class="text-xs text-gray-600 mt-1">Positive = audio plays ahead of visual notes; raise this value to catch the highway up. Adjust live with the [ and ] keys (Shift for ±50 ms). Auto-saves on every change.</p>
-                </div>
-                <div>
-                    <label class="text-sm font-medium text-gray-400 mb-2 block">Demucs Server (for stem separation)</label>
-                    <input type="text" id="demucs-server-url" placeholder="http://192.168.1.100:7865"
-                        class="w-full bg-dark-700 border border-gray-800 rounded-xl px-4 py-2.5 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
-                    <p class="text-xs text-gray-600 mt-1">Optional. Run slopsmith-demucs-server on your desktop for stem splitting without crashing Docker.</p>
-                </div>
-                <div>
-                    <label class="text-sm font-medium text-gray-400 mb-2 block">Library</label>
-                    <div class="flex items-center gap-3">
-                        <button onclick="rescanLibrary()" id="btn-rescan" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Rescan Library</button>
-                        <button onclick="fullRescanLibrary()" id="btn-full-rescan" class="bg-dark-600 hover:bg-red-900/30 px-5 py-2.5 rounded-xl text-sm text-gray-400 transition">Full Rescan</button>
-                        <span id="rescan-status" class="text-xs text-gray-500"></span>
+                </section>
+
+                <!-- ── Plugin settings ─────────────────────────────────────── -->
+                <section id="plugin-settings-area" class="hidden">
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Plugins</h3>
+                    <div class="space-y-6">
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">Plugin Updates</label>
+                            <div class="flex items-center gap-3 mb-2">
+                                <button onclick="checkPluginUpdates()" id="btn-check-updates" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Check for Updates</button>
+                                <span id="updates-status" class="text-xs text-gray-500"></span>
+                            </div>
+                            <div id="plugin-updates-list" class="space-y-2"></div>
+                        </div>
+                        <!-- Per-plugin collapsible sections injected here -->
+                        <div id="plugin-settings" class="space-y-3"></div>
                     </div>
-                    <p class="text-xs text-gray-600 mt-1">Rescan checks for new songs. Full Rescan clears the cache and re-imports everything.</p>
-                </div>
-                <div>
-                    <label class="text-sm font-medium text-gray-400 mb-2 block">Plugin Updates</label>
-                    <div class="flex items-center gap-3 mb-2">
-                        <button onclick="checkPluginUpdates()" id="btn-check-updates" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Check for Updates</button>
-                        <span id="updates-status" class="text-xs text-gray-500"></span>
-                    </div>
-                    <div id="plugin-updates-list" class="space-y-2"></div>
-                </div>
-                <!-- Plugin settings injected here -->
-                <div id="plugin-settings" class="space-y-6"></div>
-                <div id="settings-status" class="text-sm text-gray-500"></div>
+                </section>
             </div>
         </div>
     </div>
