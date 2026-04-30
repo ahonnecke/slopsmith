@@ -111,3 +111,42 @@ loopback after.
 PipeWire (`alsa_input.usb-<vendor>_<model>...`) but a hardware re-enumerate
 can occasionally produce a different suffix. If your persistent config
 stops working, re-run `pactl list short sources` and update the source name.
+
+**Detect toggle disrupts USB-out monitoring** — known intermittent issue:
+when notedetect's Detect button toggles on/off, the loopback module that
+pipes USB-guitar → speakers may stop passing audio. Workaround: toggle
+Detect off and on once or twice (the user has reported needing 5 cycles
+in worst case). Root cause is below the JS audio API: PipeWire
+renegotiates the USB source's clock/quantum when Firefox's `getUserMedia`
+grab attaches and detaches concurrently with the loopback's source-read.
+The notedetect plugin disconnects its WebAudio graph in stages on stop
+(source first, then worklet, then tracks, then context close) to reduce
+the race, but PipeWire still occasionally drops the loopback's
+source-output during the renegotiation.
+
+When this happens, capture diagnostic data so we can write a real fix:
+
+```bash
+# Terminal — capture PipeWire state DURING the breakage:
+pactl list sink-inputs > /tmp/sink-inputs-broken.txt
+pactl list source-outputs > /tmp/source-outputs-broken.txt
+
+# DevTools console — capture JS audio state at the same moment:
+await slopsmith.ndDiag.audioPath()
+```
+
+Then toggle Detect to recover and re-capture both:
+
+```bash
+pactl list sink-inputs > /tmp/sink-inputs-working.txt
+pactl list source-outputs > /tmp/source-outputs-working.txt
+```
+
+```js
+await slopsmith.ndDiag.audioPath()
+```
+
+The diff between broken and working states tells us exactly which stream
+got wedged (corked, disconnected from source, routed to a dead sink).
+Without that data we can only ship defensive patches; with it we can
+write a targeted fix.
