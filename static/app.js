@@ -890,6 +890,19 @@ function togglePlay() {
 }
 
 function seekBy(s) { audio.currentTime = Math.max(0, audio.currentTime + s); }
+
+// Explicit "I'm done with this attempt — show me the review" signal.
+// Plugins (notedetect's coaching review) listen for song:restart to pop a
+// modal, then the seek-to-zero + pause runs after they've snapshotted.
+function restartSong() {
+    window.slopsmith.emit('song:restart', { time: audio.currentTime });
+    audio.pause();
+    audio.currentTime = 0;
+    if (isPlaying) {
+        isPlaying = false;
+        document.getElementById('btn-play').textContent = '▶ Play';
+    }
+}
 function setVolume(v) {
     audio.volume = v / 100;
     document.getElementById('vol-label').textContent = v + '%';
