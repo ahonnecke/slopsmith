@@ -42,13 +42,23 @@ Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` 
   "screen": "screen.html",
   "script": "screen.js",
   "routes": "routes.py",
-  "settings": { "html": "settings.html" }
+  "settings": {
+    "html": "settings.html",
+    "server_files": ["my_plugin.db", "my_plugin_models/"]
+  }
 }
 ```
 
 All fields except `id` and `name` are optional. Plugins can have any combination of frontend (screen/script), backend (routes), and settings.
 
 `version` and `private` are advisory metadata — the plugin loader does not currently consume them, but plugins commonly include them for publishing/tooling purposes.
+
+`settings.server_files` is the **opt-in** for the unified Settings export/import flow (slopsmith#113). It's a list of relpaths under `context["config_dir"]` that the plugin wants included in user-triggered backups. A trailing `/` denotes a directory (recurse). Plugins that omit this field have no server-side files exported; their state lives entirely in browser `localStorage`, which is bundled wholesale on every export. Rules:
+- Relpaths only. Absolute paths, drive letters, `..` segments, and backslashes are rejected at load time with a `[Plugin]` warning.
+- The same allowlist is consulted at both export and import: a bundle that references a file the *importing host*'s manifest no longer declares is skipped with a warning (handles plugin updates between export and import). A bundle that references a file your host's manifest never declared is also skipped — no surprise writes.
+- Files are encoded as `{"encoding": "json", "data": <parsed>}` for `.json` files that parse cleanly (diff-friendly), `{"encoding": "base64", "data": "..."}` otherwise (sqlite, model blobs, IRs).
+- Plugins own their internal data migration. Importing a bundle whose data schema predates your current code restores bytes verbatim — your plugin must cope at next load.
+- Symlinks are skipped on export and never followed on import.
 
 `type` is an optional role hint (slopsmith#36). Supported values:
 - `"visualization"` — plugin provides a highway renderer. Declaring this makes the plugin eligible for the main-player viz picker AND splitscreen's per-panel picker. Must pair with a `window.slopsmithViz_<id>` factory exporting the setRenderer contract below.

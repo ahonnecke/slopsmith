@@ -276,6 +276,16 @@
                             </div>
                             <p class="text-xs text-gray-600 mt-1">Rescan checks for new songs. Full Rescan clears the cache and re-imports everything.</p>
                         </div>
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">Backup</label>
+                            <div class="flex items-center gap-3">
+                                <button onclick="exportSettings()" id="btn-export-settings" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Export Settings</button>
+                                <button onclick="document.getElementById('import-settings-file').click()" id="btn-import-settings" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Import Settings</button>
+                                <input type="file" id="import-settings-file" accept="application/json,.json" class="hidden" onchange="importSettings(this.files[0]); this.value=''">
+                                <span id="backup-status" class="text-xs text-gray-500"></span>
+                            </div>
+                            <p class="text-xs text-gray-600 mt-1">Export bundles server config, browser preferences, and opted-in plugin data into one JSON file. Import overwrites current settings and reloads.</p>
+                        </div>
                         <div id="settings-status" class="text-sm text-gray-500"></div>
                     </div>
                 </section>

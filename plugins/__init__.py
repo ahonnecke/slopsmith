@@ -197,6 +197,87 @@ def _warn_on_module_collisions(plugin_specs):
         )
 
 
+def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
+    """Validate and normalize a plugin's `settings.server_files` manifest
+    list into clean POSIX-style relpaths suitable for the settings
+    export/import bundle (slopsmith#113).
+
+    Each entry must be a non-empty string with no absolute prefix and
+    no `..` segment. A trailing `/` denotes a directory (recurse on
+    export). Invalid entries are dropped with a `[Plugin]` warning so
+    a bad manifest can't smuggle a path-traversal opportunity into
+    the importer's allowlist.
+
+    Returns a list of normalized strings. Returns `[]` when the
+    manifest doesn't declare any exportable server files (the common
+    case — most plugins keep state purely in localStorage).
+    """
+    if not isinstance(settings_field, dict):
+        return []
+    raw = settings_field.get("server_files")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        print(
+            f"[Plugin] '{plugin_id}': settings.server_files must be a list, "
+            f"got {type(raw).__name__}; ignoring"
+        )
+        return []
+
+    cleaned: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry:
+            print(
+                f"[Plugin] '{plugin_id}': dropping non-string / empty "
+                f"server_files entry {entry!r}"
+            )
+            continue
+        # Loader rules mirror what `_validate_relpath` enforces at import
+        # time, so any entry that passes here is guaranteed to round-trip
+        # through export and back through import. Surfacing whitespace /
+        # `.` / dotfile entries as warnings beats silently producing a
+        # bundle that the same server later refuses to ingest.
+        if entry != entry.strip():
+            print(
+                f"[Plugin] '{plugin_id}': dropping server_files entry with "
+                f"leading/trailing whitespace {entry!r}"
+            )
+            continue
+        # Reject absolute paths, drive letters, and any backslash-
+        # separated form before splitting — the importer treats the
+        # allowlist as POSIX strings, so accepting `foo\bar` here would
+        # let a malicious manifest sidestep traversal detection on
+        # platforms whose `Path` accepts both separators.
+        if "\\" in entry:
+            print(
+                f"[Plugin] '{plugin_id}': server_files entry must use POSIX "
+                f"separators, dropping {entry!r}"
+            )
+            continue
+        # Strip a single trailing slash for the traversal check, then
+        # re-attach it so the export walker can still detect "this is
+        # a directory" from the normalized form.
+        is_dir = entry.endswith("/")
+        body = entry.rstrip("/")
+        if not body:
+            print(f"[Plugin] '{plugin_id}': dropping empty server_files entry")
+            continue
+        parts = body.split("/")
+        if (
+            body.startswith("/")
+            or (len(body) >= 2 and body[1] == ":")  # Windows drive letter
+            or any(part in ("", ".", "..") for part in parts)
+            or parts[0].startswith(".")
+        ):
+            print(
+                f"[Plugin] '{plugin_id}': dropping unsafe server_files entry "
+                f"{entry!r} (absolute / traversal / dotfile / empty segment)"
+            )
+            continue
+        cleaned.append(body + ("/" if is_dir else ""))
+    return cleaned
+
+
 def _install_requirements(plugin_dir: Path, plugin_id: str):
     """Install plugin requirements.txt to a persistent location."""
     req_file = plugin_dir / "requirements.txt"
@@ -388,6 +469,11 @@ def load_plugins(app: FastAPI, context: dict):
             "has_screen": bool(manifest.get("screen")),
             "has_script": bool(manifest.get("script")),
             "has_settings": bool(manifest.get("settings")),
+            # Normalized list of relpaths under CONFIG_DIR that this
+            # plugin opts in to settings export/import. Empty for
+            # plugins that don't declare `settings.server_files`. See
+            # slopsmith#113.
+            "_export_paths": _normalize_export_paths(manifest.get("settings"), plugin_id),
             "_dir": plugin_dir,
             "_manifest": manifest,
         })
