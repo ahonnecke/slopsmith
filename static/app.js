@@ -2462,7 +2462,6 @@ async function _scheduleStartupRehydration() {
                     console.log('[slopsmith] Background startup complete — re-hydrating plugins');
                     const plugins = await loadPlugins();
                     _populateVizPicker(plugins);
-                    setPluginLoadingState(false, '');
                 } else {
                     console.warn('[slopsmith] Backend startup ended without completing — skipping re-hydration');
                 }
