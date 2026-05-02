@@ -2283,7 +2283,11 @@ async function waitForPluginStartupComplete(timeoutMs = 180000) {
     return { running: false, phase: 'timeout', message: 'Plugin startup timed out', error: null, current_plugin: '', loaded: 0, total: 0 };
 }
 
+let _loadPluginsInFlight = false;
+
 async function loadPlugins() {
+    if (_loadPluginsInFlight) return null;
+    _loadPluginsInFlight = true;
     let plugins;
     try {
         const resp = await fetch('/api/plugins');
@@ -2440,8 +2444,10 @@ async function loadPlugins() {
         }
     } catch (e) {
         console.error('Failed to load plugins:', e);
+        _loadPluginsInFlight = false;
         return null;
     }
+    _loadPluginsInFlight = false;
     return plugins;
 }
 
