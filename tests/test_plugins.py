@@ -12,13 +12,36 @@ plus a warning at startup so
 existing colliding plugins are visible.
 """
 
+import contextlib
 import importlib
 import json
+import logging
 import sys
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+
+@contextlib.contextmanager
+def capture_logger(caplog, logger_name, level=logging.WARNING):
+    """Context manager that attaches *caplog.handler* directly to the named
+    logger for the duration of the ``with`` block, then restores its original
+    level and ``propagate`` flag.  Bypasses pytest's default root-logger
+    attachment so tests that set ``propagate=False`` on their logger still
+    capture records even when the ``slopsmith`` hierarchy hasn't set up
+    handlers yet."""
+    logger = logging.getLogger(logger_name)
+    orig_level, orig_propagate = logger.level, logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    try:
+        yield logger
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(orig_level)
+        logger.propagate = orig_propagate
 
 
 # Bare module names that this test module pre-populates into
@@ -183,29 +206,29 @@ def test_load_sibling_rejects_traversal_and_suffix(tmp_path, reset_plugin_state)
             plugins._load_plugin_sibling("p", plugin_dir, bad)
 
 
-def test_collision_warning_fires_for_shared_module_name(tmp_path, reset_plugin_state, capsys):
+def test_collision_warning_fires_for_shared_module_name(tmp_path, reset_plugin_state, caplog):
     """Two plugins both shipping extractor.py must trigger the warning."""
     plugins = reset_plugin_state
     _make_plugin(tmp_path, "rs1extract", sibling_files={"extractor": "X = 1\n"})
     _make_plugin(tmp_path, "discextract", sibling_files={"extractor": "Y = 2\n"})
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
-    assert "Module-name collision warning" in out
-    assert "'extractor' (module)" in out
-    assert "rs1extract" in out
-    assert "discextract" in out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" in caplog.text
+    assert "'extractor' (module)" in caplog.text
+    assert "rs1extract" in caplog.text
+    assert "discextract" in caplog.text
 
 
-def test_collision_warning_silent_when_names_unique(tmp_path, reset_plugin_state, capsys):
+def test_collision_warning_silent_when_names_unique(tmp_path, reset_plugin_state, caplog):
     plugins = reset_plugin_state
     _make_plugin(tmp_path, "alpha", sibling_files={"alpha_helper": "A = 1\n"})
     _make_plugin(tmp_path, "beta", sibling_files={"beta_helper": "B = 2\n"})
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
-    assert "Module-name collision warning" not in out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" not in caplog.text
 
 
-def test_collision_warning_excludes_routes_and_dunders(tmp_path, reset_plugin_state, capsys):
+def test_collision_warning_excludes_routes_and_dunders(tmp_path, reset_plugin_state, caplog):
     """routes.py is already namespaced by the loader; __init__.py
     belongs to a plugin that opted into being a package and namespaces
     itself. Neither should trip the collision warning even when both
@@ -215,12 +238,12 @@ def test_collision_warning_excludes_routes_and_dunders(tmp_path, reset_plugin_st
     p2 = _make_plugin(tmp_path, "two", sibling_files={"unique_two": "V = 2\n"})
     (p1 / "__init__.py").write_text("")
     (p2 / "__init__.py").write_text("")
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
-    assert "Module-name collision warning" not in out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" not in caplog.text
 
 
-def test_collision_warning_dedupes_per_plugin(tmp_path, reset_plugin_state, capsys):
+def test_collision_warning_dedupes_per_plugin(tmp_path, reset_plugin_state, caplog):
     """A single plugin shipping BOTH `extractor.py` and
     `extractor/__init__.py` is a supported intra-plugin layout
     (load_sibling deterministically prefers the package form,
@@ -233,14 +256,14 @@ def test_collision_warning_dedupes_per_plugin(tmp_path, reset_plugin_state, caps
     pkg_dir = plugin_dir / "extractor"
     pkg_dir.mkdir()
     (pkg_dir / "__init__.py").write_text("FROM = 'package'\n")
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
     # Only one plugin is involved, so no cross-plugin warning fires.
-    assert "Module-name collision warning" not in out
+    assert "Module-name collision" not in caplog.text
 
 
 def test_collision_warning_still_fires_when_two_plugins_each_have_both_forms(
-    tmp_path, reset_plugin_state, capsys
+    tmp_path, reset_plugin_state, caplog
 ):
     """Two plugins each shipping both forms of `extractor` IS a
     real cross-plugin collision and must be reported. Codex round 5
@@ -252,11 +275,11 @@ def test_collision_warning_still_fires_when_two_plugins_each_have_both_forms(
         pkg_dir = plugin_dir / "extractor"
         pkg_dir.mkdir()
         (pkg_dir / "__init__.py").write_text(f"OWNER = '{pid}-package'\n")
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
-    warning_lines = [ln for ln in out.splitlines() if "Module-name collision warning" in ln]
-    assert len(warning_lines) == 1
-    warning = warning_lines[0]
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    collision_records = [r for r in caplog.records if "Module-name collision" in r.getMessage()]
+    assert len(collision_records) == 1
+    warning = collision_records[0].getMessage()
     assert "alpha" in warning
     assert "beta" in warning
     # The warning text should list each plugin id ONCE, even though
@@ -490,7 +513,7 @@ def test_safe_plugin_id_encoding_is_collision_free(reset_plugin_state):
     assert len(set(encoded)) == len(samples), dict(zip(samples, encoded))
 
 
-def test_load_plugins_skips_non_string_id(tmp_path, reset_plugin_state, capsys):
+def test_load_plugins_skips_non_string_id(tmp_path, reset_plugin_state, caplog):
     """A malformed manifest with a non-string id (e.g. number) is
     skipped with a clear message rather than crashing later inside
     `_safe_plugin_id_for_module_name`'s `.replace()` call. Copilot
@@ -501,16 +524,16 @@ def test_load_plugins_skips_non_string_id(tmp_path, reset_plugin_state, capsys):
     (bad_dir / "plugin.json").write_text('{"id": 42, "name": "bad"}')
     _make_plugin(tmp_path, "good", sibling_files={"util": "X = 1\n"})
     fake_app = type("FakeApp", (), {})()
-    _run_load_plugins(plugins, fake_app, tmp_path)
-    out = capsys.readouterr().out
-    assert "must be a string" in out
-    assert "int" in out  # type name surfaced
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, fake_app, tmp_path)
+    assert "must be a string" in caplog.text
+    assert "int" in caplog.text  # type name surfaced
     loaded_ids = {p["id"] for p in plugins.LOADED_PLUGINS}
     assert 42 not in loaded_ids
     assert "good" in loaded_ids
 
 
-def test_load_plugins_warns_on_falsy_non_string_id(tmp_path, reset_plugin_state, capsys):
+def test_load_plugins_warns_on_falsy_non_string_id(tmp_path, reset_plugin_state, caplog):
     """`{"id": 0}` and `{"id": []}` are falsy non-strings. The
     type-check must run BEFORE the falsy-empty check so the user
     gets the explicit "must be a string" warning instead of a
@@ -520,14 +543,14 @@ def test_load_plugins_warns_on_falsy_non_string_id(tmp_path, reset_plugin_state,
         bad_dir = tmp_path / f"bad{i}"
         bad_dir.mkdir()
         (bad_dir / "plugin.json").write_text(f'{{"id": {bad_value}, "name": "x"}}')
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
     # Each malformed manifest produces a "must be a string" warning;
     # none are silently dropped.
-    assert out.count("must be a string") == 3
-    assert "int" in out  # for {"id": 0}
-    assert "list" in out  # for {"id": []}
-    assert "bool" in out  # for {"id": false}
+    assert caplog.text.count("must be a string") == 3
+    assert "int" in caplog.text  # for {"id": 0}
+    assert "list" in caplog.text  # for {"id": []}
+    assert "bool" in caplog.text  # for {"id": false}
 
 
 def test_load_plugins_escapes_dotted_id_in_routes_module_name(tmp_path, reset_plugin_state):
@@ -744,7 +767,7 @@ def test_load_sibling_disambiguates_underscored_ids_and_names(tmp_path, reset_pl
     assert sys.modules["plugin_a.b_c"] is m2
 
 
-def test_collision_warning_detects_package_form(tmp_path, reset_plugin_state, capsys):
+def test_collision_warning_detects_package_form(tmp_path, reset_plugin_state, caplog):
     """A plugin shipping `extractor/__init__.py` collides with another
     plugin's `extractor.py` the same way two `.py` files would. The
     scanner picks up packages too. Codex review on PR for slopsmith#33."""
@@ -756,18 +779,18 @@ def test_collision_warning_detects_package_form(tmp_path, reset_plugin_state, ca
     pkg_dir = plugin_pkg / "extractor"
     pkg_dir.mkdir()
     (pkg_dir / "__init__.py").write_text("Y = 2\n")
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
-    assert "Module-name collision warning" in out
-    assert "extractor" in out
-    assert "as_module" in out
-    assert "as_package" in out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" in caplog.text
+    assert "extractor" in caplog.text
+    assert "as_module" in caplog.text
+    assert "as_package" in caplog.text
     # The mixed-form label should also appear so the maintainer knows
     # to look for both shapes.
-    assert "module/package" in out
+    assert "module/package" in caplog.text
 
 
-def test_collision_warning_detects_two_packages(tmp_path, reset_plugin_state, capsys):
+def test_collision_warning_detects_two_packages(tmp_path, reset_plugin_state, caplog):
     """Two plugins each shipping the SAME package directory form."""
     plugins = reset_plugin_state
     for pid in ("plug_a", "plug_b"):
@@ -775,12 +798,12 @@ def test_collision_warning_detects_two_packages(tmp_path, reset_plugin_state, ca
         pkg = plugin_dir / "shared_pkg"
         pkg.mkdir()
         (pkg / "__init__.py").write_text(f"# {pid}\n")
-    _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
-    out = capsys.readouterr().out
-    assert "Module-name collision warning" in out
-    assert "shared_pkg" in out
-    assert "plug_a" in out
-    assert "plug_b" in out
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" in caplog.text
+    assert "shared_pkg" in caplog.text
+    assert "plug_a" in caplog.text
+    assert "plug_b" in caplog.text
 
 
 def test_per_plugin_context_does_not_leak_load_sibling_across_plugins(tmp_path, reset_plugin_state):

@@ -71,6 +71,7 @@ All fields except `id` and `name` are optional. Plugins can have any combination
 - `meta_db` — shared MetadataDB instance
 - `get_sloppak_cache_dir()` — sloppak cache path
 - `load_sibling(name)` — loads a sibling module from this plugin's directory under a unique, namespaced module name. See "Sibling imports" below.
+- `log` — stdlib `logging.Logger` namespaced to `slopsmith.plugin.<id>`. Pre-configured with the app-wide level, format (including JSON mode), and correlation IDs. Use this for all backend plugin output instead of `print()`. See "Backend plugin logging" below.
 
 **Sibling imports — use `load_sibling`, not bare imports** (slopsmith#33). The plugin loader inserts each plugin's directory onto `sys.path` so `from extractor import X` works, but Python caches imports by **module name** in `sys.modules`. Two plugins that each ship a top-level `extractor.py` (or any other generic name — `util.py`, `client.py`, `parser.py`, `config.py`, …) collide: whichever loads first wins, and the other plugin's `from extractor import X` either gets the wrong module or fails with `cannot import name 'X' from 'extractor'`.
 
@@ -240,6 +241,29 @@ if (window.slopsmith && window.slopsmith.audio) {
 ```
 
 The plugin owns persistence — the registry calls `getValue()` when the popover opens, and also after each `setValue()` during slider drags to re-sync the displayed value. Keep `getValue()` cheap and side-effect-free, and make sure `setValue()` updates whatever backing state `getValue()` reads synchronously. Pair `setValue` with whatever your plugin already does internally (write the GainNode, persist to localStorage, update any in-plugin label). Use `unregisterFader(id)` when your plugin is teardown-able and you want the strip to disappear; otherwise keep it registered so the user's setting persists across toggle states.
+
+### Backend plugin logging
+
+Use `context["log"]` for all backend plugin output. It is a stdlib `logging.Logger` namespaced to `slopsmith.plugin.<id>`, pre-configured with the app-wide level, format (including JSON mode), and correlation IDs. Never use `print()` — it bypasses correlation context and log rotation.
+
+```python
+def setup(app, context):
+    log = context["log"]
+    log.info("plugin ready")
+    log.warning("optional dependency %r not found, feature disabled", dep)
+    try:
+        risky_init()
+    except Exception:
+        log.exception("unhandled error during setup")  # auto-captures traceback
+```
+
+For CLI entry points (scripts that also run as `__main__`), add a stdlib fallback so the logger works without the server pipeline:
+
+```python
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+```
 
 ### General plugin guidelines
 

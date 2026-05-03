@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -9,6 +10,8 @@ import threading
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
+
+log = logging.getLogger("slopsmith.plugins")
 
 
 PLUGINS_DIR = Path(__file__).parent
@@ -193,12 +196,11 @@ def _warn_on_module_collisions(plugin_specs):
         # Aggregate kinds across all plugins to label the warning.
         kinds = {k for kind_set in by_plugin.values() for k in kind_set}
         kind_label = "module/package" if len(kinds) > 1 else next(iter(kinds))
-        print(
-            f"[Plugin] Module-name collision warning: '{name}' "
-            f"({kind_label}) is shipped by {len(by_plugin)} plugins "
-            f"({ids_quoted}). Bare `import {name}` may load the wrong "
-            f"file. Migrate to context['load_sibling']('{name}') — "
-            f"see CLAUDE.md (slopsmith#33)."
+        log.warning(
+            "Module-name collision: %r (%s) is shipped by %d plugins (%s). "
+            "Bare `import %s` may load the wrong file. "
+            "Migrate to context['load_sibling']('%s') — see CLAUDE.md (slopsmith#33).",
+            name, kind_label, len(by_plugin), ids_quoted, name, name,
         )
 
 
@@ -260,18 +262,18 @@ def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
     if raw is None:
         return []
     if not isinstance(raw, list):
-        print(
-            f"[Plugin] '{plugin_id}': settings.server_files must be a list, "
-            f"got {type(raw).__name__}; ignoring"
+        log.warning(
+            "Plugin %r: settings.server_files must be a list, got %s; ignoring",
+            plugin_id, type(raw).__name__,
         )
         return []
 
     cleaned: list[str] = []
     for entry in raw:
         if not isinstance(entry, str) or not entry:
-            print(
-                f"[Plugin] '{plugin_id}': dropping non-string / empty "
-                f"server_files entry {entry!r}"
+            log.warning(
+                "Plugin %r: dropping non-string / empty server_files entry %r",
+                plugin_id, entry,
             )
             continue
         # Loader rules mirror what `_validate_relpath` enforces at import
@@ -280,9 +282,9 @@ def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
         # `.` / dotfile entries as warnings beats silently producing a
         # bundle that the same server later refuses to ingest.
         if entry != entry.strip():
-            print(
-                f"[Plugin] '{plugin_id}': dropping server_files entry with "
-                f"leading/trailing whitespace {entry!r}"
+            log.warning(
+                "Plugin %r: dropping server_files entry with leading/trailing whitespace %r",
+                plugin_id, entry,
             )
             continue
         # Reject absolute paths, drive letters, and any backslash-
@@ -291,9 +293,9 @@ def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
         # let a malicious manifest sidestep traversal detection on
         # platforms whose `Path` accepts both separators.
         if "\\" in entry:
-            print(
-                f"[Plugin] '{plugin_id}': server_files entry must use POSIX "
-                f"separators, dropping {entry!r}"
+            log.warning(
+                "Plugin %r: server_files entry must use POSIX separators, dropping %r",
+                plugin_id, entry,
             )
             continue
         # Strip a single trailing slash for the traversal check, then
@@ -302,7 +304,7 @@ def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
         is_dir = entry.endswith("/")
         body = entry.rstrip("/")
         if not body:
-            print(f"[Plugin] '{plugin_id}': dropping empty server_files entry")
+            log.warning("Plugin %r: dropping empty server_files entry", plugin_id)
             continue
         parts = body.split("/")
         if (
@@ -311,9 +313,10 @@ def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
             or any(part in ("", ".", "..") for part in parts)
             or parts[0].startswith(".")
         ):
-            print(
-                f"[Plugin] '{plugin_id}': dropping unsafe server_files entry "
-                f"{entry!r} (absolute / traversal / dotfile / empty segment)"
+            log.warning(
+                "Plugin %r: dropping unsafe server_files entry %r "
+                "(absolute / traversal / dotfile / empty segment)",
+                plugin_id, entry,
             )
             continue
         cleaned.append(body + ("/" if is_dir else ""))
@@ -339,7 +342,7 @@ def _install_requirements(plugin_dir: Path, plugin_id: str):
     if marker.exists() and marker.read_text().strip() == req_hash:
         return True  # Already installed, same requirements
 
-    print(f"[Plugin] Installing requirements for '{plugin_id}' (this can take a while for large deps)...")
+    log.info("Installing requirements for plugin %r (this can take a while for large deps)...", plugin_id)
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install",
@@ -350,21 +353,31 @@ def _install_requirements(plugin_dir: Path, plugin_id: str):
         )
         if result.returncode == 0:
             marker.write_text(req_hash)
-            print(f"[Plugin] Requirements installed for '{plugin_id}'")
+            log.info("Requirements installed for plugin %r", plugin_id)
             return True
         else:
             err_lower = result.stderr.lower() if result.stderr else ""
             if "read-only" in err_lower or "permission denied" in err_lower:
-                print(f"[Plugin] Optional dependencies not installed for '{plugin_id}' — functionality may be limited. Install dependencies manually or configure an external service if available.")
+                log.warning(
+                    "Plugin %r: optional dependencies not installed — "
+                    "functionality may be limited. Install dependencies manually "
+                    "or configure an external service if available.",
+                    plugin_id,
+                )
             else:
-                print(f"[Plugin] Failed to install requirements for '{plugin_id}': {result.stderr[:300]}")
+                log.warning("Plugin %r: failed to install requirements: %s", plugin_id, result.stderr[:300])
             return False
     except Exception as e:
         err_lower = str(e).lower()
         if "read-only" in err_lower or "permission denied" in err_lower:
-            print(f"[Plugin] Optional dependencies not installed for '{plugin_id}' — functionality may be limited. Install dependencies manually or configure an external service if available.")
+            log.warning(
+                "Plugin %r: optional dependencies not installed — "
+                "functionality may be limited. Install dependencies manually "
+                "or configure an external service if available.",
+                plugin_id,
+            )
         else:
-            print(f"[Plugin] Error installing requirements for '{plugin_id}': {e}")
+            log.warning("Plugin %r: error installing requirements: %s", plugin_id, e)
         return False
 
 
@@ -450,7 +463,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             try:
                 manifest = json.loads(manifest_path.read_text())
             except Exception as e:
-                print(f"[Plugin] Failed to read {manifest_path}: {e}")
+                log.warning("Failed to read plugin manifest %s: %s", manifest_path, e)
                 continue
             plugin_id = manifest.get("id")
             if plugin_id is None:
@@ -463,9 +476,9 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             # explicit "must be a string" warning, not be silently
             # dropped. Spotted by Copilot review on PR #105 round 4.
             if not isinstance(plugin_id, str):
-                print(
-                    f"[Plugin] Skipping {manifest_path}: 'id' must be a string, "
-                    f"got {type(plugin_id).__name__} ({plugin_id!r})"
+                log.warning(
+                    "Skipping %s: 'id' must be a string, got %s (%r)",
+                    manifest_path, type(plugin_id).__name__, plugin_id,
                 )
                 continue
             if not plugin_id:
@@ -474,7 +487,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 # for empty strings).
                 continue
             if plugin_id in loaded_ids:
-                print(f"[Plugin] Skipping duplicate '{plugin_id}' from {plugins_base_dir}")
+                log.warning("Skipping duplicate plugin %r from %s", plugin_id, plugins_base_dir)
                 continue
             loaded_ids.add(plugin_id)
             plugin_load_specs.append((plugin_id, plugin_dir, manifest))
@@ -551,6 +564,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             lambda name, _pid=plugin_id, _pdir=plugin_dir:
                 _load_plugin_sibling(_pid, _pdir, name)
         )
+        plugin_context["log"] = logging.getLogger(f"slopsmith.plugin.{plugin_id}")
 
         # Load routes using importlib to avoid module name collisions
         routes_file = manifest.get("routes")
@@ -588,9 +602,9 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                         route_setup_fn(_fn)
                     else:
                         routes_module.setup(app, plugin_context)
-                    print(f"[Plugin] Loaded routes for '{plugin_id}'")
+                    log.info("Loaded routes for plugin %r", plugin_id)
             except Exception as e:
-                print(f"[Plugin] Failed to load routes for '{plugin_id}': {e}")
+                log.exception("Failed to load routes for plugin %r", plugin_id)
                 _emit_progress(
                     "plugin-error",
                     f"Failed loading routes for '{plugin_id}'",
@@ -599,8 +613,6 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     total=len(plugin_load_specs),
                     error=str(e),
                 )
-                import traceback
-                traceback.print_exc()
 
         _loaded_batch.append({
             "id": plugin_id,
@@ -624,7 +636,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             "_dir": plugin_dir,
             "_manifest": manifest,
         })
-        print(f"[Plugin] Registered '{plugin_id}' ({manifest.get('name', '')})")
+        log.info("Registered plugin %r (%s)", plugin_id, manifest.get("name", ""))
         _emit_progress(
             "plugin-registered",
             f"Registered plugin '{plugin_id}'",
@@ -818,7 +830,7 @@ def register_plugin_api(app: FastAPI):
                     or tour_filename.startswith("/")
                     or "\\" in tour_filename
                 ):
-                    print(f"[Plugin] {plugin_id}: invalid tour path rejected: {tour_filename!r}")
+                    log.warning("Plugin %r: invalid tour path rejected: %r", plugin_id, tour_filename)
                     break
                 tour_file = (p["_dir"] / tour_filename).resolve()
                 plugin_dir = p["_dir"].resolve()
@@ -826,7 +838,7 @@ def register_plugin_api(app: FastAPI):
                 try:
                     tour_file.relative_to(plugin_dir)
                 except ValueError:
-                    print(f"[Plugin] {plugin_id}: tour path escapes plugin dir: {tour_filename!r}")
+                    log.warning("Plugin %r: tour path escapes plugin dir: %r", plugin_id, tour_filename)
                     break
                 if tour_file.is_file():
                     return Response(tour_file.read_text(encoding="utf-8"), media_type="application/json")
