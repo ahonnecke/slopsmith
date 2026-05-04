@@ -5,9 +5,27 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
+
+
+# Cache control for plugin-served files. Plugin scripts are edited live
+# during development; without these headers browsers cache the previous
+# version and "did the new code load" becomes guesswork. no-cache (NOT
+# no-store) requires revalidation per request but allows a 304 response
+# when the file hasn't changed, so we still avoid retransmission cost on
+# unchanged loads. Last-Modified gives the browser the conditional-GET
+# pivot point; If-Modified-Since handling falls through to the framework.
+def _no_cache_headers(file_path: Path) -> dict:
+    last_mod = time.strftime(
+        "%a, %d %b %Y %H:%M:%S GMT",
+        time.gmtime(file_path.stat().st_mtime))
+    return {
+        "Cache-Control": "no-cache, must-revalidate",
+        "Last-Modified": last_mod,
+    }
 
 
 PLUGINS_DIR = Path(__file__).parent
@@ -253,7 +271,9 @@ def register_plugin_api(app: FastAPI):
             if p["id"] == plugin_id:
                 screen_file = p["_dir"] / p["_manifest"].get("screen", "screen.html")
                 if screen_file.exists():
-                    return HTMLResponse(screen_file.read_text(encoding="utf-8"))
+                    return HTMLResponse(
+                        screen_file.read_text(encoding="utf-8"),
+                        headers=_no_cache_headers(screen_file))
         return HTMLResponse("", status_code=404)
 
     @app.get("/api/plugins/{plugin_id}/screen.js")
@@ -262,7 +282,17 @@ def register_plugin_api(app: FastAPI):
             if p["id"] == plugin_id:
                 script_file = p["_dir"] / p["_manifest"].get("script", "screen.js")
                 if script_file.exists():
-                    return Response(script_file.read_text(encoding="utf-8"), media_type="application/javascript")
+                    # no-cache + Last-Modified: browser conditional-GETs
+                    # on every page load; server returns 304 if unchanged,
+                    # 200 with fresh body if the plugin file moved on disk.
+                    # Without this, browsers cache the script aggressively
+                    # and "did the new code load" becomes guesswork during
+                    # plugin development — exactly the failure mode that
+                    # made yesterday's 0% report unverifiable.
+                    return Response(
+                        script_file.read_text(encoding="utf-8"),
+                        media_type="application/javascript",
+                        headers=_no_cache_headers(script_file))
         return Response("", status_code=404)
 
     @app.get("/api/plugins/{plugin_id}/settings.html")
@@ -272,5 +302,7 @@ def register_plugin_api(app: FastAPI):
                 settings = p["_manifest"].get("settings", {})
                 settings_file = p["_dir"] / (settings.get("html", "settings.html") if isinstance(settings, dict) else "settings.html")
                 if settings_file.exists():
-                    return HTMLResponse(settings_file.read_text())
+                    return HTMLResponse(
+                        settings_file.read_text(),
+                        headers=_no_cache_headers(settings_file))
         return HTMLResponse("", status_code=404)
