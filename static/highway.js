@@ -4,19 +4,26 @@
  */
 function createHighway() {
     let canvas, ctx, ws;
-    // Single audio-aligned clock — both render and plugin scoring share it.
-    //   chartTime  — what getTime() exposes to plugins (scoring, note
-    //                detection). The "where in the song are we right now"
-    //                clock that should match what the user actually HEARS.
-    //   currentTime — rendering clock. Kept equal to chartTime so visuals
-    //                 and plugins agree on time.
-    // setTime(t) is fed audio.currentTime by app.js. That value is the
-    // playback-buffer position — about output-latency seconds AHEAD of what
-    // the user hears (typical 50-300 ms depending on driver). avOffsetSec
-    // is the user's measurement of that lag (tuned with [/] keys until
-    // visuals match audio); we apply it here so chartTime — and therefore
-    // every plugin built on top of getTime() — also matches what the user
-    // hears. Default 0 means uncompensated; both clocks lead audio output.
+    // Promise chain for serializing async ws.onmessage handlers —
+    // reset on each connect() so reconnections start a fresh chain.
+    let _msgChain = Promise.resolve();
+    // Monotonically-increasing connection generation counter.
+    // Incremented on every connect() so async handlers that survive a
+    // reconnect can detect they are stale and bail out before mutating
+    // shared state.
+    let _wsGen = 0;
+    // Pending JUCE routing promise for the current connection's song_info.
+    // The 'ready' handler awaits this so _juceMode is settled before
+    // _onReady / song:ready fire, without blocking note/chord processing.
+    let _juceRoutingPromise = Promise.resolve();
+    // Two notions of "now" — kept deliberately separate:
+    //   chartTime — audio-aligned clock. What getTime() exposes to plugins
+    //               (scoring, note detection, etc.) and what setTime() receives.
+    //   currentTime — rendering clock. Equal to chartTime + avOffsetSec, so the
+    //                 draw code can shift visual notes forward to compensate
+    //                 for audio-output pipeline latency without plugins having
+    //                 to care about the offset.
+    // avOffsetSec is set by setAvOffset(ms); default 0 means old behavior.
     let chartTime = 0;
     let currentTime = 0;
     let avOffsetSec = 0;
@@ -34,16 +41,45 @@ function createHighway() {
     let sections = [];
     let anchors = [];
     let chordTemplates = [];
+    // Number of strings on the active arrangement. Updated from the
+    // `stringCount` field in each `song_info` WS message; falls back
+    // to `tuning.length` (works for older servers that don't yet emit
+    // stringCount) then to 6 (final safety). 4 = bass, 6 = guitar,
+    // 7+ = extended-range GP imports.
+    let stringCount = 6;
     let lyrics = [];
     let toneChanges = [];
     let toneBase = "";
     let ready = false;
+    // Master-difficulty (slopsmith#48). _phrases stays null as a
+    // "slider disabled" sentinel when the source chart has no ladder
+    // data (GP imports, legacy sloppak) — the server omits the
+    // `phrases` message entirely in that case. When populated, the
+    // filter maps the slider fraction to a per-phrase level index and
+    // stages _filteredNotes / _filteredChords for the render loop.
+    // _filteredNotes === null means "fall through to flat notes" —
+    // either no phrase data or filter not rebuilt yet.
+    let _phrases = null;
+    // Default to full chart. Persistence lives in the caller (app.js
+    // loadSettings, or a splitscreen plugin managing its own panel
+    // state) so multiple createHighway() instances stay truly
+    // per-instance — no shared localStorage key to race on.
+    let _mastery = 1;
+    let _filteredNotes = null;
+    let _filteredChords = null;
+    let _filteredAnchors = null;
     let showLyrics = localStorage.getItem('showLyrics') !== 'false';
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
     let _inverted = localStorage.getItem('invertHighway') === 'true';
-    function si(s) { return _inverted ? 5 - s : s; }  // string index mapper for inversion
     let _lefty = localStorage.getItem('lefty') === '1';
+    let _lastChordOnFretLine = null;  // chord object currently shown on fret line
+    let _chordFretLineNotes = [];  // notes to render on fret line
+    const _frameMismatchWarned = new Set();  // chord ids already warned about (slopsmith#88)
+    // Per-chord render info, computed lazily once per src array (slopsmith#88).
+    const _chordRenderInfo = new WeakMap();  // chord -> { chainIndex, chainLen, isFull, baseFret }
+    let _chordRenderCacheSrc = null;
+    let _chordRenderCacheInverted = null;
 
     // Rendering config
     const VISIBLE_SECONDS = 3.0;
@@ -51,17 +87,24 @@ function createHighway() {
     const Z_MAX = 10.0;
     const BG = '#080810';
 
+    // String color palettes. Indices 0–5 cover guitar / bass; 6–7
+    // are added for extended-range GP imports (7-string, 8-string).
+    // Lookups still use `|| '#888'` as a safety fallback for any
+    // out-of-range index.
     const STRING_COLORS = [
         '#cc0000', '#cca800', '#0066cc',
         '#cc6600', '#00cc66', '#9900cc',
+        '#cc00aa', '#00cccc',  // 7th = magenta, 8th = teal
     ];
     const STRING_DIM = [
         '#520000', '#524200', '#002952',
         '#522900', '#005229', '#3d0052',
+        '#520042', '#005252',
     ];
     const STRING_BRIGHT = [
         '#ff3c3c', '#ffe040', '#3c9cff',
         '#ff9c3c', '#3cff9c', '#cc3cff',
+        '#ff3ce0', '#3ce0e0',
     ];
 
     // ── Projection ───────────────────────────────────────────────────────
@@ -85,8 +128,11 @@ function createHighway() {
     let displayMaxFret = 12;  // rightmost visible fret (smoothed)
 
     function getAnchorAt(t) {
-        let a = anchors[0] || { fret: 1, width: 4 };
-        for (const anc of anchors) {
+        // Same master-difficulty fallback as the render loops — the
+        // anchor ladder pairs with the note ladder.
+        const src = _filteredAnchors !== null ? _filteredAnchors : anchors;
+        let a = src[0] || { fret: 1, width: 4 };
+        for (const anc of src) {
             if (anc.time > t) break;
             a = anc;
         }
@@ -95,9 +141,10 @@ function createHighway() {
 
     function getMaxFretInWindow(t) {
         // Find the highest fret needed across all anchors visible on screen
+        const src = _filteredAnchors !== null ? _filteredAnchors : anchors;
         let maxFret = 0;
-        for (const anc of anchors) {
-            if (anc.time > t + VISIBLE_SECONDS) break;
+        for (const anc of src) {
+            if (anc.time > t + VISIBLE_SECONDS + 2) break; // Skip anchors well in the future (with a little buffer to avoid moving early the cutoff)
             if (anc.time + 2 < t) continue;  // skip anchors well in the past
             const top = anc.fret + anc.width;
             if (top > maxFret) maxFret = top;
@@ -106,7 +153,16 @@ function createHighway() {
     }
 
     function updateSmoothAnchor(anchor, dt) {
-        const rate = Math.min(1.0 * dt, 1.0);
+        // Smoothing rate balances two regressions seen in slopsmith#88:
+        //   rate=1.0 (was) snapped to target every frame — visible jitter
+        //   on aerial passages where anchors moved every few frames.
+        //   rate=0.15 (Knaifhogg) was too gentle — large jumps (low frets
+        //   to teens) took ~3s to catch up, pushing upcoming notes off the
+        //   right edge.
+        // 0.4 splits the difference: half-life ~1.7s, but the per-frame
+        // step at 60fps is ~0.0067 — still small enough that frame-to-frame
+        // changes read as smooth.
+        const rate = Math.min(0.4 * dt, 0.4);
         // Look ahead: use the widest fret range across all visible anchors
         const lookAheadMax = getMaxFretInWindow(currentTime);
         const currentMax = anchor.fret + anchor.width;
@@ -125,7 +181,11 @@ function createHighway() {
 
     /** Call while lefty mirror transform is active; keeps glyphs readable. */
     function fillTextReadable(text, x, y) {
-        if (!canvas) return;
+        // ctx may be null when the 2D context was never acquired
+        // (canvas already locked to WebGL). No-op in that case —
+        // alternatives would be throwing, which breaks plugin hooks
+        // that call this after a context-type mismatch.
+        if (!canvas || !ctx) return;
         const W = canvas.width;
         if (!_lefty) {
             ctx.fillText(text, x, y);
@@ -138,46 +198,314 @@ function createHighway() {
     }
 
     // ── Drawing ──────────────────────────────────────────────────────────
+    //
+    // slopsmith#36 — swappable renderers.
+    //
+    // The default renderer below is the original 2D canvas highway. Its
+    // methods still reach into the factory closure (ctx, beats, notes,
+    // _drawHooks, etc.) to avoid rewriting every helper; it's not
+    // "isolated," just shaped as the contract. Custom renderers from
+    // plugins (3D, tab, fretboard, future "keys"/"drums") pass through
+    // setRenderer() and consume the bundle instead of the closure —
+    // they stay self-contained and never touch the factory's `ctx`.
+    //
+    // Lifecycle: setRenderer(r) -> previous.destroy() -> r.init(canvas,
+    // bundle) -> per frame r.draw(bundle) -> on resize r.resize(w, h) ->
+    // on stop or swap r.destroy(). Renderer owns its rendering context
+    // (2D, WebGL, DOM overlay). Factory owns canvas element, rAF, WS,
+    // data state, resize subscription, _drawHooks for 2D compositing.
+    //
+    // Contract for setRenderer(r): r is an object with at minimum
+    // {draw(bundle)}. init / resize / destroy are optional. Pass null
+    // or undefined to restore the default renderer.
+    //
+    // The bundle (see _makeBundle) is a per-frame snapshot of factory
+    // state — includes difficulty-filtered note / chord / anchor arrays
+    // so renderers never touch _filteredX internals directly. Arrays
+    // are live references (performance), NOT copies — renderers must
+    // treat them as read-only.
+    let _renderer = null;
+
+    function _makeBundle() {
+        // Snapshot of current factory state passed to each renderer call.
+        // Arrays and songInfo are LIVE references, not copies — the bundle
+        // itself is rebuilt each frame but its `notes`, `chords`,
+        // `anchors`, `beats`, etc. point at closure state. Renderers
+        // MUST NOT mutate these; treat them as read-only. We don't
+        // Object.freeze or deep-copy for per-frame allocation cost reasons.
+        return {
+            // Timing
+            currentTime,
+            songInfo,
+            isReady: ready,
+
+            // Chart content (filter-aware — difficulty-filtered arrays
+            // preferred; raw arrays are the fallback when no ladder data).
+            notes: _filteredNotes !== null ? _filteredNotes : notes,
+            chords: _filteredChords !== null ? _filteredChords : chords,
+            anchors: _filteredAnchors !== null ? _filteredAnchors : anchors,
+            beats,
+            sections,
+            chordTemplates,
+            stringCount,
+            lyrics,
+            toneChanges,
+            toneBase,
+
+            // Master-difficulty (slopsmith#48)
+            mastery: _mastery,
+            hasPhraseData: !!(_phrases && _phrases.length > 0),
+
+            // Display flags
+            inverted: _inverted,
+            lefty: _lefty,
+            renderScale: _renderScale,
+            lyricsVisible: showLyrics,
+
+            // 2D-style helpers (renderers that don't need these can ignore).
+            // `fillTextUnmirrored` is deliberately NOT exposed here —
+            // the factory-level version writes to the default renderer's
+            // closure ctx, which is null for custom renderers. Renderers
+            // that need lefty-aware text should check `bundle.lefty` and
+            // apply the mirror transform themselves on their own context.
+            project,
+            fretX,
+        };
+    }
+
+    const _defaultRenderer = {
+        _ctxWarned: false,
+        init(canvasEl /* , bundle */) {
+            // getContext('2d') returns null when the canvas is already
+            // locked to another context type (e.g. a WebGL viz plugin
+            // grabbed it first). Once that happens the 2D renderer can't
+            // recover on the same canvas — surface a single clear error
+            // and skip drawing. A future revision will recreate the
+            // canvas element on renderer-type swap to avoid this.
+            ctx = canvasEl.getContext('2d');
+            if (!ctx && !this._ctxWarned) {
+                console.error(
+                    'Default 2D renderer: canvas.getContext("2d") returned null ' +
+                    '— the canvas is locked to another context type. ' +
+                    'Reload the page to restore the highway.'
+                );
+                this._ctxWarned = true;
+            }
+        },
+        draw(/* bundle */) {
+            // Still reads from the factory closure directly — the bundle
+            // is shaped for custom renderers, not used here. Keeping the
+            // default renderer's body unchanged from the pre-refactor
+            // draw() preserves pixel-level parity with current main.
+            if (!canvas || !ready || !ctx) return;
+            try {
+                const W = canvas.width;
+                const H = canvas.height;
+                ctx.fillStyle = BG;
+                ctx.fillRect(0, 0, W, H);
+
+                const anchor = getAnchorAt(currentTime);
+                updateSmoothAnchor(anchor, 1 / 60);
+
+                ctx.save();
+                if (_lefty) {
+                    ctx.translate(W, 0);
+                    ctx.scale(-1, 1);
+                }
+
+                drawHighway(W, H);
+                drawFretLines(W, H);
+                drawBeats(W, H);
+                drawStrings(W, H);
+                drawSustains(W, H);
+                drawNowLine(W, H);
+                drawNotes(W, H);
+                drawChords(W, H);
+                drawFretNumbers(W, H);
+
+                // Plugin draw hooks (same coordinate system as the highway).
+                // The default 2D renderer iterates the list directly here;
+                // custom renderers (e.g. the bundled 3D Highway) invoke
+                // `api.fireDrawHooks(ctx, W, H)` against their own overlay
+                // 2D context after rendering. Either path receives the
+                // same `(ctx, W, H)` callback signature.
+                for (const hook of _drawHooks) {
+                    try { hook(ctx, W, H); } catch (e) { /* ignore */ }
+                }
+
+                ctx.restore();
+
+                // Lyrics: drawn unmirrored so lines stay left-to-right readable (layout is center-symmetric)
+                if (showLyrics) drawLyrics(W, H);
+            } catch (e) {
+                console.error('draw error:', e);
+            }
+        },
+        resize(/* w, h */) {
+            // no-op; canvas dimension change is handled by the factory,
+            // and the 2D context doesn't maintain persistent state we'd
+            // need to rebuild here.
+        },
+        destroy() {
+            // Leave ctx intact. Helper paths like fillTextReadable /
+            // api.fillTextUnmirrored may still be called while another
+            // renderer is active or after stop() (e.g. a residual draw
+            // hook, plugin cleanup code). Forcing ctx to null would
+            // make those calls throw. A subsequent init() re-assigns
+            // ctx via canvasEl.getContext('2d') — the browser returns
+            // the same cached context for the same canvas, so there's
+            // nothing to "refresh" by nulling. Reset the warn-once
+            // guard so a fresh init on a fresh canvas is a new
+            // opportunity to succeed or fail.
+            this._ctxWarned = false;
+        },
+    };
+
+    // Tracks consecutive renderer.draw failures so a permanently broken
+    // renderer auto-reverts to default instead of spamming the console
+    // every frame. Reset on every successful draw and whenever a new
+    // renderer is installed.
+    let _rendererDrawFailures = 0;
+    const MAX_RENDERER_DRAW_FAILURES = 3;
+
+    // True only while the current renderer has had a successful init
+    // since its last destroy (or was freshly installed but never init'd
+    // because canvas was null). Gates destroy calls so an uninit'd
+    // renderer doesn't receive spurious destroys — the restore-on-
+    // page-load flow relies on this: setRenderer can run before init.
+    let _rendererInited = false;
+
+    function _destroyCurrentIfInited() {
+        if (_renderer && _rendererInited && typeof _renderer.destroy === 'function') {
+            try { _renderer.destroy(); }
+            catch (e) { console.error('renderer destroy:', e); }
+        }
+        _rendererInited = false;
+    }
+
+    function _emitVizReverted(reason) {
+        // Notify listeners (e.g. app.js's viz picker, splitscreen's
+        // per-panel picker in Wave C) that the factory auto-reverted
+        // to the default renderer — so the UI / persisted selection
+        // don't keep advertising the broken plugin.
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            try { window.slopsmith.emit('viz:reverted', { reason }); }
+            catch (e) { console.error('viz:reverted emit:', e); }
+        }
+    }
+
+    function _setRenderer(r) {
+        _destroyCurrentIfInited();
+        // null/undefined reverts to default. Anything else must provide
+        // at minimum a draw(bundle) function — without it the rAF loop
+        // would throw every frame. Log once and fall back to default
+        // rather than accepting a broken renderer.
+        let next;
+        if (r == null) {
+            next = _defaultRenderer;
+        } else if (typeof r.draw === 'function') {
+            next = r;
+        } else {
+            console.error('setRenderer: renderer missing draw(bundle) function; reverting to default.');
+            next = _defaultRenderer;
+        }
+        _renderer = next;
+        _rendererDrawFailures = 0;
+        // Defer init/resize until the canvas is available. setRenderer
+        // can legitimately be called before api.init() runs (e.g. app.js
+        // restoring a saved picker selection at page load, before any
+        // song has been played). api.init() will re-run these when it
+        // assigns the canvas.
+        if (!canvas) return;
+        const bundle = _makeBundle();
+        // A renderer without an init() function is treated as ready
+        // by default (it simply has no setup to do). If an init()
+        // exists, only flip the flag true when it returns without
+        // throwing — otherwise a later destroy would run on an
+        // effectively-uninitialized renderer.
+        let initSucceeded = typeof _renderer.init !== 'function';
+        if (typeof _renderer.init === 'function') {
+            try {
+                _renderer.init(canvas, bundle);
+                initSucceeded = true;
+            }
+            catch (e) {
+                console.error('renderer init:', e);
+                // Init may have partially allocated GPU/DOM resources
+                // before throwing. Run destroy best-effort to release
+                // whatever it got — renderer's destroy contract already
+                // requires handling partial state gracefully. Then
+                // revert to the default renderer so the user isn't
+                // stranded on a broken viz, and notify the UI so the
+                // picker + localStorage sync back to 'default'.
+                if (_renderer !== _defaultRenderer) {
+                    if (typeof _renderer.destroy === 'function') {
+                        try { _renderer.destroy(); }
+                        catch (destroyErr) {
+                            console.error('renderer destroy after init failure:', destroyErr);
+                        }
+                    }
+                    _renderer = _defaultRenderer;
+                    _emitVizReverted('init-failure');
+                    if (typeof _renderer.init === 'function') {
+                        try {
+                            _renderer.init(canvas, _makeBundle());
+                            initSucceeded = true;
+                        }
+                        catch (e2) {
+                            console.error('default renderer init after revert:', e2);
+                        }
+                    } else {
+                        initSucceeded = true;
+                    }
+                }
+            }
+        }
+        _rendererInited = initSucceeded;
+        if (!_rendererInited) return;
+        if (typeof _renderer.resize === 'function') {
+            try { _renderer.resize(canvas.width, canvas.height); }
+            catch (e) { console.error('renderer resize:', e); }
+        }
+    }
+
     function draw() {
         animFrame = requestAnimationFrame(draw);
-        if (!canvas || !ready) return;
+        if (!canvas || !_renderer) return;
+        // Match pre-refactor behaviour: skip draw until WS ready fires.
+        // This gates out the brief "arrays cleared, WS reconnecting"
+        // window during playSong / reconnect. Renderers that want to
+        // draw a loading state can still opt in via the `isReady`
+        // field on the bundle passed to a custom pre-ready handler —
+        // we'd need to widen the contract to support that, out of
+        // scope here. Default 2D renderer also checks `ready` in its
+        // draw body (defence in depth).
+        if (!ready) return;
+        // Skip bundle allocation when the default renderer is active —
+        // it reads closure state directly and ignores the bundle.
+        // _makeBundle at 60fps was a steady GC churn for the common
+        // case where no custom renderer is installed.
+        const bundle = _renderer === _defaultRenderer ? undefined : _makeBundle();
         try {
-        const W = canvas.width;
-        const H = canvas.height;
-        ctx.fillStyle = BG;
-        ctx.fillRect(0, 0, W, H);
-
-        const anchor = getAnchorAt(currentTime);
-        updateSmoothAnchor(anchor, 1 / 60);
-
-        ctx.save();
-        if (_lefty) {
-            ctx.translate(W, 0);
-            ctx.scale(-1, 1);
-        }
-
-        drawHighway(W, H);
-        drawFretLines(W, H);
-        drawBeats(W, H);
-        drawStrings(W, H);
-        drawSustains(W, H);
-        drawNowLine(W, H);
-        drawNotes(W, H);
-        drawChords(W, H);
-        drawFretNumbers(W, H);
-
-        // Plugin draw hooks (same coordinate system as the highway)
-        for (const hook of _drawHooks) {
-            try { hook(ctx, W, H); } catch (e) { /* ignore */ }
-        }
-
-        ctx.restore();
-
-        // Lyrics: drawn unmirrored so lines stay left-to-right readable (layout is center-symmetric)
-        if (showLyrics) drawLyrics(W, H);
-
+            _renderer.draw(bundle);
+            _rendererDrawFailures = 0;
         } catch (e) {
-            console.error('draw error:', e);
+            _rendererDrawFailures += 1;
+            console.error('renderer draw:', e);
+            // Self-heal: a plugin whose draw() throws every frame
+            // would otherwise spam the console and leave the canvas
+            // blank indefinitely. After a short streak of failures,
+            // revert to the built-in renderer so the user at least
+            // gets the default highway back. 2D default is known-safe.
+            if (_rendererDrawFailures >= MAX_RENDERER_DRAW_FAILURES &&
+                _renderer !== _defaultRenderer) {
+                console.error(
+                    'renderer draw: failed ' + _rendererDrawFailures +
+                    ' frames in a row; reverting to default renderer.'
+                );
+                _setRenderer(_defaultRenderer);
+                _emitVizReverted('draw-failure');
+            }
         }
     }
 
@@ -245,10 +573,17 @@ function createHighway() {
         const strTop = H * 0.83;
         const strBot = H * 0.95;
         const margin = W * 0.03;
-        for (let i = 0; i < 6; i++) {
-            const yi = _inverted ? 5 - i : i;
-            const y = strTop + (yi / 5) * (strBot - strTop);
-            ctx.strokeStyle = STRING_COLORS[i];
+        // Adapt to the active arrangement's string count: 4 for bass,
+        // 6 for guitar, 7+ for extended-range GP imports. The visible
+        // band [strTop..strBot] gets divided into (stringCount - 1)
+        // slots, so 4 strings spread across the full band rather than
+        // using the upper 4/6ths of the 6-string layout. The Math.max
+        // guards against a hypothetical 1-string instrument (denom=0).
+        const span = Math.max(1, stringCount - 1);
+        for (let i = 0; i < stringCount; i++) {
+            const yi = _inverted ? (stringCount - 1 - i) : i;
+            const y = strTop + (yi / span) * (strBot - strTop);
+            ctx.strokeStyle = STRING_COLORS[i] || '#888';
             ctx.lineWidth = 3;
             ctx.beginPath();
             ctx.moveTo(margin, y);
@@ -326,6 +661,57 @@ function createHighway() {
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             fillTextReadable('0', W/2, y);
+
+            // Technique labels on open strings — PM, H/P/T, tremolo, and
+            // accent markers are all meaningful on fret 0. Bend and slide
+            // are omitted because they reference a fret position that the
+            // centered bar doesn't visually convey. Matches the sz<14 gate
+            // the fretted path uses so labels don't render on tiny bars.
+            // Fixes #21.
+            if (sz >= 14) {
+                // H / P / T above
+                if (hammerOn || pullOff || tap) {
+                    const label = tap ? 'T' : (hammerOn ? 'H' : 'P');
+                    ctx.fillStyle = '#fff';
+                    ctx.font = `bold ${Math.max(9, sz * 0.3) | 0}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'bottom';
+                    fillTextReadable(label, W/2, y - barH/2 - 4);
+                }
+                // PM below
+                if (palmMute) {
+                    ctx.fillStyle = '#aaa';
+                    ctx.font = `bold ${Math.max(8, sz * 0.25) | 0}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'top';
+                    fillTextReadable('PM', W/2, y + barH/2 + 2);
+                }
+                // Tremolo (wavy line above)
+                if (tremolo) {
+                    const ty = y - barH/2 - 6;
+                    ctx.strokeStyle = '#ff0';
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    for (let i = -3; i <= 3; i++) {
+                        const wx = W/2 + i * sz * 0.08;
+                        const wy = ty + Math.sin(i * 2) * 3;
+                        if (i === -3) ctx.moveTo(wx, wy);
+                        else ctx.lineTo(wx, wy);
+                    }
+                    ctx.stroke();
+                }
+                // Accent caret above
+                if (accent) {
+                    const ay2 = y - barH/2 - 4;
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(W/2 - sz * 0.2, ay2 + 3);
+                    ctx.lineTo(W/2, ay2 - 2);
+                    ctx.lineTo(W/2 + sz * 0.2, ay2 + 3);
+                    ctx.stroke();
+                }
+            }
             return;
         }
 
@@ -483,7 +869,12 @@ function createHighway() {
     }
 
     function drawSustains(W, H) {
-        for (const n of notes) {
+        // Same master-difficulty fallback as drawNotes/drawChords —
+        // without this, sustain bars for filtered-out notes would
+        // still render, leaving orphan rectangles where no note head
+        // is drawn.
+        const src = _filteredNotes !== null ? _filteredNotes : notes;
+        for (const n of src) {
             if (n.sus <= 0.01) continue;
             const end = n.t + n.sus;
             if (end < currentTime || n.t > currentTime + VISIBLE_SECONDS) continue;
@@ -511,20 +902,25 @@ function createHighway() {
     }
 
     function drawNotes(W, H) {
+        // Master-difficulty filter (slopsmith#48): when the source had
+        // phrase-level ladder data, render from the mastery-filtered
+        // array. _filteredNotes stays null for slider-disabled sources
+        // so rendering falls through to the flat notes array unchanged.
+        const src = _filteredNotes !== null ? _filteredNotes : notes;
         // Binary search for visible range
         const tMin = currentTime - 0.25;
         const tMax = currentTime + VISIBLE_SECONDS;
-        let lo = bsearch(notes, tMin);
-        let hi = bsearch(notes, tMax);
+        let lo = bsearch(src, tMin);
+        let hi = bsearch(src, tMax);
 
         // Include sustained notes
-        while (lo > 0 && notes[lo-1].t + notes[lo-1].sus > currentTime) lo--;
+        while (lo > 0 && src[lo-1].t + src[lo-1].sus > currentTime) lo--;
 
         // Collect drawn positions for unison bend detection
         const drawnNotes = [];
 
         for (let i = hi - 1; i >= lo; i--) {
-            const n = notes[i];
+            const n = src[i];
             let tOff = n.t - currentTime;
 
             // Hold sustained notes at now line
@@ -611,69 +1007,167 @@ function createHighway() {
     }
 
     function drawChords(W, H) {
+        // See drawNotes — _filteredChords is null for slider-disabled
+        // sources so we fall through to the flat chords array.
+        const src = _filteredChords !== null ? _filteredChords : chords;
+        _ensureChordRenderCache(src);
+
         const tMin = currentTime - 0.25;
         const tMax = currentTime + VISIBLE_SECONDS;
-        let lo = bsearchChords(chords, tMin);
-        let hi = bsearchChords(chords, tMax);
+        const lo = bsearchChords(src, tMin);
+        const hi = bsearchChords(src, tMax);
+
+        _updateFretLinePreview(src, lo, hi);
+        _drawFretLineChordPreview(W, H);
 
         for (let i = hi - 1; i >= lo; i--) {
-            const ch = chords[i];
+            const ch = src[i];
             const p = project(ch.t - currentTime);
             if (!p) continue;
+
+            const info = _chordRenderInfo.get(ch);
+            const { isFull, baseFret } = info;
 
             const sorted = [...ch.notes].sort((a, b) => _inverted ? b.s - a.s : a.s - b.s);
             const sz = Math.max(10, 28 * p.scale * (H / 900));
             const spread = sz * 0.85;
-            const totalH = spread * (sorted.length - 1);
-
-            // Bracket connector
-            const minSpread = sz + 16;  // full note size + gap (accounts for glow)
+            const minSpread = sz + 16 * p.scale;
             const actualSpread = Math.max(spread, minSpread);
-            const actualTotalH = actualSpread * (sorted.length - 1);
-            if (sorted.length >= 2) {
-                const positions = sorted.map((cn, j) => ({
+            const actualTotalH = actualSpread * Math.max(0, sorted.length - 1);
+
+            const { tmpl, getTemplateFret, isOpen } = getChordTemplateInfo(ch.id, chordTemplates);
+            const nonZeroNotes = sorted.filter(cn => !isOpen(cn));
+            const hasNonZero = nonZeroNotes.length >= 1;
+
+            const frameLeftFret = baseFret;
+            const frameRightFret = baseFret + CHORD_FRAME_FRETS;
+
+            // Frame validation — log once per chord id rather than every frame.
+            if (hasNonZero && !_frameMismatchWarned.has(ch.id)) {
+                const notesInFrame = nonZeroNotes.every(cn => cn.f >= frameLeftFret && cn.f <= frameRightFret);
+                if (!notesInFrame) {
+                    _frameMismatchWarned.add(ch.id);
+                    console.warn('Chord frame mismatch:', ch.id, { frameLeftFret, frameRightFret, nonZeroFrets: nonZeroNotes.map(cn => cn.f) });
+                }
+            }
+
+            // X span between fretted notes (excluding open strings)
+            const xMin = hasNonZero ? Math.min(...nonZeroNotes.map(cn => fretX(cn.f, p.scale, W))) : null;
+            const xMax = hasNonZero ? Math.max(...nonZeroNotes.map(cn => fretX(cn.f, p.scale, W))) : null;
+
+            // Muted chord (all notes muted): draw empty gray frame with X
+            const allMuted = sorted.length > 0 && sorted.every(cn => cn.mt);
+            if (allMuted) {
+                const { boxX, boxW, boxTop, boxH } = _computeChordBox(p, H, W, sorted, sz, actualSpread, baseFret);
+
+                ctx.strokeStyle = MUTE_BOX_STROKE;
+                ctx.lineWidth = Math.max(2, sz / 6);
+                roundRect(ctx, boxX, boxTop, boxW, boxH, 2);
+                ctx.stroke();
+
+                ctx.fillStyle = MUTE_BOX_BAR;
+                ctx.fillRect(boxX, boxTop + 2, boxW, 4);
+
+                // Gray X cross, centered in frame
+                const xInset = sz * 0.6;
+                const xStartX = boxX + xInset;
+                const xEndX = boxX + boxW - xInset;
+                ctx.beginPath();
+                ctx.moveTo(xStartX, boxTop + sz * 0.5);
+                ctx.lineTo(xEndX, boxTop + boxH - sz * 0.5);
+                ctx.moveTo(xEndX, boxTop + sz * 0.5);
+                ctx.lineTo(xStartX, boxTop + boxH - sz * 0.5);
+                ctx.stroke();
+
+                continue;
+            }
+
+            // Repeat chord (mid-chain): translucent box + bracket bar.
+            if (!isFull) {
+                const { boxX, boxW, boxTop, boxH } = _computeChordBox(p, H, W, sorted, sz, actualSpread, baseFret);
+
+                ctx.fillStyle = REPEAT_BOX_FILL;
+                roundRect(ctx, boxX, boxTop, boxW, boxH, 2);
+                ctx.fill();
+
+                ctx.fillStyle = REPEAT_BOX_BAR;
+                ctx.fillRect(boxX, boxTop + 2, boxW, 4);
+
+                continue;
+            }
+
+            // First-in-chain (or short chain): full chord rendering.
+            // Bracket bar above the notes.
+            if (hasNonZero || sorted.length >= 2) {
+                const positions = (hasNonZero ? nonZeroNotes : sorted).map((cn, j) => ({
                     x: fretX(cn.f, p.scale, W),
                     y: p.y * H - actualTotalH / 2 + j * actualSpread,
                 }));
                 const barY = positions[0].y - sz * 0.7;
+                const barLeft = hasNonZero ? xMin : fretX(frameLeftFret, p.scale, W);
+                const barRight = hasNonZero ? xMax : fretX(frameRightFret, p.scale, W);
 
-                ctx.fillStyle = '#50a0dc';
+                ctx.fillStyle = REPEAT_BOX_BAR;
                 ctx.lineWidth = Math.max(3, sz / 4);
-                // Horizontal bar
-                const xMin = Math.min(...positions.map(p => p.x));
-                const xMax = Math.max(...positions.map(p => p.x));
-                roundRect(ctx, xMin - 2, barY - 2, xMax - xMin + 4, 4, 2);
+                roundRect(ctx, barLeft - 2, barY - 2, barRight - barLeft + 4, 4, 2);
                 ctx.fill();
-                // Stems
                 for (const pos of positions) {
-                    ctx.fillRect(pos.x - 2, barY, 4, pos.y - sz/2 - barY);
+                    ctx.fillRect(pos.x - 2, barY, 4, pos.y - sz / 2 - barY);
                 }
             }
 
             // Chord name label
-            if (!ch.hd && p.scale > 0.15) {
-                const tmpl = chordTemplates[ch.id];
-                if (tmpl && tmpl.name) {
-                    const labelY = (sorted.length >= 2)
-                        ? (p.y * H - actualTotalH / 2 - sz * 0.7 - sz * 0.4)
-                        : (p.y * H - sz * 0.8);
-                    const labelX = (sorted.length >= 2)
-                        ? (Math.min(...sorted.map(cn => fretX(cn.f, p.scale, W))) + Math.max(...sorted.map(cn => fretX(cn.f, p.scale, W)))) / 2
-                        : fretX(sorted[0].f, p.scale, W);
-                    ctx.fillStyle = '#fff';
-                    ctx.font = `bold ${Math.max(14, sz * 0.45) | 0}px sans-serif`;
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'bottom';
-                    fillTextReadable(tmpl.name, labelX, labelY);
-                }
+            if (!ch.hd && p.scale > 0.15 && tmpl && tmpl.name) {
+                const labelY = hasNonZero
+                    ? (p.y * H - actualTotalH / 2 - sz * 0.7 - sz * 0.4)
+                    : (p.y * H - sz * 0.8);
+                const labelX = hasNonZero
+                    ? (xMin + xMax) / 2
+                    : (sorted.length >= 2
+                        ? (fretX(frameLeftFret, p.scale, W) + fretX(frameRightFret, p.scale, W)) / 2
+                        : fretX(sorted[0].f, p.scale, W));
+                ctx.fillStyle = '#fff';
+                ctx.font = `bold ${Math.max(14, sz * 0.45) | 0}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'bottom';
+                fillTextReadable(tmpl.name, labelX, labelY);
             }
 
-            // Notes — ensure same-fret notes don't overlap vertically
+            // Notes — wide colored bar for open strings inside a chord,
+            // normal note glyph otherwise.
             const chordPositions = [];
+            const hasMultipleNotes = sorted.length >= 2;
+
             sorted.forEach((cn, j) => {
                 const x = fretX(cn.f, p.scale, W);
                 const ny = p.y * H - actualTotalH / 2 + j * actualSpread;
-                drawNote(W, H, x, ny, p.scale, cn.s, cn.f, { ...cn, chord: true });
+
+                // Open-string-in-chord wide bar — only when the note has no
+                // technique flags. Otherwise fall back to drawNote so PM /
+                // H / P / T / tremolo / accent labels still render (drawNote
+                // is the only path that emits those labels).
+                if (getTemplateFret(cn) === 0 && hasMultipleNotes && !_noteHasTechniqueFlags(cn)) {
+                    const color = STRING_COLORS[cn.s] || '#888';
+                    const dark = STRING_DIM[cn.s] || '#222';
+                    const barH = sz;
+                    const barLeft = fretX(frameLeftFret, p.scale, W);
+                    const barRight = fretX(frameRightFret, p.scale, W);
+                    ctx.fillStyle = dark;
+                    roundRect(ctx, barLeft - 1, ny - barH / 2 - 1, barRight - barLeft + 2, barH + 2, 3);
+                    ctx.fill();
+                    ctx.fillStyle = color;
+                    roundRect(ctx, barLeft, ny - barH / 2, barRight - barLeft, barH, 2);
+                    ctx.fill();
+                    const fontSize = Math.max(8, sz * 0.5) | 0;
+                    ctx.fillStyle = '#fff';
+                    ctx.font = `bold ${fontSize}px sans-serif`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    fillTextReadable('0', (barLeft + barRight) / 2, ny);
+                } else {
+                    drawNote(W, H, x, ny, p.scale, cn.s, cn.f, { ...cn, chord: true });
+                }
+
                 chordPositions.push({ s: cn.s, f: cn.f, bn: cn.bn || 0, x, y: ny, scale: p.scale });
             });
 
@@ -925,18 +1419,312 @@ function createHighway() {
         return lo;
     }
 
+    // ── Chord rendering — chains, frames, fretline preview (slopsmith#88) ──
+    //
+    // Rocksmith charts often repeat the same chord shape several times in a
+    // row (e.g. a G strummed 4 times). We call a contiguous run of same-id
+    // chords with gaps < CHAIN_GAP_THRESHOLD a "chain". Chains drive two
+    // visual choices:
+    //   • The first chord in a chain renders in full; subsequent chords in
+    //     a chain of CHAIN_RENDER_FULL_MAX or longer render as a "repeat
+    //     box" — a translucent boxed frame so the eye can see the rhythm
+    //     pattern without re-scanning identical fret numbers.
+    //   • Each chord anchors a CHORD_FRAME_FRETS-wide frame; muted and
+    //     open-only chords inherit the frame from their predecessor so
+    //     they don't snap to fret 0.
+    //
+    // We compute chain stats and frame anchors once per `src` array via
+    // _ensureChordRenderCache (lazy, invalidates when the array reference
+    // changes — which happens on chord ingest, mastery rebuild, or song
+    // reset). The render path is then pure read.
+    const CHAIN_GAP_THRESHOLD = 0.5;
+    const CHAIN_RENDER_FULL_MAX = 4;
+    const CHORD_FRAME_FRETS = 4;
+
+    // Fretline preview: the static fret line at the bottom shows the chord
+    // closest to the strum line (currentTime + FRETLINE_TARGET_OFFSET) within
+    // the [target - FRETLINE_WINDOW_BEFORE, target + FRETLINE_WINDOW_AFTER]
+    // window, as a teaching aid.
+    const FRETLINE_TARGET_OFFSET = -0.25;
+    const FRETLINE_WINDOW_BEFORE = 0.1;
+    const FRETLINE_WINDOW_AFTER = 0.3;
+
+    // Repeat / mute box colors.
+    const REPEAT_BOX_FILL = 'rgba(48, 80, 128, 0.06)';
+    const REPEAT_BOX_BAR = '#50a0dc';
+    const MUTE_BOX_STROKE = '#6060809b';
+    const MUTE_BOX_BAR = '#606080d1';
+
+    // Reset all chord-render-derived state. Called from init() and
+    // reconnect() so per-song state (preview, frame-mismatch warnings,
+    // chain cache) doesn't leak across songs that reuse chord IDs.
+    function _resetChordRenderState() {
+        _lastChordOnFretLine = null;
+        _chordFretLineNotes = [];
+        _frameMismatchWarned.clear();
+        _chordRenderCacheSrc = null;
+        _chordRenderCacheInverted = null;
+    }
+
+    // True if a chord note carries per-strum technique data (bend,
+    // hammer/pull/tap, slide, palm-mute, tremolo, accent, harmonic, pinch
+    // harmonic, dead note). drawNote renders these as glyph labels —
+    // alternate render paths (repeat box, open-string-in-chord wide bar)
+    // bypass drawNote and so must fall back to the full path whenever a
+    // technique flag is present, otherwise authored cues vanish silently.
+    function _noteHasTechniqueFlags(n) {
+        if (n.bn || n.ho || n.po || n.tp || n.pm || n.tr || n.ac || n.hm || n.hp || n.mt) return true;
+        if (typeof n.sl === 'number' && n.sl >= 0) return true;
+        return false;
+    }
+    function _chordHasTechniqueFlags(ch) {
+        const notes = ch.notes;
+        for (let i = 0; i < notes.length; i++) {
+            if (_noteHasTechniqueFlags(notes[i])) return true;
+        }
+        return false;
+    }
+
+    // Template lookup: returns helpers that classify a chord note's fret
+    // against its template. Open = template fret 0 (regardless of cn.f).
+    function getChordTemplateInfo(chordId, chordTemplates) {
+        const tmpl = chordTemplates[chordId];
+        const tmplFrets = tmpl && tmpl.frets ? tmpl.frets : [];
+        const getTemplateFret = (cn) => cn.s < tmplFrets.length ? tmplFrets[cn.s] : cn.f;
+        const isOpen = (cn) => getTemplateFret(cn) === 0;
+        return { tmpl, tmplFrets, getTemplateFret, isOpen };
+    }
+
+    // Build _chordRenderInfo for every chord in `src` if the cache is stale.
+    // Two passes over the array: chain bounds, then base-fret resolution
+    // (which can read previous chord's cached baseFret).
+    function _ensureChordRenderCache(src) {
+        if (_chordRenderCacheSrc === src && _chordRenderCacheInverted === _inverted) return;
+        _chordRenderCacheSrc = src;
+        _chordRenderCacheInverted = _inverted;
+
+        // Pass 1: walk forward, marking chain index / length / isFull on a
+        // per-chord WeakMap entry. A chain breaks when the next chord has a
+        // different id OR the time gap is >= CHAIN_GAP_THRESHOLD.
+        // Chords that carry per-strum technique flags (bend / palm-mute /
+        // hammer / pull / tap / slide / tremolo / accent / harmonic / mute)
+        // never collapse to a repeat box — those cues are authored on each
+        // strum and must stay visible.
+        let chainStart = 0;
+        for (let i = 0; i <= src.length; i++) {
+            const breakHere = (i === src.length) ||
+                (i > chainStart && (src[i].id !== src[i - 1].id ||
+                    Math.abs(src[i].t - src[i - 1].t) >= CHAIN_GAP_THRESHOLD));
+            if (breakHere && i > chainStart) {
+                const len = i - chainStart;
+                for (let k = chainStart; k < i; k++) {
+                    const chainIndex = k - chainStart;
+                    const hasTechniques = _chordHasTechniqueFlags(src[k]);
+                    _chordRenderInfo.set(src[k], {
+                        chainIndex,
+                        chainLen: len,
+                        isFull: len < CHAIN_RENDER_FULL_MAX || chainIndex === 0 || hasTechniques,
+                        baseFret: 0,  // filled in pass 2
+                    });
+                }
+                chainStart = i;
+            }
+        }
+
+        // Pass 2: resolve baseFret. Fretted chords use their own lowest
+        // non-open fret; chained same-id chords inherit from the previous
+        // entry; open-only / muted chords with a different-id predecessor
+        // inherit that predecessor's frame too. The walk is forward so
+        // prev's cached value is always present when we read it.
+        for (let i = 0; i < src.length; i++) {
+            const ch = src[i];
+            const info = _chordRenderInfo.get(ch);
+            const { isOpen } = getChordTemplateInfo(ch.id, chordTemplates);
+            const sortedNotes = [...ch.notes].sort((a, b) => _inverted ? b.s - a.s : a.s - b.s);
+            const nonZero = sortedNotes.filter(cn => !isOpen(cn));
+            if (nonZero.length >= 1) {
+                info.baseFret = Math.min(...nonZero.map(cn => cn.f));
+            } else if (i > 0) {
+                const prevInfo = _chordRenderInfo.get(src[i - 1]);
+                info.baseFret = prevInfo ? prevInfo.baseFret : 0;
+            } else {
+                info.baseFret = 0;
+            }
+        }
+    }
+
+    // Compute the on-screen box for a chord (used by both muted and repeat
+    // box renderings). Box height tracks the per-string note positions; box
+    // width spans the CHORD_FRAME_FRETS frame anchored at info.baseFret.
+    function _computeChordBox(p, H, W, sorted, sz, actualSpread, baseFret) {
+        const actualTotalH = actualSpread * Math.max(0, sorted.length - 1);
+        const yCenter = p.y * H;
+        const boxTop = yCenter - actualTotalH / 2 - sz * 0.5;
+        const boxBottom = boxTop + Math.max(sz, actualTotalH + sz);
+        const boxX = fretX(baseFret, p.scale, W);
+        const boxW = fretX(baseFret + CHORD_FRAME_FRETS, p.scale, W) - boxX;
+        return { boxX, boxW, boxTop, boxH: boxBottom - boxTop };
+    }
+
+    // Search [lo, hi) for the chord we should preview on the static fret
+    // line. Prefer the chord nearest the strum line that's within
+    // [target - before, target + after]; if none match, fall back to the
+    // first visible chord. Updates _lastChordOnFretLine / _chordFretLineNotes
+    // only when the active chord changes (lets the preview persist while a
+    // chord is held).
+    function _updateFretLinePreview(src, lo, hi) {
+        const targetTime = currentTime + FRETLINE_TARGET_OFFSET;
+        let activeChord = null;
+        let activeNotesOnFret = [];
+        let bestChordTime = -Infinity;
+
+        for (let i = lo; i < hi; i++) {
+            const ch = src[i];
+            if (ch.t >= targetTime - FRETLINE_WINDOW_BEFORE &&
+                ch.t < targetTime + FRETLINE_WINDOW_AFTER &&
+                ch.t > bestChordTime) {
+                bestChordTime = ch.t;
+                activeChord = ch;
+                const { isOpen } = getChordTemplateInfo(ch.id, chordTemplates);
+                const nonZero = ch.notes.filter(cn => !isOpen(cn));
+                activeNotesOnFret = nonZero.length >= 1 ? nonZero.map(cn => ({ s: cn.s, f: cn.f })) : [];
+            }
+        }
+
+        if (activeChord === null) {
+            for (let i = lo; i < hi; i++) {
+                const ch = src[i];
+                const p = project(ch.t - currentTime);
+                if (!p) continue;
+                activeChord = ch;
+                const { isOpen } = getChordTemplateInfo(ch.id, chordTemplates);
+                const nonZero = ch.notes.filter(cn => !isOpen(cn));
+                activeNotesOnFret = nonZero.length >= 1 ? nonZero.map(cn => ({ s: cn.s, f: cn.f })) : [];
+                break;
+            }
+        }
+
+        // Compare by chord OBJECT identity rather than .id — two strums of
+        // the same chord template are different objects, so a chain like
+        // (G normal) → (G all-muted) refreshes the preview instead of
+        // leaving the first strum's fingerings stuck on the fret line.
+        if (activeChord !== _lastChordOnFretLine) {
+            _chordFretLineNotes = activeNotesOnFret;
+            _lastChordOnFretLine = activeChord;
+        }
+    }
+
+    function _drawFretLineChordPreview(W, H) {
+        if (_chordFretLineNotes.length === 0) return;
+        const strTop = H * 0.83;
+        const strBot = H * 0.95;
+        // Scale glyphs with H so preview stays proportionate at any
+        // resolution / renderScale. Constants picked to match the prior
+        // hardcoded 30px diameter / 24px font at H=900.
+        const noteSize = Math.max(14, H * 0.033);
+        const fontSize = Math.max(11, H * 0.027) | 0;
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        for (const cn of _chordFretLineNotes) {
+            const yi = _inverted ? 5 - cn.s : cn.s;
+            const syl = strTop + (yi / 5) * (strBot - strTop);
+            const fretXPos = fretX(cn.f, 1, W);
+            ctx.fillStyle = STRING_COLORS[cn.s] || '#888';
+            ctx.beginPath();
+            ctx.arc(fretXPos, syl, noteSize / 2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#fff';
+            fillTextReadable(String(cn.f), fretXPos, syl);
+        }
+    }
+
+    // Rebuild the mastery-filtered note/chord arrays from _phrases +
+    // _mastery. Called on `ready` and on every setMastery(). When
+    // _phrases is null (slider-disabled source), we clear the filtered
+    // arrays — drawNotes/drawChords fall through to the flat arrays.
+    //
+    // Output arrays are pre-sorted by time because phrase iterations
+    // arrive in chronological order and within each level the notes/
+    // chords are time-sorted already (PR 1's parser sorts them), so
+    // concatenation preserves the order. No explicit sort needed.
+    function _rebuildMasteryFilter() {
+        // Null OR empty → fall through to flat arrays. The server's
+        // chunked emission invariant means _phrases should never land
+        // at `[]` in practice (it'd require the `phrases` message to
+        // fire with zero data), but the defensive guard means a bug
+        // on the way in wouldn't blank the chart.
+        if (_phrases === null || _phrases.length === 0) {
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
+            return;
+        }
+        const outNotes = [];
+        const outChords = [];
+        const outAnchors = [];
+        for (const p of _phrases) {
+            const n = p.levels.length;
+            if (n === 0) continue;
+            // Map slider fraction to a level index. `n` already equals
+            // `max_difficulty + 1` for fully-authored phrases, and
+            // equals the authored-level count otherwise — so indexing
+            // into p.levels.length is both correct and defensive.
+            const idx = Math.min(n - 1, Math.floor(_mastery * n));
+            const lv = p.levels[idx];
+            for (const x of lv.notes)   outNotes.push(x);
+            for (const x of lv.chords)  outChords.push(x);
+            // Anchors drive the fret zoom / pan. Keeping max-mastery
+            // anchors while hiding higher-difficulty notes would leave
+            // the highway panning into empty regions — filter them to
+            // the same level as the notes they pair with.
+            for (const x of lv.anchors) outAnchors.push(x);
+        }
+        _filteredNotes = outNotes;
+        _filteredChords = outChords;
+        _filteredAnchors = outAnchors;
+    }
+
     // ── Public API ───────────────────────────────────────────────────────
     const api = {
         init(canvasEl, container) {
             canvas = canvasEl;
             _resizeContainer = container || null;
-            ctx = canvas.getContext('2d');
+            // Size the canvas BEFORE installing the renderer so
+            // _setRenderer's init/resize calls see the real dimensions
+            // instead of the default 300x150 backing store. Otherwise
+            // WebGL renderers would allocate framebuffers at the wrong
+            // size and immediately have to tear them down when
+            // api.resize fires afterwards.
             this.resize();
+            // Install the default renderer on first init. If a caller
+            // pre-selected a custom renderer before init ran (e.g.
+            // app.js restoring a saved viz picker selection at page
+            // load), re-apply that choice now that the canvas is
+            // available instead of clobbering it with the default.
+            // _setRenderer(_renderer) is correct: it re-applies the
+            // selected renderer now that the canvas exists, and only
+            // destroys the previous renderer if it had been
+            // successfully init'd before this mount (so a pre-selected
+            // renderer that never saw a canvas gets init'd fresh, not
+            // destroy+init'd).
+            _setRenderer(_renderer || _defaultRenderer);
             if (_resizeHandler) window.removeEventListener('resize', _resizeHandler);
             _resizeHandler = () => this.resize();
             window.addEventListener('resize', _resizeHandler);
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            stringCount = 6;  // default until song_info arrives
+            // Reset phrase ladder + filter (slopsmith#48). _mastery
+            // persists across arrangement switches — the slider's
+            // position stays put. Filter rebuilds on the next `ready`
+            // once the new arrangement's phrases arrive (or stays
+            // disabled if the new source has no phrase data).
+            _phrases = null;
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
+            _resetChordRenderState();
         },
 
         resize() {
@@ -956,6 +1744,22 @@ function createHighway() {
             canvas.style.height = h + 'px';
             canvas.width = Math.round(w * _renderScale);
             canvas.height = Math.round(h * _renderScale);
+            // Notify the active renderer so WebGL / offscreen buffers
+            // can recreate their framebuffers. Setting canvas.width
+            // above already invalidates both 2D and WebGL state — any
+            // renderer relying on persistent GPU resources listens here.
+            //
+            // Gated on _rendererInited: a renderer pre-selected via
+            // setRenderer before api.init has run is stashed but not
+            // initialized yet. Calling resize() on it would violate
+            // the init-before-resize contract and can break renderers
+            // that assume resize() means "canvas dims changed after
+            // setup." The subsequent api.init will call its resize()
+            // once init succeeds.
+            if (_renderer && _rendererInited && typeof _renderer.resize === 'function') {
+                try { _renderer.resize(canvas.width, canvas.height); }
+                catch (e) { console.error('renderer resize:', e); }
+            }
         },
 
         setRenderScale(scale) {
@@ -975,160 +1779,326 @@ function createHighway() {
 
         getLefty() { return _lefty; },
 
+        // Master-difficulty (slopsmith#48). Per-instance: splitscreen
+        // plugins that call createHighway() separately get their own
+        // _mastery via closure.
+        setMastery(fraction) {
+            // Same NaN guard as the init (plugins could pass undefined
+            // or a string that coerces badly). Silently ignore — the
+            // caller probably meant to pass a number; keeping the
+            // previous value is safer than propagating NaN into
+            // Math.floor → p.levels[NaN].
+            const next = Number(fraction);
+            if (!Number.isFinite(next)) return;
+            _mastery = Math.max(0, Math.min(1, next));
+            _rebuildMasteryFilter();
+        },
+        getMastery() { return _mastery; },
+        // Align with _rebuildMasteryFilter's own "null OR empty → fall
+        // through" check. If we returned true for _phrases = [], the
+        // slider would be enabled (via song:ready's hasPhraseData) but
+        // dragging it would do nothing (filter stays null). Same
+        // sentinel, same check, single source of truth.
+        hasPhraseData() { return !!(_phrases && _phrases.length > 0); },
+
         connect(wsUrl, opts = {}) {
             _connectOpts = opts;
+            // Bump generation so async handlers from the previous connection
+            // can detect they are stale and skip state mutations.
+            _wsGen += 1;
+            // Fresh routing promise for this connection's song_info load.
+            _juceRoutingPromise = Promise.resolve();
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
             ws.onerror = (e) => { console.error('WS error', e); };
-            ws.onmessage = (ev) => {
-                const msg = JSON.parse(ev.data);
-                if (msg.error) {
-                    console.error('Server error:', msg.error);
-                    if (opts.onError) opts.onError(msg.error);
-                    else alert('Error: ' + msg.error);
-                    return;
+            // Reset the serialization chain so old in-flight handlers
+            // from a previous connection don't delay new messages.
+            _msgChain = Promise.resolve();
+
+            // Helper: attach the HTML5 audio buffering overlay to `audio`.
+            // Shared by both the direct HTML5 path and the JUCE fallback path.
+            function _showAudioBufferingOverlay(audio) {
+                let overlay = document.getElementById('audio-buffer-overlay');
+                if (!overlay) {
+                    overlay = document.createElement('div');
+                    overlay.id = 'audio-buffer-overlay';
+                    overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+                    overlay.innerHTML = `
+                        <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
+                            <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
+                            <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
+                                <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
+                            </div>
+                            <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
+                        </div>`;
+                    document.body.appendChild(overlay);
                 }
-                switch (msg.type) {
-                    case 'loading':
-                        console.log('Loading:', msg.stage);
-                        break;
-                    case 'song_info':
-                        songInfo = msg;
-                        if (opts.onSongInfo) {
-                            opts.onSongInfo(msg);
-                        } else {
-                            document.getElementById('hud-artist').textContent = msg.artist;
-                            document.getElementById('hud-title').textContent = msg.title;
-                            document.getElementById('hud-arrangement').textContent = msg.arrangement;
 
-                            // Clear any lingering audio-error banner from a prior song.
-                            const existingAudioErr = document.getElementById('audio-error-banner');
-                            if (existingAudioErr) existingAudioErr.remove();
+                const bar = document.getElementById('audio-buffer-bar');
+                const pct = document.getElementById('audio-buffer-pct');
+                const MIN_BUFFER_SECS = 30;
 
-                            // Server reported a concrete audio-pipeline failure and has
-                            // no URL to give us — surface it instead of leaving the
-                            // user with a cryptic "Empty src attribute" from audio.play().
-                            if (!msg.audio_url && msg.audio_error) {
-                                const banner = document.createElement('div');
-                                banner.id = 'audio-error-banner';
-                                banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[300] bg-red-900/95 border border-red-700 text-red-100 rounded-lg px-4 py-3 max-w-2xl shadow-xl';
-                                banner.innerHTML = `
-                                    <div class="flex items-start gap-3">
-                                        <span class="text-xl leading-none">⚠</span>
-                                        <div class="flex-1">
-                                            <div class="font-semibold text-sm">Audio unavailable</div>
-                                            <div class="text-xs text-red-200 mt-1"></div>
-                                        </div>
-                                        <button class="text-red-300 hover:text-white text-lg leading-none" aria-label="Dismiss">✕</button>
-                                    </div>`;
-                                banner.querySelector('.text-xs').textContent = msg.audio_error;
-                                banner.querySelector('button').addEventListener('click', () => banner.remove());
-                                document.body.appendChild(banner);
+                function onProgress() {
+                    if (audio.buffered.length > 0 && audio.duration > 0) {
+                        const loaded = audio.buffered.end(audio.buffered.length - 1);
+                        const p = Math.round((loaded / audio.duration) * 100);
+                        if (bar) bar.style.width = p + '%';
+                        if (pct) pct.textContent = p + '%';
+                        if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
+                            cleanup();
+                        }
+                    }
+                }
+
+                function cleanup() {
+                    audio.removeEventListener('progress', onProgress);
+                    audio.removeEventListener('canplaythrough', cleanup);
+                    const ol = document.getElementById('audio-buffer-overlay');
+                    if (ol) ol.remove();
+                }
+
+                audio.addEventListener('progress', onProgress);
+                audio.addEventListener('canplaythrough', cleanup, { once: true });
+            }
+
+            ws.onmessage = (ev) => {
+                const data = ev.data;
+                // Capture generation synchronously before any async work so
+                // stale completions from a prior WebSocket can be detected.
+                const gen = _wsGen;
+                _msgChain = _msgChain.then(async () => {
+                    // Bail out if a reconnect happened while this step was queued.
+                    if (gen !== _wsGen) return;
+                    try {
+                    const msg = JSON.parse(data);
+                    if (msg.error) {
+                        console.error('Server error:', msg.error);
+                        if (opts.onError) opts.onError(msg.error);
+                        else alert('Error: ' + msg.error);
+                        return;
+                    }
+                    switch (msg.type) {
+                        case 'loading':
+                            console.log('Loading:', msg.stage);
+                            break;
+                        case 'song_info':
+                            songInfo = msg;
+                            // Pick up the active arrangement's string count.
+                            // Prefer the explicit `stringCount` field (added
+                            // in slopsmith-plugin-3dhighway#7); fall back to
+                            // `tuning.length` for older servers that haven't
+                            // started emitting it (works correctly for
+                            // GP-imported sources where tuning is already
+                            // truncated, and for sloppaks loaded against an
+                            // updated lib/song.py); final fallback is 6 for
+                            // safety so a missing/malformed payload doesn't
+                            // surface as 0 strings.
+                            //
+                            // Clamp to [1, MAX_STRINGS] before storing —
+                            // stringCount drives loop bounds in drawStrings
+                            // and downstream plugins. A malformed payload
+                            // (huge or zero / negative) would otherwise hang
+                            // the UI or render no strings at all. 8 covers
+                            // every real-world instrument we ship colors
+                            // for; values above that fall back to '#888'
+                            // anyway via the STRING_COLORS lookup so
+                            // capping the loop bound costs nothing visible.
+                            const MAX_STRINGS = 8;
+                            let _sc;
+                            if (typeof msg.stringCount === 'number' && msg.stringCount > 0) {
+                                _sc = msg.stringCount;
+                            } else if (Array.isArray(msg.tuning) && msg.tuning.length > 0) {
+                                _sc = msg.tuning.length;
+                            } else {
+                                _sc = 6;
                             }
-
-                            if (msg.audio_url) {
-                                const audio = document.getElementById('audio');
-                                if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
-                                    audio.src = msg.audio_url;
-                                    audio.load();
-
-                                    // Show buffering overlay
-                                    let overlay = document.getElementById('audio-buffer-overlay');
-                                    if (!overlay) {
-                                        overlay = document.createElement('div');
-                                        overlay.id = 'audio-buffer-overlay';
-                                        overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
-                                        overlay.innerHTML = `
-                                            <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
-                                                <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
-                                                <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
-                                                    <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
-                                                </div>
-                                                <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
-                                            </div>`;
-                                        document.body.appendChild(overlay);
-                                    }
-
-                                    const bar = document.getElementById('audio-buffer-bar');
-                                    const pct = document.getElementById('audio-buffer-pct');
-
-                                    const MIN_BUFFER_SECS = 30;
-
-                                    function onProgress() {
-                                        if (audio.buffered.length > 0 && audio.duration > 0) {
-                                            const loaded = audio.buffered.end(audio.buffered.length - 1);
-                                            const p = Math.round((loaded / audio.duration) * 100);
-                                            if (bar) bar.style.width = p + '%';
-                                            if (pct) pct.textContent = p + '%';
-                                            // Dismiss when enough is buffered
-                                            if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
-                                                cleanup();
-                                            }
+                            // Math.trunc(_sc) (with finite check) instead of
+                            // `_sc | 0` — bitwise-OR forces 32-bit signed
+                            // conversion, so any value ≥ 2^31 wraps negative
+                            // and the Math.max(1, ...) clamp would land at
+                            // 1 string. Math.trunc preserves the magnitude;
+                            // the Math.min(MAX_STRINGS, ...) below caps it
+                            // safely.
+                            const _scTrunc = Number.isFinite(_sc) ? Math.trunc(_sc) : 1;
+                            stringCount = Math.max(1, Math.min(MAX_STRINGS, _scTrunc));
+                            if (opts.onSongInfo) {
+                                opts.onSongInfo(msg);
+                            } else {
+                                document.getElementById('hud-artist').textContent = msg.artist;
+                                document.getElementById('hud-title').textContent = msg.title;
+                                document.getElementById('hud-arrangement').textContent = msg.arrangement;
+    
+                                // Clear any lingering audio-error banner from a prior song.
+                                const existingAudioErr = document.getElementById('audio-error-banner');
+                                if (existingAudioErr) existingAudioErr.remove();
+    
+                                // Server reported a concrete audio-pipeline failure and has
+                                // no URL to give us — surface it instead of leaving the
+                                // user with a cryptic "Empty src attribute" from audio.play().
+                                if (!msg.audio_url && msg.audio_error) {
+                                    const banner = document.createElement('div');
+                                    banner.id = 'audio-error-banner';
+                                    banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[300] bg-red-900/95 border border-red-700 text-red-100 rounded-lg px-4 py-3 max-w-2xl shadow-xl';
+                                    banner.innerHTML = `
+                                        <div class="flex items-start gap-3">
+                                            <span class="text-xl leading-none">⚠</span>
+                                            <div class="flex-1">
+                                                <div class="font-semibold text-sm">Audio unavailable</div>
+                                                <div class="text-xs text-red-200 mt-1"></div>
+                                            </div>
+                                            <button class="text-red-300 hover:text-white text-lg leading-none" aria-label="Dismiss">✕</button>
+                                        </div>`;
+                                    banner.querySelector('.text-xs').textContent = msg.audio_error;
+                                    banner.querySelector('button').addEventListener('click', () => banner.remove());
+                                    document.body.appendChild(banner);
+                                }
+    
+                                if (msg.audio_url) {
+                                    const audio = document.getElementById('audio');
+                                    const audioFilename = msg.audio_url.split('/').pop();
+                                    const alreadyLoaded = window._juceMode
+                                        ? window._juceAudioUrl === msg.audio_url
+                                        : (audio.src && audio.src.includes(audioFilename));
+                                    if (!alreadyLoaded) {
+                                        const juceApi = window.slopsmithDesktop?.audio;
+                                        // Only attempt JUCE routing for /audio/ URLs — sloppak stems
+                                        // (/api/sloppak/…) are not resolvable via audio-local-path.
+                                        const isAudioUrl = msg.audio_url.startsWith('/audio/');
+                                        if (isAudioUrl && juceApi) {
+                                            // Run JUCE routing off the critical message-processing chain
+                                            // so subsequent notes/chords/ready messages aren't blocked
+                                            // waiting for IPC + HTTP round-trips. The 'ready' handler
+                                            // awaits _juceRoutingPromise so _juceMode is settled before
+                                            // _onReady / song:ready fire.
+                                            const audioUrl = msg.audio_url;
+                                            _juceRoutingPromise = (async () => {
+                                                try {
+                                                    if (await juceApi.isAudioRunning()) {
+                                                        if (gen !== _wsGen) return; // stale
+                                                        const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(audioUrl)}`);
+                                                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                                                        const { path } = await res.json();
+                                                        await juceApi.loadBackingTrack(path);
+                                                        if (gen !== _wsGen) return; // stale
+                                                        if (window.jucePlayer) window.jucePlayer._dur = await juceApi.getBackingDuration();
+                                                        if (gen !== _wsGen) return; // stale
+                                                        window._juceMode = true;
+                                                        window._juceAudioUrl = audioUrl;
+                                                        // Clear the HTML5 element so it does not buffer an unused track
+                                                        audio.src = '';
+                                                        return;
+                                                    }
+                                                } catch (err) {
+                                                    console.warn('[highway] JUCE audio routing failed, falling back to HTML5:', err);
+                                                    if (gen !== _wsGen) return; // stale
+                                                    window._juceMode = false;
+                                                    window._juceAudioUrl = null;
+                                                }
+                                                // HTML5 fallback (isAudioRunning false, or JUCE error)
+                                                if (gen !== _wsGen) return; // stale
+                                                audio.src = audioUrl;
+                                                audio.load();
+                                                window._juceMode = false;
+                                                window._juceAudioUrl = null;
+                                                _showAudioBufferingOverlay(audio);
+                                            })();
+                                        } else {
+                                            // Non-JUCE path: sloppak stems, or no JUCE API present
+                                            audio.src = msg.audio_url;
+                                            audio.load();
+                                            window._juceMode = false;
+                                            window._juceAudioUrl = null;
+                                            _showAudioBufferingOverlay(audio);
                                         }
                                     }
-
-                                    function cleanup() {
-                                        audio.removeEventListener('progress', onProgress);
-                                        audio.removeEventListener('canplaythrough', cleanup);
-                                        const ol = document.getElementById('audio-buffer-overlay');
-                                        if (ol) ol.remove();
-                                    }
-
-                                    audio.addEventListener('progress', onProgress);
-                                    // Fallback: also dismiss on canplaythrough
-                                    audio.addEventListener('canplaythrough', cleanup, { once: true });
+                                }
+                                // Populate arrangement dropdown
+                                if (msg.arrangements) {
+                                    const sel = document.getElementById('arr-select');
+                                    sel.innerHTML = msg.arrangements.map(a =>
+                                        `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
+                                    ).join('');
                                 }
                             }
-                            // Populate arrangement dropdown
-                            if (msg.arrangements) {
-                                const sel = document.getElementById('arr-select');
-                                sel.innerHTML = msg.arrangements.map(a =>
-                                    `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
-                                ).join('');
+                            // Plugin context API — broadcast current song state
+                            if (window.slopsmith) {
+                                const wsPath = ws.url.split('/ws/highway/')[1] || '';
+                                const filename = decodeURIComponent(wsPath.split('?')[0]);
+                                window.slopsmith.currentSong = {
+                                    filename,
+                                    title: msg.title,
+                                    artist: msg.artist,
+                                    duration: msg.duration,
+                                    arrangement: msg.arrangement,
+                                    arrangementIndex: msg.arrangement_index,
+                                    arrangements: msg.arrangements || [],
+                                    tuning: msg.tuning,
+                                    capo: msg.capo,
+                                    format: msg.format,
+                                };
+                                window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
                             }
-                        }
-                        // Plugin context API — broadcast current song state
-                        if (window.slopsmith) {
-                            const wsPath = ws.url.split('/ws/highway/')[1] || '';
-                            const filename = decodeURIComponent(wsPath.split('?')[0]);
-                            window.slopsmith.currentSong = {
-                                filename,
-                                title: msg.title,
-                                artist: msg.artist,
-                                duration: msg.duration,
-                                arrangement: msg.arrangement,
-                                arrangementIndex: msg.arrangement_index,
-                                arrangements: msg.arrangements || [],
-                                tuning: msg.tuning,
-                                capo: msg.capo,
-                                format: msg.format,
-                            };
-                            window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
-                        }
-                        break;
-                    case 'beats': beats = msg.data; break;
-                    case 'sections': sections = msg.data; break;
-                    case 'anchors':
-                        anchors = msg.data;
-                        if (anchors.length) {
-                            displayMaxFret = Math.max(anchors[0].fret + anchors[0].width + 3, 8);
-                        }
-                        break;
-                    case 'chord_templates': chordTemplates = msg.data; break;
-                    case 'lyrics': lyrics = msg.data; break;
-                    case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
-                    case 'notes': notes = notes.concat(msg.data); break;
-                    case 'chords': chords = chords.concat(msg.data); break;
-                    case 'ready':
-                        ready = true;
-                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords`);
-                        if (!animFrame) draw();
-                        if (api._onReady) api._onReady();
-                        break;
-                }
+                            break;
+                        case 'beats': beats = msg.data; break;
+                        case 'sections': sections = msg.data; break;
+                        case 'anchors':
+                            anchors = msg.data;
+                            if (anchors.length) {
+                                displayMaxFret = Math.max(anchors[0].fret + anchors[0].width + 3, 8);
+                            }
+                            break;
+                        case 'chord_templates': chordTemplates = msg.data; break;
+                        case 'lyrics': lyrics = msg.data; break;
+                        case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
+                        case 'notes': notes = notes.concat(msg.data); break;
+                        case 'chords': chords = chords.concat(msg.data); break;
+                        case 'phrases':
+                            // Accumulate chunks but DON'T rebuild the filter
+                            // until `ready` — rebuilding per chunk would
+                            // cause visual flicker (partial filtered array
+                            // visible while later chunks are still arriving)
+                            // and duplicate work.
+                            if (_phrases === null) _phrases = [];
+                            for (const p of msg.data) _phrases.push(p);
+                            break;
+                        case 'ready':
+                            ready = true;
+                            _rebuildMasteryFilter();
+                            console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords` +
+                                (_phrases !== null ? `, ${_phrases.length} phrases (mastery ${Math.round(_mastery * 100)}%)` : ""));
+                            // Wait for the off-chain JUCE routing (if any) to settle
+                            // so _juceMode is correctly set before _onReady and song:ready fire.
+                            await _juceRoutingPromise.catch(() => {});
+                            if (!animFrame) draw();
+                            if (api._onReady) await Promise.resolve(api._onReady()).catch((err) => console.error('[highway] _onReady error:', err));
+                            // Broadcast to interested listeners (e.g. the
+                            // difficulty-slider disabled-state update in
+                            // app.js). Fires on every `ready`, including
+                            // arrangement switches — unlike `_onReady`,
+                            // which is a single-use callback slot.
+                            if (window.slopsmith) {
+                                // Reuse api.hasPhraseData so the emit and
+                                // the public getter agree on the sentinel.
+                                window.slopsmith.emit('song:ready', {
+                                    hasPhraseData: api.hasPhraseData(),
+                                });
+                            }
+                            break;
+                    }
+                    } catch (err) {
+                        console.error('[highway] ws.onmessage error:', err);
+                    }
+                }).catch((err) => { console.error('[highway] message chain error:', err); });
             };
         },
 
+        // Both clocks shifted by avOffsetSec so plugins (which read chartTime
+        // via getTime()) see the same time the user sees visually. Without
+        // this, a plugin onset stamped at chartTime maps to a chart note
+        // avOffsetSec EARLIER than the visual — giving the user a systematic
+        // early bias when matching. Upstream chose the opposite (raw audio
+        // time on chartTime) but the plugin's matcher depends on this
+        // shape; we keep it locally and revisit during the plugin port.
         setTime(t) { chartTime = t + avOffsetSec; currentTime = chartTime; },
         setAvOffset(ms) {
             const prev = avOffsetSec;
@@ -1174,12 +2144,46 @@ function createHighway() {
         getTime() { return chartTime; },
         getNotes() { return notes; },
         getChords() { return chords; },
+        // Live reference to the chord-template lookup table —
+        // `getChords()[i].id` is an index into this array. Each
+        // template carries `{ name, fingers, frets }`:
+        //   - name:    chord name string ("Em", "Cmaj7", …)
+        //   - fingers: per-string finger numbers (length matches
+        //              the tuning's string count; -1 = unused, 0 =
+        //              open string, n > 0 = finger number). RS XML
+        //              sources populate real values; GP imports
+        //              currently emit all -1.
+        //   - frets:   per-string fret numbers, same indexing.
+        // Read-only: overlay plugins should NOT mutate the array or
+        // its entries. Not difficulty-filter-aware (templates are
+        // static metadata; every chord_id referenced by `getChords()`
+        // is guaranteed valid).
+        getChordTemplates() { return chordTemplates; },
         getToneChanges() { return toneChanges; },
         getToneBase() { return toneBase; },
         getSections() { return sections; },
         getSongInfo() { return songInfo; },
+        // Number of strings on the active arrangement
+        // (slopsmith-plugin-3dhighway#7). 4 for bass, 6 for guitar,
+        // 7+ for extended-range GP imports. Plugins should size
+        // string-indexed UI / geometry against THIS rather than
+        // assuming 6. Defaults to 6 between songs (until the next
+        // song_info message arrives).
+        getStringCount() { return stringCount; },
         addDrawHook(fn) { _drawHooks.push(fn); },
         removeDrawHook(fn) { _drawHooks = _drawHooks.filter(h => h !== fn); },
+        /**
+         * Fire all registered draw hooks on the given 2D context.
+         * Custom renderers (e.g. the 3D highway) that maintain their own
+         * 2D overlay canvas should call this after each frame so overlay
+         * plugins that use addDrawHook() keep working regardless of which
+         * renderer is active.
+         */
+        fireDrawHooks(ctx, W, H) {
+            for (const hook of _drawHooks) {
+                try { hook(ctx, W, H); } catch (e) { /* ignore */ }
+            }
+        },
         project(tOffset) { return project(tOffset); },
         fretX(fret, scale, w) { return fretX(fret, scale, w); },
 
@@ -1203,7 +2207,18 @@ function createHighway() {
             // Close old WS but keep audio + animation running
             if (ws) { ws.close(); ws = null; }
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            stringCount = 6;  // default until song_info arrives
+            // Reset phrase ladder + filter (slopsmith#48). _mastery
+            // persists across arrangement switches — the slider's
+            // position stays put. Filter rebuilds on the next `ready`
+            // once the new arrangement's phrases arrive (or stays
+            // disabled if the new source has no phrase data).
+            _phrases = null;
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
+            _resetChordRenderState();
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);
@@ -1219,8 +2234,34 @@ function createHighway() {
                 window.removeEventListener('resize', _resizeHandler);
                 _resizeHandler = null;
             }
+            // Release the renderer's GPU / DOM / event-listener resources
+            // when leaving the player — anything it allocated in init()
+            // should be torn down here so navigating away doesn't leak.
+            // Crucially we KEEP `_renderer` (the instance/selection) so
+            // that the next api.init() can re-apply the same visualization
+            // on the new canvas. _rendererInited flips to false so
+            // _setRenderer knows not to call destroy() again on this
+            // already-destroyed instance.
+            _destroyCurrentIfInited();
             ready = false;
+            songInfo = {};
         },
+
+        /**
+         * Install a custom renderer. Contract (slopsmith#36):
+         *   r.init(canvas, bundle) — one-time setup; owns getContext().
+         *   r.draw(bundle)         — per rAF frame.
+         *   r.resize(w, h)         — optional; called when canvas dims change.
+         *   r.destroy()            — optional; release resources.
+         * Pass null or undefined to restore the default renderer.
+         *
+         * Custom renderers receive a data bundle (see _makeBundle) that
+         * already applies the master-difficulty filter — the notes /
+         * chords / anchors arrays are the right set to render regardless
+         * of slider position. Use _drawHooks only for the default
+         * renderer; they're a 2D-only contract.
+         */
+        setRenderer(r) { _setRenderer(r); },
     };
     return api;
 }

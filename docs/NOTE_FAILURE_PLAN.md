@@ -8,8 +8,9 @@ Depends on: `docs/NOTE_FAILURE_SPEC.md` (read that first)
 
 **Goal:** Working note detection plugin streaming detected notes via WebSocket.
 
-This phase is covered by the existing NOTE_DETECTION_PLUGIN_PLAN (in git at
-`67ef79d:docs/NOTE_DETECTION_PLUGIN_PLAN.md`). Summary:
+This phase was previously tracked in a separate NOTE_DETECTION_PLUGIN_PLAN
+document (in the `slopsmith-plugin-notedetect` repository). The relevant scope
+is summarized here to avoid relying on an internal git-only reference:
 
 - [ ] Plugin skeleton: `slopsmith-plugin-notedetect/` with plugin.json, routes.py, screen.js
 - [ ] Port TonalRecall YIN detection (aubio + sounddevice) to routes.py
@@ -31,17 +32,27 @@ console logging only.
 - `screen.js` in the notedetect plugin
 
 **Tasks:**
-- [ ] Implement `expectedFreq(string, fret, tuningOffsets)` using standard tuning
-      constants and the song's tuning metadata from `highway.getSongInfo().tuning`
+- [ ] Implement `expectedFreq(string, fret, tuningOffsets, capo, stringCount, arrangementName)` using
+      base open-string frequencies, semitone offsets from `highway.getSongInfo().tuning`,
+      and semitone math (`2^(semitones/12)`) rather than assuming 6-string standard
+      tuning; use `highway.getStringCount()` as the authoritative string count because
+      tuning may be padded to length 6 for RS XML sources even for bass/extended-range
+      arrangements; include `highway.getSongInfo().capo` as additional semitones if
+      the intent is expected sounding pitch; pass `highway.getSongInfo().arrangement` as
+      `arrangementName` to disambiguate 5-string bass vs 5-string guitar (matching the
+      spec's `getBaseTuning` helper)
 - [ ] Implement `NoteJudgmentTracker` class with:
   - `addDetection(detected)` — correlate with nearest unmatched chart note
   - `update(currentTime)` — expire pending notes whose match window has passed
   - `getJudgmentsInRange(tStart, tEnd)` — return judgments in time range
   - `reset()` — clear all state
 - [ ] Connect to detection WebSocket, feed events into tracker
-- [ ] Initialize tracker with `highway.getNotes()` and `highway.getChords()` on song load
+- [ ] Initialize tracker with `highway.getNotes()` and `highway.getChords()` on song ready
 - [ ] Console.log each judgment as it resolves (HIT/MISSED/EARLY/LATE/SHARP/FLAT)
-- [ ] Re-initialize tracker on `song:loaded` event and arrangement switch (`highway.reconnect`)
+- [ ] Re-initialize tracker on `song:ready` (fires on every new song **and** on every
+      arrangement switch — no need to hook `highway.reconnect` or other internals);
+      do **not** use `song:loaded` — note/chord arrays are still empty at that point (data
+      arrives incrementally and only completes at `song:ready`)
 
 **Exit criterion:** Playing along with a song, console shows correct HIT/MISSED
 judgments with timing and pitch error values.
@@ -63,8 +74,12 @@ judgments with timing and pitch error values.
       `hitGlowDuration` seconds. Use `highway.project()` and `highway.fretX()` for
       positioning. Additive blend via `ctx.globalCompositeOperation = 'lighter'`.
 - [ ] **Miss rendering:** Red `✕` marker at the note's string/fret position, drawn
-      in the "past" region below the now-line. Use `highway.project(negative_offset)`
-      for Y positioning. Marker fades after `missMarkerDuration` seconds.
+      in the "past" region below the now-line. Do **not** rely on
+      `highway.project(negative_offset)` for long-lived placement — the current
+      renderer returns `null` for offsets more than ~50ms into the past. Instead,
+      anchor at the now-line (`highway.project(0)`) and map elapsed time since the
+      miss to a linear below-now-line Y position (configurable pixels/second), fading
+      the marker after `missMarkerDuration` seconds.
 - [ ] **String pulse:** Brief red tint on the missed note's string (200ms fade on
       the string line segment near the now-line).
 - [ ] Handle lefty mode: use `highway.fillTextUnmirrored()` for text markers.
@@ -177,7 +192,9 @@ transition. Lowest section is highlighted for targeted practice.
   - Binary search over judgments by time (same pattern as `drawNotes`)
 - [ ] Smooth animations: glow/fade using eased alpha, not linear
 - [ ] Color-blind accessible palette option (use shapes not just colors)
-- [ ] Persist settings via `/api/settings` under `notedetect_feedback` key
+- [ ] Persist settings in plugin-local storage (e.g. `localStorage` prefixed with
+      plugin id) — do **not** use `/api/settings` for this; the current server only
+      persists a fixed set of known keys and will silently discard `notedetect_feedback`
 
 **Estimated scope:** ~100 lines JS, ~60 lines HTML
 

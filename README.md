@@ -7,7 +7,9 @@ A self-contained web application for browsing, playing, and practicing Rocksmith
 > **Looking for a desktop app?** [Slopsmith Desktop](https://github.com/byrongamatos/slopsmith-desktop) is a standalone native app for non-technical users — no Docker required. It includes everything in the web version plus a built-in audio engine with VST3/AU/LV2 plugin hosting, Neural Amp Modeler (NAM) for amp simulation, cabinet IR loading, and automatic tone switching that changes your signal chain as tones change during a song.
 
 ![Library](docs/library.png)
-![Player](docs/player.png)
+![3D Highway Player](docs/player-3d.jpg)
+
+> The screenshot above shows the **3D Highway** — a bundled visualization plugin selectable from the viz picker, featuring depth-aware camera, lighting, and per-string lane glow. The **Classic 2D Highway** is also available in the picker.
 
 ## Features
 
@@ -21,7 +23,7 @@ A self-contained web application for browsing, playing, and practicing Rocksmith
 - **Retune to E Standard** — pitch-shift songs in Eb/D/C#/C Standard to E Standard with one click
 
 ### Note Highway Player
-A real-time canvas-based note highway that renders Rocksmith arrangements as they would appear in the game.
+A real-time note highway that renders Rocksmith arrangements as they would appear in the game. Bundled visualization options include a 3D highway with depth-aware camera, lighting, and per-string lane glow, and a classic 2D highway selectable from the visualization picker.
 
 **Note rendering:**
 - Fret-positioned notes with string colors (red, orange, blue, orange, green, purple)
@@ -93,6 +95,36 @@ On first launch, the app scans your DLC folder and imports metadata. A progress 
 
 - **DLC Folder** — set in Settings or via the `DLC_PATH` environment variable
 - **Default Arrangement** — choose Lead, Rhythm, or Bass as the default when opening songs (Settings)
+
+### Logging
+
+Control log verbosity and format via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Severity threshold: `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
+| `LOG_FORMAT` | `text` | `text` for coloured console output; `json` for structured output (Loki, ELK, Promtail) |
+| `LOG_FILE` | *(unset)* | If set, also write logs to this path (e.g. `/config/slopsmith.log`) |
+
+### Reporting Bugs / Diagnostics
+
+When you hit a bug, **Settings → Diagnostics → Export Diagnostics** produces a single zip containing everything a maintainer (or AI agent) needs to triage:
+
+- Server logs (tail of `LOG_FILE`)
+- System info (Python, OS, Slopsmith version)
+- Hardware (CPU, RAM, GPU) — works in Docker, Electron (slopsmith-desktop), or bare Python
+- Plugin inventory with git commit SHAs (so we know exactly which build you're on) — including orphaned plugins that failed to load
+- Browser console transcript (all `console.log/info/warn/error/debug` + uncaught errors + promise rejections, last 500 entries)
+- Browser hardware (WebGL renderer, WebGPU adapter)
+- Per-plugin contributed diagnostics (when plugins opt in)
+
+**Privacy:** redaction is on by default. DLC paths, song filenames, IP addresses, and bearer tokens are replaced with stable hashed tokens (`<song:a3f1c2d4>`) before the bundle is created. Click **Preview Bundle** to see exactly what's about to be exported.
+
+Set `LOG_FILE` first if you want server logs included — without it the bundle still ships system + hardware + browser console, but the `logs/` section will be empty.
+
+The bundle layout and per-file schemas are fully documented in [`docs/diagnostics-bundle-spec.md`](docs/diagnostics-bundle-spec.md). Top-level `manifest.json` carries a `schema` field on every JSON data file so AI agents can dispatch by version.
+
+Attach the zip to a GitHub issue or share with whoever's helping you debug.
 
 ### Docker Compose Example
 
@@ -222,10 +254,11 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Studio](https://github.com/byrongamatos/slopsmith-plugin-studio) | Collaborative band recording and multi-track mixing | `git clone ...slopsmith-plugin-studio.git studio` |
 | [Drum Highway](https://github.com/byrongamatos/slopsmith-plugin-drums) | Lane-based drum highway with MIDI drum pad input and built-in sounds | `git clone ...slopsmith-plugin-drums.git drums` |
 | [Split Screen](https://github.com/topkoa/slopsmith-plugin-splitscreen) | 2-4 highway panels side-by-side for multi-arrangement practice | `git clone ...slopsmith-plugin-splitscreen.git splitscreen` |
-| [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) | Convert PSARC to .sloppak with Demucs stem splitting | `git clone ...slopsmith-plugin-sloppak-converter.git sloppak_converter` |
+| [Sloppak Converter](https://github.com/topkoa/slopsmith-plugin-sloppak-converter) | Convert PSARC to .sloppak with Demucs stem splitting — bulk-select cards or one-click "convert all PSARCs missing a sloppak", with a Conversions queue dashboard (pause/resume, retry, per-job metadata + Demucs result summary) | `git clone ...slopsmith-plugin-sloppak-converter.git sloppak_converter` |
 | [Stems Mixer](https://github.com/topkoa/slopsmith-plugin-stems) | Per-stem mute/volume controls for .sloppak songs | `git clone ...slopsmith-plugin-stems.git stems` |
 | [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
 | [Jumping Tab](https://github.com/renanboni/slopsmith-plugin-jumpingtab) | Yousician-style 2D horizontal tab with trajectory arcs and hopping ball | `git clone ...slopsmith-plugin-jumpingtab.git jumpingtab` |
+| [Step Mode](https://github.com/byrongamatos/slopsmith-plugin-stepmode) | Rocksmith-1-style practice mode — highway freezes at each note until played (via Note Detection) or Space | `git clone ...slopsmith-plugin-stepmode.git step_mode` |
 | [Lyrics Sync](https://github.com/byrongamatos/slopsmith-plugin-lyrics-sync) | Generate synced LRC lyrics from text + vocals stem via Whisper alignment | `git clone ...slopsmith-plugin-lyrics-sync.git lyrics_sync` |
 | [NAM Tone Engine](https://github.com/byrongamatos/slopsmith-plugin-nam-tone) | In-browser amp modeling with NAM WASM, cabinet IRs, tone auto-switching | `git clone ...slopsmith-plugin-nam-tone.git nam_tone` |
 | [Guitar Theory Lab](https://github.com/topkoa/slopsmith-plugin-guitar-theory) | Explore scales, chords, intervals, tunings, and voicings on a fully interactive fretboard  | `git clone ...slopsmith-plugin-nam-tone.git guitar-theory-lab` |
@@ -239,6 +272,10 @@ cd plugins
 git clone https://github.com/byrongamatos/slopsmith-plugin-ug.git ultimate_guitar
 docker compose restart
 ```
+
+## AI Agent Guide
+
+This repo includes a [`CLAUDE.md`](CLAUDE.md) file with architecture overview, plugin conventions, and best practices for AI coding agents (Claude Code, etc.). If you're using AI tools to contribute, the guide is picked up automatically. If you're updating conventions or patterns, please keep `CLAUDE.md` in sync.
 
 ## Tech Stack
 

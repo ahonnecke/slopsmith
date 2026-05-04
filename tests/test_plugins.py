@@ -1,0 +1,1742 @@
+"""Tests for plugins/__init__.py — namespace isolation for sibling
+modules and startup-time collision detection (slopsmith#33).
+
+The plugin loader used to insert each plugin directory onto `sys.path`,
+which made bare `import sibling` fall through Python's per-name cache
+in `sys.modules`. Two plugins shipping a same-named top-level module
+(`extractor.py`, `util.py`, …) would step on each other. The loader
+now exposes `context['load_sibling'](name)` that loads the sibling
+under a namespaced module name `plugin_<plugin_id>.<name>` (with `.`
+in plugin_id bijectively encoded — `_` -> `_5f_`, `.` -> `_2e_`),
+plus a warning at startup so
+existing colliding plugins are visible.
+"""
+
+import contextlib
+import importlib
+import json
+import logging
+import sys
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+@contextlib.contextmanager
+def capture_logger(caplog, logger_name, level=logging.WARNING):
+    """Context manager that attaches *caplog.handler* directly to the named
+    logger for the duration of the ``with`` block, then restores its original
+    level and ``propagate`` flag.  Bypasses pytest's default root-logger
+    attachment so tests that set ``propagate=False`` on their logger still
+    capture records even when the ``slopsmith`` hierarchy hasn't set up
+    handlers yet."""
+    logger = logging.getLogger(logger_name)
+    orig_level, orig_propagate = logger.level, logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    try:
+        yield logger
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(orig_level)
+        logger.propagate = orig_propagate
+
+
+# Bare module names that this test module pre-populates into
+# sys.modules to simulate the bare-import path. Saved/restored by
+# the reset_plugin_state fixture so they don't leak to other test
+# files. Codex / Copilot review on PR for slopsmith#33.
+_BARE_NAMES_USED = ("util", "extractor")
+
+
+@pytest.fixture()
+def reset_plugin_state(monkeypatch):
+    """Clear loader module-level state and restore on teardown.
+
+    Saves and restores:
+      * `plugins.LOADED_PLUGINS`
+      * any `plugin_*` keys we add to `sys.modules`
+      * the bare names this module simulates (`util`, `extractor`)
+      * `sys.path` — `plugins.load_plugins()` mutates it
+    Also unsets `SLOPSMITH_PLUGINS_DIR` for the test's duration
+    (via monkeypatch) so a CI env that pre-sets it can't leak
+    real user plugins into a tmp_path-driven test. Per-module
+    locks are owned by the standard import system
+    (`importlib._bootstrap._module_locks`) and are not our
+    responsibility to reset.
+    """
+    monkeypatch.delenv("SLOPSMITH_PLUGINS_DIR", raising=False)
+    plugins = importlib.import_module("plugins")
+    saved_loaded = list(plugins.LOADED_PLUGINS)
+    saved_modules = {k: v for k, v in sys.modules.items() if k.startswith("plugin_")}
+    saved_bare = {k: sys.modules[k] for k in _BARE_NAMES_USED if k in sys.modules}
+    saved_path = list(sys.path)
+    plugins.LOADED_PLUGINS.clear()
+    for k in list(sys.modules):
+        if k.startswith("plugin_") or k in _BARE_NAMES_USED:
+            del sys.modules[k]
+    try:
+        yield plugins
+    finally:
+        plugins.LOADED_PLUGINS.clear()
+        plugins.LOADED_PLUGINS.extend(saved_loaded)
+        for k in list(sys.modules):
+            if k.startswith("plugin_") or k in _BARE_NAMES_USED:
+                del sys.modules[k]
+        sys.modules.update(saved_modules)
+        sys.modules.update(saved_bare)
+        sys.path[:] = saved_path
+
+
+def _make_plugin(plugin_root, plugin_id, *, sibling_files=None, routes_body=None):
+    """Create a minimal plugin directory under `plugin_root`.
+
+    `sibling_files` is a dict of `{module_name: file_body}` written as
+    `{module_name}.py` next to routes. `routes_body` is the contents of
+    routes.py — defaults to a no-op `setup` so the plugin loads cleanly.
+    """
+    plugin_dir = plugin_root / plugin_id
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": plugin_id, "name": plugin_id, "routes": "routes.py"})
+    )
+    (plugin_dir / "routes.py").write_text(
+        routes_body if routes_body is not None else "def setup(app, ctx):\n    pass\n"
+    )
+    for name, body in (sibling_files or {}).items():
+        (plugin_dir / f"{name}.py").write_text(body)
+    return plugin_dir
+
+
+def _run_load_plugins(plugins, app, tmp_path, context=None):
+    """Drive load_plugins against a tmp plugin root, restoring module
+    state on the way out so each test is isolated."""
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = tmp_path
+    try:
+        plugins.load_plugins(app, context if context is not None else {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+
+def test_load_sibling_returns_per_plugin_namespaced_modules(tmp_path, reset_plugin_state):
+    """Two plugins shipping `extractor.py` with different exports must
+    each see their OWN file via load_sibling — no cross-contamination."""
+    plugins = reset_plugin_state
+    _make_plugin(
+        tmp_path, "alpha",
+        sibling_files={"extractor": "MANIFEST_DIR = 'alpha-manifest'\n"},
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    extractor = ctx['load_sibling']('extractor')\n"
+            "    app.state.alpha_manifest = extractor.MANIFEST_DIR\n"
+        ),
+    )
+    _make_plugin(
+        tmp_path, "beta",
+        sibling_files={"extractor": "BETA_VALUE = 42\n"},
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    extractor = ctx['load_sibling']('extractor')\n"
+            "    app.state.beta_value = extractor.BETA_VALUE\n"
+        ),
+    )
+    fake_app = type("FakeApp", (), {})()
+    fake_app.state = type("State", (), {})()
+    _run_load_plugins(plugins, fake_app, tmp_path)
+    assert fake_app.state.alpha_manifest == "alpha-manifest"
+    assert fake_app.state.beta_value == 42
+    # The two extractors are namespaced into distinct sys.modules
+    # entries. `.` separates id and name to disambiguate when either
+    # contains underscores.
+    alpha_mod = sys.modules["plugin_alpha.extractor"]
+    beta_mod = sys.modules["plugin_beta.extractor"]
+    assert alpha_mod is not beta_mod
+    assert getattr(alpha_mod, "MANIFEST_DIR", None) == "alpha-manifest"
+    assert getattr(beta_mod, "BETA_VALUE", None) == 42
+    # Negative cross-check: alpha's extractor must NOT carry beta's exports.
+    assert not hasattr(alpha_mod, "BETA_VALUE")
+    assert not hasattr(beta_mod, "MANIFEST_DIR")
+
+
+def test_load_sibling_caches_repeat_calls(tmp_path, reset_plugin_state):
+    """Two `load_sibling('util')` calls within the same plugin return
+    the identical module object — no double exec_module."""
+    plugins = reset_plugin_state
+    _make_plugin(
+        tmp_path, "cached",
+        sibling_files={"util": "INSTANCE = object()\n"},
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    a = ctx['load_sibling']('util')\n"
+            "    b = ctx['load_sibling']('util')\n"
+            "    app.state.same = a is b\n"
+            "    app.state.instance = a.INSTANCE\n"
+        ),
+    )
+    fake_app = type("FakeApp", (), {})()
+    fake_app.state = type("State", (), {})()
+    _run_load_plugins(plugins, fake_app, tmp_path)
+    assert fake_app.state.same is True
+    assert fake_app.state.instance is sys.modules["plugin_cached.util"].INSTANCE
+
+
+def test_load_sibling_missing_module_raises_import_error(tmp_path, reset_plugin_state):
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "bare")
+    with pytest.raises(ImportError):
+        plugins._load_plugin_sibling("bare", plugin_dir, "does_not_exist")
+
+
+def test_load_sibling_rejects_traversal_and_suffix(tmp_path, reset_plugin_state):
+    """The helper takes a bare module name; reject anything that could
+    traverse paths or carry a redundant .py suffix."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "p")
+    # Reject:
+    # - empty / non-string (bare module name required)
+    # - path traversal (`/`, `\`, `../`)
+    # - redundant `.py` suffix
+    # - any `.` (used as separator in the cache key — would
+    #   otherwise allow ambiguous keys)
+    for bad in ("", "../etc", "sub/util", "util.py", "pkg.helper", 123, None):
+        with pytest.raises((ValueError, TypeError)):
+            plugins._load_plugin_sibling("p", plugin_dir, bad)
+
+
+def test_collision_warning_fires_for_shared_module_name(tmp_path, reset_plugin_state, caplog):
+    """Two plugins both shipping extractor.py must trigger the warning."""
+    plugins = reset_plugin_state
+    _make_plugin(tmp_path, "rs1extract", sibling_files={"extractor": "X = 1\n"})
+    _make_plugin(tmp_path, "discextract", sibling_files={"extractor": "Y = 2\n"})
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" in caplog.text
+    assert "'extractor' (module)" in caplog.text
+    assert "rs1extract" in caplog.text
+    assert "discextract" in caplog.text
+
+
+def test_collision_warning_silent_when_names_unique(tmp_path, reset_plugin_state, caplog):
+    plugins = reset_plugin_state
+    _make_plugin(tmp_path, "alpha", sibling_files={"alpha_helper": "A = 1\n"})
+    _make_plugin(tmp_path, "beta", sibling_files={"beta_helper": "B = 2\n"})
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" not in caplog.text
+
+
+def test_collision_warning_excludes_routes_and_dunders(tmp_path, reset_plugin_state, caplog):
+    """routes.py is already namespaced by the loader; __init__.py
+    belongs to a plugin that opted into being a package and namespaces
+    itself. Neither should trip the collision warning even when both
+    plugins ship one."""
+    plugins = reset_plugin_state
+    p1 = _make_plugin(tmp_path, "one", sibling_files={"unique_one": "V = 1\n"})
+    p2 = _make_plugin(tmp_path, "two", sibling_files={"unique_two": "V = 2\n"})
+    (p1 / "__init__.py").write_text("")
+    (p2 / "__init__.py").write_text("")
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" not in caplog.text
+
+
+def test_collision_warning_dedupes_per_plugin(tmp_path, reset_plugin_state, caplog):
+    """A single plugin shipping BOTH `extractor.py` and
+    `extractor/__init__.py` is a supported intra-plugin layout
+    (load_sibling deterministically prefers the package form,
+    matching CPython's import precedence). The warning must NOT
+    count it as a 2-plugin collision and emit a bogus message
+    listing the same plugin id twice. Codex round 5."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "lonely")
+    (plugin_dir / "extractor.py").write_text("FROM = 'file'\n")
+    pkg_dir = plugin_dir / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("FROM = 'package'\n")
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    # Only one plugin is involved, so no cross-plugin warning fires.
+    assert "Module-name collision" not in caplog.text
+
+
+def test_collision_warning_still_fires_when_two_plugins_each_have_both_forms(
+    tmp_path, reset_plugin_state, caplog
+):
+    """Two plugins each shipping both forms of `extractor` IS a
+    real cross-plugin collision and must be reported. Codex round 5
+    sanity check on the dedup logic."""
+    plugins = reset_plugin_state
+    for pid in ("alpha", "beta"):
+        plugin_dir = _make_plugin(tmp_path, pid)
+        (plugin_dir / "extractor.py").write_text(f"OWNER = '{pid}-file'\n")
+        pkg_dir = plugin_dir / "extractor"
+        pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text(f"OWNER = '{pid}-package'\n")
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    collision_records = [r for r in caplog.records if "Module-name collision" in r.getMessage()]
+    assert len(collision_records) == 1
+    warning = collision_records[0].getMessage()
+    assert "alpha" in warning
+    assert "beta" in warning
+    # The warning text should list each plugin id ONCE, even though
+    # both plugins ship two forms of `extractor`.
+    assert warning.count("'alpha'") == 1
+    assert warning.count("'beta'") == 1
+    # Both forms reported in the kind label.
+    assert "module/package" in warning
+
+
+def test_load_sibling_does_not_alias_bare_imported_package(tmp_path, reset_plugin_state):
+    """A bare-imported package keeps `__package__` and
+    `__spec__.name` as the un-namespaced bare name, so lazy
+    relative imports inside it would still resolve through the
+    global cache. To avoid that, load_sibling does NOT reuse a
+    bare-imported package — it re-executes under the namespaced
+    spec instead. Two copies of the package coexist (one bare,
+    one namespaced); module-level state diverges. This is
+    documented as the trade-off; the alternative would silently
+    leak submodule cross-loads. Codex round 5."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "pkgsafe")
+    pkg_dir = plugin_dir / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("MARK = object()\n")
+    (pkg_dir / "child.py").write_text("FROM = 'leaf'\n")
+    # Pre-populate sys.modules['extractor'] as if a bare import had
+    # already pulled in the package.
+    spec = importlib.util.spec_from_file_location(
+        "extractor",
+        str(pkg_dir / "__init__.py"),
+        submodule_search_locations=[str(pkg_dir)],
+    )
+    bare_pkg = importlib.util.module_from_spec(spec)
+    sys.modules["extractor"] = bare_pkg
+    spec.loader.exec_module(bare_pkg)
+    bare_mark = bare_pkg.MARK
+    # load_sibling re-executes under the namespaced spec rather
+    # than aliasing the bare package.
+    via_helper = plugins._load_plugin_sibling("pkgsafe", plugin_dir, "extractor")
+    assert via_helper is not bare_pkg
+    # Different MARK objects confirm the namespaced version was
+    # actually re-executed.
+    assert via_helper.MARK is not bare_mark
+    # The namespaced submodule resolves through the namespaced
+    # package, NOT through `extractor.child`.
+    child = importlib.import_module("plugin_pkgsafe.extractor.child")
+    assert child.FROM == "leaf"
+
+
+def test_load_sibling_handles_dotted_plugin_id_via_escape(tmp_path, reset_plugin_state):
+    """Plugins with reverse-DNS-style ids (`foo.bar`) must still be
+    able to use load_sibling — the helper escapes `.` in the
+    plugin_id portion of the cache key so the synthetic parent
+    package is still well-formed. Spotted across codex review
+    rounds on PR for slopsmith#33."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "rdns"
+    plugin_dir.mkdir()
+    (plugin_dir / "util.py").write_text("VALUE = 'reverse-dns'\n")
+    util = plugins._load_plugin_sibling("com.example.foo", plugin_dir, "util")
+    assert util.VALUE == "reverse-dns"
+    # The cache key uses the bijectively-encoded form so it doesn't
+    # fight with Python's package resolution. `.` -> `_2e_`.
+    assert "plugin_com_2e_example_2e_foo.util" in sys.modules
+    assert sys.modules["plugin_com_2e_example_2e_foo.util"] is util
+
+
+def test_load_sibling_rejects_empty_plugin_id(tmp_path, reset_plugin_state):
+    """Empty / non-string plugin_id is still rejected — the helper
+    needs SOMETHING to namespace under."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "valid_id", sibling_files={"util": "X = 1\n"})
+    for bad in ("", None, 123):
+        with pytest.raises((ValueError, TypeError)):
+            plugins._load_plugin_sibling(bad, plugin_dir, "util")
+
+
+def test_load_sibling_exposes_child_as_parent_attribute(tmp_path, reset_plugin_state):
+    """After load_sibling caches a child, Python's package-style
+    relative imports (`from . import sibling`, `from .. import
+    sibling`) need to find the child as an ATTRIBUTE on the parent
+    package — not just in sys.modules. The standard import
+    machinery sets that attribute; load_sibling must mimic the
+    behavior. Codex round 9."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "expose")
+    (plugin_dir / "extractor.py").write_text("VAL = 'extr'\n")
+    # Another sibling does `from . import extractor` — pure
+    # attribute lookup on the synthetic parent.
+    (plugin_dir / "consumer.py").write_text(
+        "from . import extractor\n"
+        "GOT = extractor.VAL\n"
+    )
+    # Load the consumer first; while it's executing, the
+    # `from . import extractor` triggers extractor's import
+    # through the parent package's __path__. After it loads,
+    # extractor must be visible as an attribute on the parent.
+    consumer = plugins._load_plugin_sibling("expose", plugin_dir, "consumer")
+    assert consumer.GOT == "extr"
+    parent = sys.modules["plugin_expose"]
+    assert hasattr(parent, "extractor")
+    assert parent.extractor is sys.modules["plugin_expose.extractor"]
+    # And consumer is exposed on the parent the same way.
+    assert hasattr(parent, "consumer")
+    assert parent.consumer is consumer
+
+
+def test_load_sibling_supports_relative_imports_between_siblings(tmp_path, reset_plugin_state):
+    """A sibling loaded via load_sibling that does `from .shared
+    import X` (relative import to another top-level sibling) must
+    resolve. The synthetic parent's __path__ points at the plugin
+    directory so the import machinery can find sibling files via
+    the standard relative-import path. Codex round 7."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "rel")
+    (plugin_dir / "shared.py").write_text("SHARED_VALUE = 'shared'\n")
+    (plugin_dir / "extractor.py").write_text(
+        "from .shared import SHARED_VALUE\n"
+        "RE_EXPORT = SHARED_VALUE\n"
+    )
+    extractor = plugins._load_plugin_sibling("rel", plugin_dir, "extractor")
+    assert extractor.RE_EXPORT == "shared"
+    # The relatively-imported sibling is registered under the
+    # namespaced key, NOT polluted into the global `shared` slot
+    # (collision risk with other plugins' `shared.py`).
+    assert "plugin_rel.shared" in sys.modules
+
+
+def test_load_sibling_package_relative_import_to_outside_sibling(tmp_path, reset_plugin_state):
+    """A package-form sibling whose __init__.py does
+    `from ..shared import X` reaches the parent and finds another
+    sibling. Verifies the package + parent-__path__ wiring works
+    end-to-end. Codex round 7."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "pkgrel")
+    (plugin_dir / "shared.py").write_text("VAL = 42\n")
+    pkg_dir = plugin_dir / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text(
+        "from ..shared import VAL\n"
+        "VALUE = VAL\n"
+    )
+    extractor = plugins._load_plugin_sibling("pkgrel", plugin_dir, "extractor")
+    assert extractor.VALUE == 42
+
+
+def test_load_sibling_package_relative_import_works(tmp_path, reset_plugin_state):
+    """A package-form sibling whose __init__.py uses `from .child
+    import X` must load. Without registering the synthetic parent
+    package `plugin_<id>` in sys.modules first, Python can't resolve
+    the relative import. Codex round 3 caught this."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "relpkg")
+    pkg_dir = plugin_dir / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "child.py").write_text("CHILD_VALUE = 99\n")
+    (pkg_dir / "__init__.py").write_text(
+        "from .child import CHILD_VALUE\n"
+        "RE_EXPORT = CHILD_VALUE\n"
+    )
+    extractor = plugins._load_plugin_sibling("relpkg", plugin_dir, "extractor")
+    assert extractor.RE_EXPORT == 99
+    # Parent package was registered as a synthetic ModuleType.
+    assert "plugin_relpkg" in sys.modules
+
+
+def test_load_sibling_does_not_alias_bare_imported_file_module(tmp_path, reset_plugin_state):
+    """Mixed migration: bare `import util` already cached this
+    plugin's util.py under the global `util` name. load_sibling
+    does NOT alias the bare module into the namespaced cache —
+    it re-executes under the namespaced spec. The bare module's
+    `__package__` / `__name__` / `__spec__` would otherwise stay
+    set to the un-namespaced bare name, and any later relative
+    import inside util.py (`from .shared import X` in a function
+    body) would route through the bare global cache, undoing the
+    isolation. Trade-off: module-level state in util splits across
+    two copies until the plugin removes its bare imports. Spotted
+    by codex review on PR for slopsmith#33 round 8."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "mixmig")
+    util_path = plugin_dir / "util.py"
+    util_path.write_text("MARK = object()\n")
+    spec = importlib.util.spec_from_file_location("util", str(util_path))
+    bare_mod = importlib.util.module_from_spec(spec)
+    sys.modules["util"] = bare_mod
+    spec.loader.exec_module(bare_mod)
+    bare_mark = bare_mod.MARK
+    via_helper = plugins._load_plugin_sibling("mixmig", plugin_dir, "util")
+    # Different module objects — the helper re-executed instead
+    # of aliasing.
+    assert via_helper is not bare_mod
+    assert via_helper.MARK is not bare_mark
+    # Namespaced key has the namespaced object; bare key still has
+    # the bare-imported object.
+    assert sys.modules["plugin_mixmig.util"] is via_helper
+    assert sys.modules["util"] is bare_mod
+    # Critically, via_helper has the correct namespaced metadata so
+    # later relative imports inside it would route through the
+    # synthetic parent.
+    assert via_helper.__name__ == "plugin_mixmig.util"
+    assert via_helper.__package__ == "plugin_mixmig"
+
+
+def test_safe_plugin_id_encoding_is_collision_free(reset_plugin_state):
+    """Distinct plugin_ids must always map to distinct encoded
+    forms. The previous `.` -> `_x2e_` (only when `.` was present)
+    was not bijective: ids `foo.bar` and `foo_x2e_bar` both produced
+    `foo_x2e_bar`. With the bijective `_` -> `_5f_`, `.` -> `_2e_`
+    encoding (in that order), no two distinct plugin_ids map to the
+    same output. Copilot review on PR #105 round 3."""
+    plugins = reset_plugin_state
+    samples = [
+        "foo",
+        "foo_bar",
+        "foo.bar",
+        "foo_2e_bar",
+        "foo_5f_bar",
+        "foo_5f_2e_5f_bar",
+        "com.example.foo",
+        "com_example_foo",
+        "com_2e_example_2e_foo",
+        "",  # empty edge — empty maps to empty, distinct from all others
+        "_",
+        ".",
+        "._",
+        "_.",
+    ]
+    encoded = [plugins._safe_plugin_id_for_module_name(s) for s in samples]
+    # Bijective: distinct inputs -> distinct outputs.
+    assert len(set(encoded)) == len(samples), dict(zip(samples, encoded))
+
+
+def test_load_plugins_skips_non_string_id(tmp_path, reset_plugin_state, caplog):
+    """A malformed manifest with a non-string id (e.g. number) is
+    skipped with a clear message rather than crashing later inside
+    `_safe_plugin_id_for_module_name`'s `.replace()` call. Copilot
+    review on PR #105 round 3."""
+    plugins = reset_plugin_state
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
+    (bad_dir / "plugin.json").write_text('{"id": 42, "name": "bad"}')
+    _make_plugin(tmp_path, "good", sibling_files={"util": "X = 1\n"})
+    fake_app = type("FakeApp", (), {})()
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, fake_app, tmp_path)
+    assert "must be a string" in caplog.text
+    assert "int" in caplog.text  # type name surfaced
+    loaded_ids = {p["id"] for p in plugins.LOADED_PLUGINS}
+    assert 42 not in loaded_ids
+    assert "good" in loaded_ids
+
+
+def test_load_plugins_warns_on_falsy_non_string_id(tmp_path, reset_plugin_state, caplog):
+    """`{"id": 0}` and `{"id": []}` are falsy non-strings. The
+    type-check must run BEFORE the falsy-empty check so the user
+    gets the explicit "must be a string" warning instead of a
+    silent skip. Copilot review on PR #105 round 4."""
+    plugins = reset_plugin_state
+    for i, bad_value in enumerate(("0", "[]", "false")):  # JSON literals
+        bad_dir = tmp_path / f"bad{i}"
+        bad_dir.mkdir()
+        (bad_dir / "plugin.json").write_text(f'{{"id": {bad_value}, "name": "x"}}')
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    # Each malformed manifest produces a "must be a string" warning;
+    # none are silently dropped.
+    assert caplog.text.count("must be a string") == 3
+    assert "int" in caplog.text  # for {"id": 0}
+    assert "list" in caplog.text  # for {"id": []}
+    assert "bool" in caplog.text  # for {"id": false}
+
+
+def test_load_plugins_escapes_dotted_id_in_routes_module_name(tmp_path, reset_plugin_state):
+    """A plugin with a reverse-DNS id like `com.example.foo` must
+    have its routes module registered under a `.`-free name, or
+    Python would treat the cache key as a dotted package path and
+    set `__package__` to an unintended parent (relative imports in
+    routes.py would then resolve against something else entirely).
+    The same `.` -> `_2e_` encoding used by load_sibling now
+    applies to routes too. Copilot review on PR #105 round 2."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "rdns_routes"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "com.example.foo", "name": "rdns", "routes": "routes.py"})
+    )
+    (plugin_dir / "routes.py").write_text(
+        "def setup(app, ctx):\n    app.state.routes_loaded = True\n"
+    )
+    fake_app = type("FakeApp", (), {})()
+    fake_app.state = type("State", (), {})()
+    _run_load_plugins(plugins, fake_app, tmp_path)
+    assert fake_app.state.routes_loaded is True
+    # Routes module is registered under the escaped name and is a
+    # single identifier-shaped key — NOT a dotted path that Python
+    # would try to resolve as a real package.
+    assert "plugin_com_2e_example_2e_foo_routes" in sys.modules
+    routes_mod = sys.modules["plugin_com_2e_example_2e_foo_routes"]
+    # __package__ is empty (top-level module), not a dotted parent.
+    assert (routes_mod.__package__ or "") == ""
+
+
+def test_load_sibling_parent_registration_is_atomic(tmp_path, reset_plugin_state):
+    """Two threads loading DIFFERENT siblings for the same plugin
+    must agree on the synthetic parent. If they each constructed a
+    fresh ModuleType and assigned to sys.modules[parent_name]
+    without coordination, the second assignment could replace the
+    first — and child attributes already attached to the
+    first parent would disappear, breaking `from . import sibling`.
+    setdefault makes the registration atomic. Copilot round 2."""
+    import threading
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "atomic")
+    # Two slow siblings so the threads have time to overlap.
+    (plugin_dir / "alpha.py").write_text("import time\ntime.sleep(0.05)\nVALUE = 'a'\n")
+    (plugin_dir / "beta.py").write_text("import time\ntime.sleep(0.05)\nVALUE = 'b'\n")
+    errors: list = []
+
+    def worker(name):
+        try:
+            plugins._load_plugin_sibling("atomic", plugin_dir, name)
+        except BaseException as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=worker, args=("alpha",)),
+        threading.Thread(target=worker, args=("beta",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    parent = sys.modules["plugin_atomic"]
+    # Both children are exposed as attributes on the SAME parent —
+    # neither was lost to a parent-replacement race.
+    assert hasattr(parent, "alpha")
+    assert hasattr(parent, "beta")
+    assert parent.alpha.VALUE == "a"
+    assert parent.beta.VALUE == "b"
+
+
+def test_load_sibling_concurrent_first_call_returns_fully_initialized(tmp_path, reset_plugin_state):
+    """Two threads racing on the same first-time load_sibling call
+    should both receive a fully-initialized module object — neither
+    can observe the half-built module that's briefly registered in
+    sys.modules between `module_from_spec` and the end of
+    `exec_module`. The per-module lock added in round 8 enforces
+    this."""
+    import threading
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "racy")
+    # The sibling's __init__ does meaningful work BEFORE setting
+    # `READY = True`, so a partially-initialized module would lack
+    # the attribute even though the module object exists in
+    # sys.modules.
+    (plugin_dir / "slow.py").write_text(
+        "import time\n"
+        "time.sleep(0.05)\n"
+        "READY = True\n"
+        "VALUE = 'done'\n"
+    )
+    results: list = []
+    errors: list = []
+
+    def worker():
+        try:
+            mod = plugins._load_plugin_sibling("racy", plugin_dir, "slow")
+            results.append((mod, getattr(mod, "READY", None), getattr(mod, "VALUE", None)))
+        except BaseException as e:  # pragma: no cover - bug path
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert len(results) == 8
+    # Every caller sees the same fully-initialized module.
+    first_mod, _, _ = results[0]
+    for mod, ready, value in results:
+        assert mod is first_mod
+        assert ready is True
+        assert value == "done"
+
+
+def test_load_sibling_does_not_reuse_other_plugins_bare_import(tmp_path, reset_plugin_state):
+    """If sys.path has already cached a util.py from PLUGIN A under
+    the bare name `util`, plugin B's load_sibling('util') must NOT
+    return plugin A's module — it has to load plugin B's own copy
+    under the namespaced key. This is the whole point of the
+    isolation fix; the reuse path can't accidentally undo it."""
+    plugins = reset_plugin_state
+    plugin_a = _make_plugin(tmp_path, "plug_a")
+    plugin_b = _make_plugin(tmp_path, "plug_b")
+    (plugin_a / "util.py").write_text("OWNER = 'a'\n")
+    (plugin_b / "util.py").write_text("OWNER = 'b'\n")
+    # Simulate plugin A's bare import landing in sys.modules['util'].
+    spec_a = importlib.util.spec_from_file_location("util", str(plugin_a / "util.py"))
+    bare_a = importlib.util.module_from_spec(spec_a)
+    sys.modules["util"] = bare_a
+    spec_a.loader.exec_module(bare_a)
+    assert bare_a.OWNER == "a"
+    # Plugin B's load_sibling must give plugin B's util, NOT plugin A's.
+    b_util = plugins._load_plugin_sibling("plug_b", plugin_b, "util")
+    assert b_util is not bare_a
+    assert b_util.OWNER == "b"
+
+
+def test_load_sibling_loads_package_form(tmp_path, reset_plugin_state):
+    """A plugin shipping a sibling as a package directory
+    (`extractor/__init__.py`) should be loadable through
+    load_sibling exactly like a single-file `.py` sibling. The
+    collision-warning scanner directs maintainers of package-form
+    plugins toward load_sibling, so the helper has to actually
+    support them. Codex review on PR for slopsmith#33."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "pkgplugin")
+    pkg_dir = plugin_dir / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("ROOT_VALUE = 7\n")
+    (pkg_dir / "child.py").write_text("CHILD_VALUE = 8\n")
+    extractor = plugins._load_plugin_sibling("pkgplugin", plugin_dir, "extractor")
+    assert extractor.ROOT_VALUE == 7
+    # Submodule lookup works because spec carried submodule_search_locations.
+    child = importlib.import_module("plugin_pkgplugin.extractor.child")
+    assert child.CHILD_VALUE == 8
+
+
+def test_load_sibling_prefers_package_over_file_when_both_exist(tmp_path, reset_plugin_state):
+    """If a plugin ships BOTH `extractor.py` and `extractor/__init__.py`
+    in the same directory, the package form wins — matches CPython's
+    own import-resolution precedence so bare `import extractor` and
+    `load_sibling('extractor')` always run the same code path.
+    Spotted by codex review on PR for slopsmith#33."""
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "both")
+    (plugin_dir / "extractor.py").write_text("FROM = 'file'\n")
+    pkg_dir = plugin_dir / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("FROM = 'package'\n")
+    extractor = plugins._load_plugin_sibling("both", plugin_dir, "extractor")
+    assert extractor.FROM == "package"
+
+
+def test_load_sibling_missing_in_both_forms_raises_with_useful_message(tmp_path, reset_plugin_state):
+    plugins = reset_plugin_state
+    plugin_dir = _make_plugin(tmp_path, "empty")
+    with pytest.raises(ImportError) as exc:
+        plugins._load_plugin_sibling("empty", plugin_dir, "missing")
+    msg = str(exc.value)
+    # Error message should mention BOTH probed locations so a
+    # confused author sees "I checked here AND here" not "I checked
+    # only the .py form".
+    assert "missing.py" in msg
+    assert "missing" in msg and "__init__.py" in msg
+
+
+def test_load_sibling_disambiguates_underscored_ids_and_names(tmp_path, reset_plugin_state):
+    """`(plugin_id='a_b', name='c')` and `(plugin_id='a', name='b_c')`
+    must NOT collide in sys.modules. The `.` separator + bijective
+    `_` -> `_5f_` encoding of plugin_id make the cache key
+    unambiguous (the old `_` separator collapsed both to
+    `plugin_a_b_c`). Codex review on PR for slopsmith#33."""
+    plugins = reset_plugin_state
+    p1 = _make_plugin(tmp_path, "a_b", sibling_files={"c": "WHO = 'a_b/c'\n"})
+    p2 = _make_plugin(tmp_path, "a", sibling_files={"b_c": "WHO = 'a/b_c'\n"})
+    m1 = plugins._load_plugin_sibling("a_b", p1, "c")
+    m2 = plugins._load_plugin_sibling("a", p2, "b_c")
+    assert m1 is not m2
+    assert m1.WHO == "a_b/c"
+    assert m2.WHO == "a/b_c"
+    # Both keys exist independently in sys.modules. plugin_id `a_b`
+    # encodes to `a_5f_b` so the parent is `plugin_a_5f_b`. The
+    # NAME portion is not encoded (it's only the plugin_id that
+    # could be confused with the `.` separator). So:
+    #   id='a_b', name='c'   -> plugin_a_5f_b.c
+    #   id='a',   name='b_c' -> plugin_a.b_c
+    # The old `_` separator collapsed both to `plugin_a_b_c`.
+    assert "plugin_a_5f_b.c" in sys.modules
+    assert "plugin_a.b_c" in sys.modules
+    assert sys.modules["plugin_a_5f_b.c"] is m1
+    assert sys.modules["plugin_a.b_c"] is m2
+
+
+def test_collision_warning_detects_package_form(tmp_path, reset_plugin_state, caplog):
+    """A plugin shipping `extractor/__init__.py` collides with another
+    plugin's `extractor.py` the same way two `.py` files would. The
+    scanner picks up packages too. Codex review on PR for slopsmith#33."""
+    plugins = reset_plugin_state
+    # Plugin one: extractor.py
+    _make_plugin(tmp_path, "as_module", sibling_files={"extractor": "X = 1\n"})
+    # Plugin two: extractor/ (package form)
+    plugin_pkg = _make_plugin(tmp_path, "as_package")
+    pkg_dir = plugin_pkg / "extractor"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("Y = 2\n")
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" in caplog.text
+    assert "extractor" in caplog.text
+    assert "as_module" in caplog.text
+    assert "as_package" in caplog.text
+    # The mixed-form label should also appear so the maintainer knows
+    # to look for both shapes.
+    assert "module/package" in caplog.text
+
+
+def test_collision_warning_detects_two_packages(tmp_path, reset_plugin_state, caplog):
+    """Two plugins each shipping the SAME package directory form."""
+    plugins = reset_plugin_state
+    for pid in ("plug_a", "plug_b"):
+        plugin_dir = _make_plugin(tmp_path, pid)
+        pkg = plugin_dir / "shared_pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(f"# {pid}\n")
+    with capture_logger(caplog, "slopsmith.plugins"):
+        _run_load_plugins(plugins, type("FakeApp", (), {})(), tmp_path)
+    assert "Module-name collision" in caplog.text
+    assert "shared_pkg" in caplog.text
+    assert "plug_a" in caplog.text
+    assert "plug_b" in caplog.text
+
+
+def test_per_plugin_context_does_not_leak_load_sibling_across_plugins(tmp_path, reset_plugin_state):
+    """Plugin A's `load_sibling` must close over plugin A's id+dir.
+    If both plugins received the SAME closure (the bug we are
+    preventing), plugin A calling `load_sibling('thing')` would
+    load whatever the loop's last-iteration closure pointed at —
+    typically the alphabetically-last plugin's directory."""
+    plugins = reset_plugin_state
+    _make_plugin(
+        tmp_path, "aaa",
+        sibling_files={"thing": "ORIGIN = 'aaa'\n"},
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    app.state.aaa_origin = ctx['load_sibling']('thing').ORIGIN\n"
+        ),
+    )
+    _make_plugin(
+        tmp_path, "zzz",
+        sibling_files={"thing": "ORIGIN = 'zzz'\n"},
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    app.state.zzz_origin = ctx['load_sibling']('thing').ORIGIN\n"
+        ),
+    )
+    fake_app = type("FakeApp", (), {})()
+    fake_app.state = type("State", (), {})()
+    _run_load_plugins(plugins, fake_app, tmp_path)
+    assert fake_app.state.aaa_origin == "aaa"
+    assert fake_app.state.zzz_origin == "zzz"
+
+
+# ── SLOPSMITH_PLUGINS_DIR precedence over bundled in-tree plugins ────────────
+
+def test_slopsmith_plugins_dir_takes_precedence_over_bundled(
+    tmp_path, reset_plugin_state, monkeypatch, caplog
+):
+    """SLOPSMITH_PLUGINS_DIR is scanned before the in-tree PLUGINS_DIR, so a
+    user-installed plugin with the same id shadows the bundled copy.
+
+    This is the mechanism that keeps existing standalone highway_3d installs
+    working unchanged after the plugin was bundled into core (PR 1 of 4,
+    slopsmith#160). A regression here would silently break their setup.
+    """
+    plugins = reset_plugin_state
+
+    # Simulate the in-tree (bundled) plugins directory.
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    _make_plugin(
+        bundled_dir, "highway_3d",
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    app.state.origin = 'bundled'\n"
+        ),
+    )
+    # Mark the in-tree plugin as bundled — required for override detection.
+    (bundled_dir / "highway_3d" / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "highway_3d", "routes": "routes.py", "bundled": True})
+    )
+
+    # Simulate a user-installed plugins directory (SLOPSMITH_PLUGINS_DIR).
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    _make_plugin(
+        user_dir, "highway_3d",
+        routes_body=(
+            "def setup(app, ctx):\n"
+            "    app.state.origin = 'user'\n"
+        ),
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    fake_app.state = type("State", (), {})()
+
+    # Use bundled_dir as the in-tree PLUGINS_DIR root.
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    # User copy must win — setup() from user_dir ran, not bundled_dir.
+    assert fake_app.state.origin == "user"
+    # Exactly one highway_3d entry registered.
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+    # The loader emits the bundled-override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_user_copy_logs_warning_and_sets_flag(
+    tmp_path, reset_plugin_state, monkeypatch, caplog
+):
+    """When a user-installed copy shadows a manifest-bundled plugin the loader
+    emits the specific override warning and stamps ``__overrides_bundled`` on the
+    kept (user) copy so the frontend can render the amber badge.
+    """
+    plugins = reset_plugin_state
+
+    # In-tree bundled plugin — plugin.json carries ``"bundled": true``.
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    plugin_dir = bundled_dir / "highway_3d"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # User-installed copy with the same id in a differently-named directory
+    # (confirms the override is keyed on manifest id, not directory name).
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    user_plugin_dir = user_dir / "3dhighway"  # different directory name
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (user)"})
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    # Exactly one entry registered.
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The kept copy must be the user copy (user dir scanned first).
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # The override flag must be stamped on the kept (user) copy.
+    assert kept.get("overrides_bundled") is True
+
+    # The bundled field must be False for the user copy.
+    assert kept.get("bundled") is False
+
+    # The loader must emit the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_verbatim_copy_sets_flag(
+    tmp_path, reset_plugin_state, monkeypatch, caplog
+):
+    """A user who copies the in-tree bundled plugin verbatim (keeping
+    ``"bundled": true`` in their copy) still triggers the override warning
+    and gets ``overrides_bundled=True`` + ``bundled=False`` on the kept entry.
+
+    The user copy lives in ``SLOPSMITH_PLUGINS_DIR`` (not in-tree PLUGINS_DIR),
+    so the three-part ``_is_bundled()`` check — ``(in-tree directory) AND
+    manifest.get("bundled") AND (dir name == plugin id)`` — correctly
+    identifies the in-tree copy as the real bundled plugin and the user copy
+    as the override, even though the user copy also carries the
+    ``"bundled": true`` manifest field.
+    """
+    plugins = reset_plugin_state
+
+    # In-tree bundled plugin.
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    plugin_dir = bundled_dir / "highway_3d"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # User copy that was copied verbatim from in-tree — still carries bundled=true.
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    user_plugin_dir = user_dir / "highway_3d_custom"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (custom)", "bundled": True})
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    # Exactly one entry registered.
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The kept copy is the user copy (user dir scanned first).
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # The override flag must be set even though the user copy also has bundled=true.
+    assert kept.get("overrides_bundled") is True
+
+    # bundled must be False — the kept copy is a user override, not a real
+    # in-tree bundled plugin, regardless of what its manifest claims.
+    assert kept.get("bundled") is False
+
+    # The loader emits the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_copy_in_same_plugins_dir(
+    tmp_path, reset_plugin_state, caplog
+):
+    """A user who clones an override directly into ``plugins/`` (the documented
+    third-party install location) still gets the override warning and
+    ``overrides_bundled=True``.
+
+    Both plugins live under the same PLUGINS_DIR, so override detection cannot
+    use the directory parent alone. The three-part ``_is_bundled()`` check —
+    ``(in-tree dir) AND manifest.get("bundled") AND (dir name == plugin id)`` —
+    identifies the bundled copy, and the user copy (no ``"bundled"`` field, or
+    a different directory name) as the override.
+
+    Layout mirroring the canonical example from the PR description:
+      plugins/3dhighway/   ← user-installed fork (no "bundled" field)
+      plugins/highway_3d/  ← bundled core (has "bundled": true, dir name == id)
+
+    ``3dhighway`` sorts before ``highway_3d`` alphabetically and is kept;
+    ``highway_3d`` is the duplicate that should fire the override warning.
+    """
+    plugins = reset_plugin_state
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+
+    # User-installed fork — comes first alphabetically, will be kept.
+    user_plugin_dir = plugins_dir / "3dhighway"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (user fork)"})
+    )
+
+    # Bundled core — sorts after "3dhighway", will be the duplicate.
+    bundled_plugin_dir = plugins_dir / "highway_3d"
+    bundled_plugin_dir.mkdir()
+    (bundled_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = plugins_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The kept copy must be the user fork (alphabetically first).
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # Override flag and bundled=False on the kept user copy.
+    assert kept.get("overrides_bundled") is True
+    assert kept.get("bundled") is False
+
+    # The loader emits the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_copy_in_same_plugins_dir_bundled_sorts_first(
+    tmp_path, reset_plugin_state, caplog
+):
+    """Override detection works even when the bundled directory sorts *before*
+    the user directory (i.e., the bundled copy is encountered first).
+
+    The user copy must still win regardless of alphabetical sort order.
+
+    Layout where bundled sorts before user:
+      plugins/highway_3d/   ← bundled core (has "bundled": true), sorts first
+      plugins/zzz-highway/  ← user-installed fork (no "bundled" field), sorts last
+    """
+    plugins = reset_plugin_state
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+
+    # Bundled core — sorts first alphabetically.
+    bundled_plugin_dir = plugins_dir / "highway_3d"
+    bundled_plugin_dir.mkdir()
+    (bundled_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # User-installed fork — sorts after "highway_3d", will be encountered second.
+    user_plugin_dir = plugins_dir / "zzz-highway"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (user fork)"})
+    )
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = plugins_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The user copy must win even though the bundled copy sorted first.
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # Override flag and bundled=False on the kept user copy.
+    assert kept.get("overrides_bundled") is True
+    assert kept.get("bundled") is False
+
+    # The loader emits the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_verbatim_copy_in_same_plugins_dir(
+    tmp_path, reset_plugin_state, caplog
+):
+    """A user who copies the bundled plugin *verbatim* (keeping ``"bundled": true``)
+    into ``plugins/`` under a **different directory name** is still correctly
+    identified as a user override, not a second bundled copy.
+
+    The three-part ``_is_bundled()`` check — in-tree directory, manifest field,
+    AND directory-name-matches-plugin-id — is what distinguishes the real core
+    copy from this verbatim clone.
+
+    Layout:
+      plugins/highway_3d/   ← bundled core (has "bundled": true, dir name == id)
+      plugins/zzz-highway/  ← verbatim user copy (has "bundled": true, dir name ≠ id)
+
+    ``highway_3d`` sorts before ``zzz-highway``; the bundled copy is encountered
+    first. When the user copy arrives it matches ``kept_is_bundled`` → the user
+    copy evicts the bundled one and is registered as the active plugin.
+    """
+    plugins = reset_plugin_state
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+
+    # Bundled core — dir name == plugin id, has "bundled": true.
+    bundled_plugin_dir = plugins_dir / "highway_3d"
+    bundled_plugin_dir.mkdir()
+    (bundled_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # Verbatim user copy — different dir name, but manifest is identical (including "bundled": true).
+    user_plugin_dir = plugins_dir / "zzz-highway"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = plugins_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The user copy (zzz-highway) must win even though it also carries "bundled": true.
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # override flag set; bundled must be False (dir name "zzz-highway" ≠ "highway_3d").
+    assert kept.get("overrides_bundled") is True
+    assert kept.get("bundled") is False
+
+    # Override warning must be emitted.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_flag_requires_both_in_tree_directory_and_manifest_field(
+    tmp_path, reset_plugin_state, monkeypatch
+):
+    """``bundled`` requires ALL THREE: in-tree PLUGINS_DIR location, the
+    manifest's ``"bundled": true`` field, AND the directory name matching the
+    plugin id.
+
+    - In-tree plugin, dir name == id, ``"bundled": true`` → ``bundled: true``.
+    - In-tree plugin, dir name == id, no ``"bundled"`` field → ``bundled: false``
+      (user-installed plugin cloned into plugins/).
+    - In-tree plugin, dir name ≠ id, ``"bundled": true`` → ``bundled: false``
+      (verbatim user copy under a different folder name).
+    - User-dir plugin, ``"bundled": true`` → ``bundled: false``
+      (not in-tree; manifest field alone is not sufficient).
+
+    This ensures a user-installed plugin cannot forge core status by adding
+    ``"bundled": true`` to its own plugin.json, while correctly identifying
+    legitimate in-tree bundled plugins.
+    """
+    plugins = reset_plugin_state
+
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    # In-tree plugin WITH "bundled": true AND dir name == id — the real bundled core plugin.
+    (bundled_dir / "real_core").mkdir()
+    (bundled_dir / "real_core" / "plugin.json").write_text(
+        json.dumps({"id": "real_core", "name": "Real Core Plugin", "bundled": True})
+    )
+    # In-tree plugin WITHOUT "bundled" field — a user plugin cloned into plugins/.
+    (bundled_dir / "user_in_tree").mkdir()
+    (bundled_dir / "user_in_tree" / "plugin.json").write_text(
+        json.dumps({"id": "user_in_tree", "name": "User Plugin (in plugins/)"})
+    )
+    # In-tree plugin WITH "bundled": true but dir name ≠ id — verbatim user copy
+    # of a bundled plugin placed under a different folder name.
+    (bundled_dir / "other_name").mkdir()
+    (bundled_dir / "other_name" / "plugin.json").write_text(
+        json.dumps({"id": "real_core_copy", "name": "Verbatim Copy", "bundled": True})
+    )
+
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    # User plugin in SLOPSMITH_PLUGINS_DIR that forges "bundled": true.
+    (user_dir / "fake_bundled").mkdir()
+    (user_dir / "fake_bundled" / "plugin.json").write_text(
+        json.dumps({"id": "fake_bundled", "name": "Fake Bundled", "bundled": True})
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    by_id = {p["id"]: p for p in plugins.LOADED_PLUGINS}
+
+    # In-tree plugin with "bundled": true AND dir name == id → bundled=True.
+    assert by_id["real_core"]["bundled"] is True
+    assert by_id["real_core"]["overrides_bundled"] is False
+
+    # In-tree plugin without "bundled" field → bundled=False (user clone in plugins/).
+    assert by_id["user_in_tree"]["bundled"] is False
+    assert by_id["user_in_tree"]["overrides_bundled"] is False
+
+    # In-tree plugin with "bundled": true but dir name ≠ id → bundled=False.
+    # (verbatim copy under a different folder; dir name "other_name" ≠ id "real_core_copy")
+    assert by_id["real_core_copy"]["bundled"] is False
+    assert by_id["real_core_copy"]["overrides_bundled"] is False
+
+    # Plugin from user dir with "bundled": true → bundled=False (manifest field alone insufficient).
+    assert by_id["fake_bundled"]["bundled"] is False
+    assert by_id["fake_bundled"]["overrides_bundled"] is False
+
+
+
+def test_bundled_and_overrides_bundled_returned_by_api(tmp_path, reset_plugin_state):
+    """GET /api/plugins must include ``bundled`` and ``overrides_bundled``
+    boolean fields for each plugin.
+
+    - A plugin loaded from a manifest with ``"bundled": true`` must surface
+      ``bundled: true, overrides_bundled: false``.
+    - A user copy that shadows a bundled plugin must surface
+      ``bundled: false, overrides_bundled: true``.
+    - A plain user plugin with no bundled interaction must surface
+      ``bundled: false, overrides_bundled: false``.
+    """
+    plugins_mod = reset_plugin_state
+
+    plugin_dir = tmp_path / "dummy"
+    plugin_dir.mkdir()
+
+    # Bundled plugin entry.
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "core_viz",
+        "name": "Core Viz",
+        "nav": None,
+        "type": None,
+        "bundled": True,
+        "overrides_bundled": False,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {},
+    })
+
+    # User copy overriding a bundled plugin.
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "highway_3d",
+        "name": "3D Highway (user)",
+        "nav": None,
+        "type": None,
+        "bundled": False,
+        "overrides_bundled": True,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {},
+    })
+
+    # Plain user plugin.
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "my_plugin",
+        "name": "My Plugin",
+        "nav": None,
+        "type": None,
+        "bundled": False,
+        "overrides_bundled": False,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {},
+    })
+
+    client = _make_api_client(plugins_mod)
+    try:
+        r = client.get("/api/plugins")
+        assert r.status_code == 200
+        ids = {p["id"]: p for p in r.json()}
+
+        assert ids["core_viz"]["bundled"] is True
+        assert ids["core_viz"]["overrides_bundled"] is False
+
+        assert ids["highway_3d"]["bundled"] is False
+        assert ids["highway_3d"]["overrides_bundled"] is True
+
+        assert ids["my_plugin"]["bundled"] is False
+        assert ids["my_plugin"]["overrides_bundled"] is False
+    finally:
+        client.close()
+
+
+# ── progress_cb tests ─────────────────────────────────────────────────────────
+
+def _run_load_plugins_with_cb(plugins, app, tmp_path, progress_cb, context=None):
+    """Like _run_load_plugins but passes a progress_cb spy."""
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = tmp_path
+    try:
+        plugins.load_plugins(app, context if context is not None else {}, progress_cb=progress_cb)
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+
+def test_progress_cb_receives_phases_and_counts(tmp_path, reset_plugin_state):
+    """progress_cb spy should receive structured events including
+    plugins-discovered, plugins-complete, loaded/total counters, and
+    the complete event should have loaded == total == number of plugins."""
+    plugins = reset_plugin_state
+    _make_plugin(tmp_path, "alpha")
+    _make_plugin(tmp_path, "beta")
+
+    events = []
+    _run_load_plugins_with_cb(plugins, type("FakeApp", (), {})(), tmp_path, events.append)
+
+    phases = [e["phase"] for e in events]
+    assert "plugins-discovered" in phases
+    assert "plugins-complete" in phases
+    # All events carry int counters.
+    for e in events:
+        assert isinstance(e["loaded"], int), f"loaded not int in {e}"
+        assert isinstance(e["total"], int), f"total not int in {e}"
+    # The complete event has loaded == total == 2.
+    complete = next(e for e in events if e["phase"] == "plugins-complete")
+    assert complete["loaded"] == 2
+    assert complete["total"] == 2
+
+
+def test_progress_cb_errors_do_not_break_plugin_startup(tmp_path, reset_plugin_state):
+    """A progress_cb that raises must not abort plugin loading — the
+    _emit_progress guard must swallow the exception."""
+    plugins = reset_plugin_state
+    _make_plugin(tmp_path, "safe")
+
+    def bad_cb(event):
+        raise RuntimeError("spy exploded")
+
+    _run_load_plugins_with_cb(plugins, type("FakeApp", (), {})(), tmp_path, bad_cb)
+
+    # Plugin still registered despite cb explosion.
+    assert any(p["id"] == "safe" for p in plugins.LOADED_PLUGINS)
+
+
+def test_progress_cb_emits_plugin_error_on_requirements_failure(tmp_path, reset_plugin_state, monkeypatch):
+    """When _install_requirements returns False, a plugin-error event
+    with a non-empty error field must be emitted via progress_cb, and
+    plugin loading must still continue (non-fatal)."""
+    plugins = reset_plugin_state
+    _make_plugin(tmp_path, "req_fail")
+    # Force _install_requirements to report failure without actually running pip.
+    monkeypatch.setattr(plugins, "_install_requirements", lambda *a, **kw: False)
+
+    events = []
+    _run_load_plugins_with_cb(plugins, type("FakeApp", (), {})(), tmp_path, events.append)
+
+    error_events = [e for e in events if e["phase"] == "plugin-error" and e.get("plugin_id") == "req_fail"]
+    assert error_events, "Expected at least one plugin-error event for req_fail"
+    assert all(e["error"] for e in error_events), "plugin-error events must carry a non-empty error field"
+    # Loading continued: req_fail is still registered.
+    assert any(p["id"] == "req_fail" for p in plugins.LOADED_PLUGINS)
+
+
+# ── Tour API tests ─────────────────────────────────────────────────────────────
+
+def _make_tour_plugin(plugin_root, plugin_id, *, tour_file_name="tour.json", tour_content=None):
+    """Create a minimal plugin directory with a tour field in plugin.json."""
+    plugin_dir = plugin_root / plugin_id
+    plugin_dir.mkdir(parents=True)
+    manifest = {"id": plugin_id, "name": plugin_id, "tour": tour_file_name}
+    (plugin_dir / "plugin.json").write_text(json.dumps(manifest))
+    if tour_content is not None:
+        (plugin_dir / tour_file_name).write_text(json.dumps(tour_content))
+    return plugin_dir
+
+
+def _make_api_client(plugins):
+    """Register the plugin API on a fresh FastAPI app and return a TestClient."""
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    return TestClient(app)
+
+
+@pytest.fixture()
+def tour_client(tmp_path, reset_plugin_state):
+    """A TestClient with two plugins: one with a tour, one without."""
+    plugins = reset_plugin_state
+
+    # Plugin with tour
+    tour_content = {"tour": [{"id": "step1", "title": "Hello", "content": "World"}]}
+    plugin_dir = _make_tour_plugin(tmp_path, "with_tour", tour_content=tour_content)
+
+    # Plugin without tour
+    no_tour_dir = tmp_path / "no_tour"
+    no_tour_dir.mkdir()
+    (no_tour_dir / "plugin.json").write_text(json.dumps({"id": "no_tour", "name": "No Tour"}))
+
+    # Stub LOADED_PLUGINS with both plugins
+    plugins.LOADED_PLUGINS.append({
+        "id": "with_tour",
+        "name": "With Tour",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": True,
+        "_dir": plugin_dir,
+        "_manifest": {"tour": "tour.json"},
+    })
+    plugins.LOADED_PLUGINS.append({
+        "id": "no_tour",
+        "name": "No Tour",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": no_tour_dir,
+        "_manifest": {},
+    })
+
+    client = _make_api_client(plugins)
+    try:
+        yield client, plugin_dir
+    finally:
+        client.close()
+
+
+def test_list_plugins_includes_has_tour(tour_client):
+    """GET /api/plugins must include a has_tour boolean for each plugin."""
+    client, _ = tour_client
+    r = client.get("/api/plugins")
+    assert r.status_code == 200
+    plugins_list = r.json()
+    ids = {p["id"]: p for p in plugins_list}
+    assert "has_tour" in ids["with_tour"]
+    assert ids["with_tour"]["has_tour"] is True
+    assert "has_tour" in ids["no_tour"]
+    assert ids["no_tour"]["has_tour"] is False
+
+
+def test_list_plugins_version_field(tmp_path, reset_plugin_state):
+    """GET /api/plugins must include a `version` field for each plugin.
+
+    A plugin that declares ``version`` in its manifest must surface it;
+    a plugin that omits the field must return ``None`` (not raise).
+    """
+    plugins_mod = reset_plugin_state
+
+    versioned_dir = tmp_path / "versioned"
+    versioned_dir.mkdir()
+    (versioned_dir / "plugin.json").write_text(
+        json.dumps({"id": "versioned", "name": "Versioned", "version": "1.2.3"})
+    )
+
+    unversioned_dir = tmp_path / "unversioned"
+    unversioned_dir.mkdir()
+    (unversioned_dir / "plugin.json").write_text(
+        json.dumps({"id": "unversioned", "name": "Unversioned"})
+    )
+
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "versioned",
+        "name": "Versioned",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": versioned_dir,
+        "_manifest": {"version": "1.2.3"},
+    })
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "unversioned",
+        "name": "Unversioned",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": unversioned_dir,
+        "_manifest": {},
+    })
+
+    client = _make_api_client(plugins_mod)
+    try:
+        r = client.get("/api/plugins")
+        assert r.status_code == 200
+        plugins_list = r.json()
+        ids = {p["id"]: p for p in plugins_list}
+        assert "version" in ids["versioned"], "version key must be present"
+        assert ids["versioned"]["version"] == "1.2.3"
+        assert "version" in ids["unversioned"], "version key must be present even when absent from manifest"
+        assert ids["unversioned"]["version"] is None
+    finally:
+        client.close()
+
+
+def test_tour_json_serves_file(tour_client):
+    """GET /api/plugins/{id}/tour.json returns file content as JSON for a plugin with a tour."""
+    client, _ = tour_client
+    r = client.get("/api/plugins/with_tour/tour.json")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+    assert "tour" in data
+    assert data["tour"][0]["id"] == "step1"
+
+
+def test_tour_json_returns_404_for_missing_plugin(tour_client):
+    """GET /api/plugins/{id}/tour.json returns 404 JSON for an unknown plugin."""
+    client, _ = tour_client
+    r = client.get("/api/plugins/nonexistent/tour.json")
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_tour_json_returns_404_for_plugin_without_tour(tour_client):
+    """GET /api/plugins/{id}/tour.json returns 404 for a plugin with no tour manifest entry."""
+    client, _ = tour_client
+    r = client.get("/api/plugins/no_tour/tour.json")
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_tour_json_rejects_path_traversal(tmp_path, reset_plugin_state):
+    """tour field with `../` path traversal must be rejected (returns 404)."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "evil_plugin"
+    plugin_dir.mkdir()
+    # Write a 'secret' file outside the plugin dir that the traversal targets
+    (tmp_path / "secret.json").write_text(json.dumps({"secret": "data"}))
+    plugins.LOADED_PLUGINS.append({
+        "id": "evil_plugin",
+        "name": "Evil Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": True,
+        "_dir": plugin_dir,
+        "_manifest": {"tour": "../secret.json"},
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        r = client.get("/api/plugins/evil_plugin/tour.json")
+        assert r.status_code == 404
+    finally:
+        client.close()
+
+
+def test_tour_json_handles_non_string_tour_manifest(tmp_path, reset_plugin_state):
+    """A plugin whose `tour` manifest field is truthy but not a string or dict
+    (e.g. ``true``, ``1``) must return 404 without raising AttributeError."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "bool_tour_plugin"
+    plugin_dir.mkdir()
+    plugins.LOADED_PLUGINS.append({
+        "id": "bool_tour_plugin",
+        "name": "Bool Tour Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,  # _is_valid_tour_manifest(True) → False
+        "_dir": plugin_dir,
+        "_manifest": {"tour": True},  # boolean true in manifest
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        r = client.get("/api/plugins/bool_tour_plugin/tour.json")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+    finally:
+        client.close()
+
+
+def test_tour_json_rejects_directory_path(tmp_path, reset_plugin_state):
+    """A `tour` field of `"."` resolves to the plugin dir itself.  The route
+    must return 404 (not IsADirectoryError) because is_file() gates read_text."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "dot_tour_plugin"
+    plugin_dir.mkdir()
+    plugins.LOADED_PLUGINS.append({
+        "id": "dot_tour_plugin",
+        "name": "Dot Tour Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": True,
+        "_dir": plugin_dir,
+        "_manifest": {"tour": "."},
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        r = client.get("/api/plugins/dot_tour_plugin/tour.json")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+    finally:
+        client.close()
+
+
+def test_tour_json_rejects_null_file_key(tmp_path, reset_plugin_state):
+    """`{"tour": {"file": null}}` has an explicitly invalid `file` value.
+    _is_valid_tour_manifest must reject it (has_tour=False) and the route
+    must return 404 without an AttributeError."""
+    import plugins as _plugins_mod
+    # Directly verify the validation function rejects {"file": None}
+    assert _plugins_mod._is_valid_tour_manifest({"file": None}) is False
+    assert _plugins_mod._is_valid_tour_manifest({"file": ""}) is False
+    assert _plugins_mod._is_valid_tour_manifest({}) is True   # bare dict defaults to tour.json
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "null_file_plugin"
+    plugin_dir.mkdir()
+    plugins.LOADED_PLUGINS.append({
+        "id": "null_file_plugin",
+        "name": "Null File Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,  # _is_valid_tour_manifest({"file": None}) → False
+        "_dir": plugin_dir,
+        "_manifest": {"tour": {"file": None}},
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        # Confirm the listing endpoint reflects has_tour=False for this plugin
+        listing = client.get("/api/plugins").json()
+        p_entry = next(p for p in listing if p["id"] == "null_file_plugin")
+        assert p_entry["has_tour"] is False
+        # Route must also return 404 (defensive: route validates independently)
+        r = client.get("/api/plugins/null_file_plugin/tour.json")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+    finally:
+        client.close()

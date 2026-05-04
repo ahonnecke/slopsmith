@@ -3,10 +3,50 @@
 RsCli's sng2xml only handles instrumental arrangements, so official DLC
 (which ships SNG-only) has no lyrics path. This module decodes the vocals
 SNG directly so lyrics can be served for both official DLC and CDLC.
+
+SNG vocals file format (little-endian unless noted)
+────────────────────────────────────────────────────
+Top-level envelope (what `_decrypt_sng` strips):
+
+    offset  size  field
+    ──────  ────  ──────────────────────────────────────
+     0      4     magic (u32)        # ignored by the decoder
+     4      4     version (u32)      # ignored by the decoder
+     8     16     iv                 # AES-CTR initial counter
+    24     N      encrypted_payload  # AES-CTR ciphertext
+   -56    56     signature footer   # ignored by the decoder
+
+`encrypted_payload`, after AES-CTR decryption with the platform key
+(_PC_KEY or _MAC_KEY), starts with:
+
+    +0   4     uncompressed_size (big-endian u32)
+    +4   ...   zlib stream
+
+Decompressed body for a vocals arrangement:
+
+    +0   16    four u32 zeros (section counts: beats / phrases /
+                  chord_templates / chord_notes — all 0 for vocals)
+    +16   4    vocal_count (u32)
+    +20   N*60 vocal entries
+
+Each 60-byte vocal entry:
+
+    +0    4     time   (float32)
+    +4    4     note   (int32; unused — vocals aren't pitched here)
+    +8    4     length (float32)
+    +12  48     lyric  (utf-8, null-terminated, zero-padded)
+
+A minimal round-trip encoder lives in `tests/test_sng_vocals.py` —
+the test-only inverse is the spec's source of truth when reading
+this alongside the parser.
 """
 
+import logging
 import struct
 import zlib
+from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.sng_vocals")
 
 try:
     from Crypto.Cipher import AES
@@ -47,7 +87,8 @@ def parse_vocals_sng(path: str, platform: str = "pc") -> list[dict]:
         raw = f.read()
     try:
         body = _decrypt_sng(raw, platform)
-    except Exception:
+    except Exception as e:
+        log.debug("sng_vocals: SNG decrypt failed for %s: %s", Path(path).name, e)
         return []
 
     # Vocals SNG layout: four empty u32 section counts (beats/phrases/
