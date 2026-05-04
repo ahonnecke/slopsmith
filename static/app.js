@@ -1742,6 +1742,8 @@ async function loadSettings() {
     // module variable all pick it up consistently. Pass skipPersist
     // so we don't echo the loaded value back to the server.
     setAvOffsetMs(Number(data.av_offset_ms) || 0, /* skipPersist */ true);
+    const psarcPlatformEl = document.getElementById('psarc-platform');
+    if (psarcPlatformEl) psarcPlatformEl.value = data.psarc_platform || 'both';
     // Native folder picker — only present when running inside slopsmith-desktop.
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
@@ -1817,6 +1819,7 @@ async function saveSettings() {
             default_arrangement: document.getElementById('default-arrangement').value,
             demucs_server_url: document.getElementById('demucs-server-url').value.trim(),
             av_offset_ms: _avOffsetMs,
+            psarc_platform: document.getElementById('psarc-platform')?.value || 'both',
         }),
     });
     const data = await resp.json();

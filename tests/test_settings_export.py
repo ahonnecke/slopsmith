@@ -583,6 +583,8 @@ def test_partial_field_uses_relpaths_not_absolute(client, server_mod, tmp_path, 
     ({"demucs_server_url": 42}, "demucs_server_url"),
     ({"default_arrangement": ["Lead"]}, "default_arrangement"),
     ({"dlc_dir": 42}, "dlc_dir"),
+    ({"psarc_platform": "windows"}, "psarc_platform"),
+    ({"psarc_platform": 42}, "psarc_platform"),
 ])
 def test_import_refuses_invalid_server_config(client, tmp_path, bad_cfg, needle):
     """Importer must apply the same per-key type/range gates that
@@ -623,6 +625,28 @@ def test_import_passes_through_unknown_server_config_keys(client, tmp_path):
     assert cfg["future_setting"] == {"nested": True}
     assert cfg["unknown_string"] == "hello"
     assert cfg["master_difficulty"] == 60
+
+
+def test_import_allows_psarc_platform_null(client, tmp_path):
+    """psarc_platform: null passes validation and is written verbatim
+    (import is full-replace, not partial-update). The server treats a
+    null on-disk value the same as 'both' via the .get(..., 'both')
+    fallback in _background_scan."""
+    (tmp_path / "config.json").write_text(json.dumps({"psarc_platform": "pc"}))
+
+    bundle = {
+        "schema": 1,
+        "server_config": {"psarc_platform": None},
+        "plugin_server_configs": {},
+    }
+    r = client.post("/api/settings/import", json=bundle)
+    assert r.status_code == 200, r.json()
+    # Import is full-replace: null is written verbatim; validate the
+    # disk state so a future regression (e.g. null erroneously rejected
+    # or silently dropped) is caught immediately.
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert "psarc_platform" in on_disk
+    assert on_disk["psarc_platform"] is None
 
 
 # ── Export refuses to follow symlinked subdirectories ───────────────────────

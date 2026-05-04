@@ -662,24 +662,26 @@ class MetadataDB:
 meta_db = MetadataDB()
 
 
-def _get_dlc_dir() -> Path | None:
+def _get_dlc_dir(cfg: dict | None = None) -> Path | None:
     # Only consider DLC_DIR if the env var was non-empty. `Path("")` collapses
     # to `.` and reports `.is_dir() == True`, which would silently shadow the
     # config.json fallback. Checking the raw env string preserves
     # `DLC_DIR=.` as a valid opt-in for cwd while keeping unset/empty out.
     if _DLC_DIR_ENV and DLC_DIR.is_dir():
         return DLC_DIR
-    config_file = CONFIG_DIR / "config.json"
-    if config_file.exists():
-        try:
-            cfg = json.loads(config_file.read_text())
-            raw = str(cfg.get("dlc_dir", "")).strip()
-            if raw:
-                p = Path(raw)
-                if p.is_dir():
-                    return p
-        except Exception:
-            pass
+    if cfg is None:
+        config_file = CONFIG_DIR / "config.json"
+        if config_file.exists():
+            try:
+                cfg = json.loads(config_file.read_text())
+            except Exception:
+                pass
+    if isinstance(cfg, dict):
+        raw = str(cfg.get("dlc_dir", "")).strip()
+        if raw:
+            p = Path(raw)
+            if p.is_dir():
+                return p
     return None
 
 
@@ -914,7 +916,10 @@ def _background_scan():
     global _scan_status
     _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "listing"}
 
-    dlc = _get_dlc_dir()
+    # Load config once so both the DLC-dir lookup and the platform filter
+    # read from the same snapshot, avoiding a redundant parse of config.json.
+    _cfg = _load_config(CONFIG_DIR / "config.json") or _default_settings()
+    dlc = _get_dlc_dir(_cfg)
     if not dlc:
         _scan_status = {**_SCAN_STATUS_INIT, "stage": "idle", "error": "DLC folder not configured"}
         log.warning("Scan: no DLC folder configured")
@@ -928,6 +933,14 @@ def _background_scan():
         psarcs = [f for f in sorted(dlc.rglob("*.psarc"))
                   if f.is_file()
                   and "rs1compatibility" not in f.name.lower()]
+        # Filter by platform suffix (_p.psarc = PC, _m.psarc = Mac) when the
+        # user's DLC folder contains both variants of every song (e.g. a shared
+        # Steam library between Windows and Mac).
+        _platform = _cfg.get("psarc_platform", "both")
+        if _platform == "pc":
+            psarcs = [f for f in psarcs if not f.stem.endswith("_m")]
+        elif _platform == "mac":
+            psarcs = [f for f in psarcs if not f.stem.endswith("_p")]
         # Sloppaks: match both file (zip) and directory form by suffix.
         sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
                     if sloppak_mod.is_sloppak(f)]
@@ -1495,7 +1508,10 @@ def _default_settings():
     # the explicit guard we'd surface `"."` to /api/settings — and any
     # partial-update POST would then persist that into config.json,
     # silently undoing the env-var fix on the next load.
-    return {"dlc_dir": str(DLC_DIR) if (_DLC_DIR_ENV and DLC_DIR.is_dir()) else ""}
+    return {
+        "dlc_dir": str(DLC_DIR) if (_DLC_DIR_ENV and DLC_DIR.is_dir()) else "",
+        "psarc_platform": "both",
+    }
 
 
 def _load_config(config_file):
@@ -1605,6 +1621,16 @@ def save_settings(data: dict):
         except (TypeError, ValueError, OverflowError):
             return {"error": "av_offset_ms must be a number between -1000 and 1000"}
 
+    if "psarc_platform" in data:
+        raw = data["psarc_platform"]
+        # null is a no-op (preserves on-disk value), matching the
+        # dlc_dir / default_arrangement contract. Non-string and
+        # out-of-range strings are rejected with a structured error.
+        if raw is not None:
+            if not isinstance(raw, str) or raw not in ("both", "pc", "mac"):
+                return {"error": "psarc_platform must be 'both', 'pc', or 'mac'"}
+            cfg["psarc_platform"] = raw
+
     config_file.write_text(json.dumps(cfg, indent=2))
     return {"message": ". ".join(messages) if messages else "Settings saved"}
 
@@ -1672,6 +1698,10 @@ def _validate_server_config_types(cfg: dict) -> str | None:
             return "server_config.av_offset_ms must be a number between -1000 and 1000"
         if not (-1000 <= v <= 1000):
             return "server_config.av_offset_ms must be between -1000 and 1000"
+    if "psarc_platform" in cfg:
+        v = cfg["psarc_platform"]
+        if v is not None and v not in ("both", "pc", "mac"):
+            return "server_config.psarc_platform must be 'both', 'pc', or 'mac'"
     return None
 
 
