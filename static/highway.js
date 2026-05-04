@@ -2652,15 +2652,19 @@ function createHighway() {
             };
         },
 
-        setTime(t) { chartTime = t + avOffsetSec; currentTime = chartTime; },
+        // chartTime is the audio-aligned clock — what plugins read via
+        // getTime(). currentTime is the rendering clock and is shifted
+        // forward by avOffsetSec so the highway draws notes at the
+        // user-perceived position. Plugins that need the user-perceived
+        // time (e.g. notedetect's matcher) add getAvOffset()/1000 to
+        // getTime() themselves; the matcher already does this. Earlier
+        // versions of this branch shifted chartTime too, which combined
+        // with the plugin's own +avOffsetSec produced a 2× double-applied
+        // offset and gave the user a systematic early bias on hits.
+        setTime(t) { chartTime = t; currentTime = t + avOffsetSec; },
         setAvOffset(ms) {
-            const prev = avOffsetSec;
             avOffsetSec = (Number(ms) || 0) / 1000;
-            // Shift both clocks by the delta so adjustments take effect
-            // immediately rather than waiting for the next setTime poll.
-            const delta = avOffsetSec - prev;
-            chartTime += delta;
-            currentTime = chartTime;
+            currentTime = chartTime + avOffsetSec;
         },
         getAvOffset() { return avOffsetSec * 1000; },
 
