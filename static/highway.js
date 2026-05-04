@@ -2217,6 +2217,7 @@ function createHighway() {
             // already-destroyed instance.
             _destroyCurrentIfInited();
             ready = false;
+            songInfo = {};
         },
 
         /**
