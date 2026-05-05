@@ -14,11 +14,14 @@ See the format spec in the project's sloppak plan for the full layout.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.sloppak")
 
 import yaml
 
@@ -182,7 +185,8 @@ def load_song(
             continue
         try:
             data = json.loads(arr_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            log.debug("sloppak: failed to parse arrangement %r: %s", rel, e)
             continue
         arr = arrangement_from_wire(data)
         # Manifest-level overrides take precedence over anything embedded in
@@ -220,8 +224,8 @@ def load_song(
         if lyr_path.exists():
             try:
                 song.lyrics = json.loads(lyr_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("sloppak: failed to parse lyrics %r: %s", lyrics_rel, e)
 
     # Stem descriptors — normalized for callers. File paths are resolved but
     # returned as ``file`` relative strings so URL construction stays caller-side.
@@ -284,7 +288,22 @@ def extract_meta(path: Path) -> dict:
     tuning_offsets = _tuning_for_meta(arr_list)
 
     stems_list = manifest.get("stems", []) or []
-    stem_count = sum(1 for s in stems_list if isinstance(s, dict) and s.get("id"))
+    stem_ids: list[str] = []
+    for s in stems_list:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id")
+        sfile = s.get("file")
+        # Match `load_song()`'s validation: a stem entry needs BOTH a
+        # non-empty id AND a non-empty file to be playable. Indexing a
+        # half-formed entry would advertise a stem that load_song will
+        # later refuse to surface, so the library filter would lie.
+        if (
+            isinstance(sid, str) and sid
+            and isinstance(sfile, str) and sfile
+        ):
+            stem_ids.append(sid)
+    stem_count = len(stem_ids)
 
     return {
         "title": str(manifest.get("title", "")),
@@ -296,4 +315,6 @@ def extract_meta(path: Path) -> dict:
         "arrangements": arrangements,
         "has_lyrics": has_lyrics,
         "stem_count": stem_count,
+        # slopsmith#129: per-stem filter needs the id list, not just count.
+        "stem_ids": stem_ids,
     }
