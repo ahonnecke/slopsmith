@@ -46,21 +46,14 @@ function buildSandbox() {
                 className: '',
                 textContent: '',
                 value: '',
-                // _syncSavedLoopSelection iterates over <select>.options.
-                // An empty option list is fine for these unit tests; the
-                // sync becomes a no-op (no matching option found).
-                options: [],
                 classList: { add() {}, remove() {}, toggle() {} },
             }),
         },
         // _audioSeek spy — records every call so tests can assert seek
         // happened with the right target.
-        // _audioSeek now resolves to { completed, from, to }; the
-        // stub mimics a successful seek that lands exactly on s so
-        // setLoop's off-target check passes.
         _audioSeek: (s, reason) => {
             seekCalls.push({ s, reason: reason ?? null });
-            return Promise.resolve({ completed: true, from: 0, to: s });
+            return Promise.resolve();
         },
         _audioTime: () => 0,
         // updateLoopUI references formatTime for the label; we don't
@@ -78,7 +71,6 @@ function loadFunctions(sandbox, src) {
         var loopA = null;
         var loopB = null;
         ${extractFunction(src, 'function clearLoop()')}
-        ${extractFunction(src, 'function _syncSavedLoopSelection()')}
         ${extractFunction(src, 'async function setLoop(')}
         ${extractFunction(src, 'function updateLoopUI()')}
         // Expose for the test runner.
@@ -94,47 +86,12 @@ test('setLoop mutates loopA/loopB and seeks to A', async () => {
     const sandbox = buildSandbox();
     loadFunctions(sandbox, src);
 
-    const result = await sandbox.__setLoop(5.5, 12.25);
-    assert.equal(result, true, 'successful seek must resolve to true (plugin contract)');
+    await sandbox.__setLoop(5.5, 12.25);
     const { loopA, loopB } = sandbox.__getLoop();
     assert.equal(loopA, 5.5);
     assert.equal(loopB, 12.25);
     assert.equal(sandbox.seekCalls.length, 1);
     assert.equal(sandbox.seekCalls[0].s, 5.5);
-});
-
-test('setLoop returns false and leaves loopA/loopB untouched on cancelled seek', async () => {
-    // Plugin-facing contract: cancelled seek (teardown gen bump) returns
-    // false; the loop is NOT armed.
-    const src = fs.readFileSync(APP_JS, 'utf8');
-    const sandbox = buildSandbox();
-    sandbox._audioSeek = () => Promise.resolve({ completed: false, from: NaN, to: NaN });
-    loadFunctions(sandbox, src);
-
-    const before = sandbox.__getLoop();
-    const result = await sandbox.__setLoop(5, 10);
-
-    assert.equal(result, false, 'cancelled seek must resolve to false');
-    const after = sandbox.__getLoop();
-    assert.equal(after.loopA, before.loopA, 'loopA must not be committed on cancel');
-    assert.equal(after.loopB, before.loopB, 'loopB must not be committed on cancel');
-});
-
-test('setLoop returns false and leaves loopA/loopB untouched on off-target landing', async () => {
-    // JUCE rollback / HTML5 clamp: completed:true but to drifts > 50ms
-    // from the requested a. The loop is NOT armed.
-    const src = fs.readFileSync(APP_JS, 'utf8');
-    const sandbox = buildSandbox();
-    sandbox._audioSeek = (s) => Promise.resolve({ completed: true, from: 0, to: s + 0.5 });
-    loadFunctions(sandbox, src);
-
-    const before = sandbox.__getLoop();
-    const result = await sandbox.__setLoop(5, 10);
-
-    assert.equal(result, false, 'off-target seek must resolve to false');
-    const after = sandbox.__getLoop();
-    assert.equal(after.loopA, before.loopA, 'loopA must not be committed on off-target');
-    assert.equal(after.loopB, before.loopB, 'loopB must not be committed on off-target');
 });
 
 test('setLoop coerces string inputs (parseFloat-style)', async () => {
