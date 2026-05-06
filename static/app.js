@@ -4581,44 +4581,12 @@ async function startCountIn() {
             // Rewind done — set final position and start count.
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
-            _audioSeek(loopA, 'loop-wrap').then((r) => {
-                if (gen !== _countInGen) return; // teardown during seek
-                // Abort the loop restart in two cases:
-                //   1. Cancelled (player torn down): don't beginCount on a
-                //      new session.
-                //   2. Off-target landing (JUCE rollback / clamp far from
-                //      loopA): proceeding would emit loop:restart and start
-                //      a count-in from the wrong position. Audio is at
-                //      r.from / r.to, which is not where the loop wants to
-                //      resume — better to drop this iteration than play out
-                //      of sync.
-                // 50 ms tolerance: well within JUCE's normal seek precision
-                // but tight enough to catch a real rollback or no-op.
-                if (!r.completed || Math.abs(r.to - loopA) > 0.05) {
-                    // startCountIn paused audio at entry but left isPlaying
-                    // alone — beginCount would have set it on resume. On
-                    // abort, sync the transport: audio is paused, so
-                    // isPlaying must reflect that and the button + plugin
-                    // host must agree.
-                    _countingIn = false;
-                    if (isPlaying) {
-                        isPlaying = false;
-                        document.getElementById('btn-play').textContent = '▶ Play';
-                        if (window.slopsmith) {
-                            window.slopsmith.isPlaying = false;
-                            window.slopsmith.emit('song:pause', _songEventPayload());
-                        }
-                    }
-                    return;
-                }
-                // Use the verified post-seek clock for the chart so audio
-                // and chart stay in sync if JUCE clamped to slightly
-                // before/after loopA. The loop:restart event keeps `time:
-                // loopA` because subscribers treat that as the semantic
-                // marker for "new iteration starts at A", not the actual
-                // audio position.
-                lastAudioTime = r.to;
-                highway.setTime(r.to);
+            _audioSeek(loopA).then(() => {
+                lastAudioTime = loopA;
+                highway.setTime(loopA);
+                // Emit before beginCount so plugins that capture per-iteration
+                // state (notedetect drill-mode score capture) see the wrap at
+                // the same moment chartTime resets, not after the 4-beat count.
                 window.slopsmith.emit('loop:restart', { loopA, loopB, time: loopA });
                 beginCount();
             });
