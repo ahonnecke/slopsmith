@@ -3364,62 +3364,6 @@ let _resetJuceAudioShimChain = function () {};
 
 function _audioTime() { return window._juceMode ? jucePlayer.currentTime : audio.currentTime; }
 function _audioDuration() { return window._juceMode ? jucePlayer.duration : audio.duration; }
-// Canonical payload for song:play/song:pause/song:ended. Plugins anchor
-// their own clocks against `perfNow` (a monotonic timestamp at the same
-// moment audio reports `audioT`) so they don't have to chase the chart
-// clock with a follow-up call. `time` is kept as an alias for `audioT`
-// because pre-existing plugins read e.detail.time.
-function _songEventPayload() {
-    const audioT = _audioTime();
-    return {
-        time: audioT,
-        audioT,
-        chartT: highway.getTime(),
-        perfNow: performance.now(),
-    };
-}
-// Serializes seeks so concurrent callers (e.g. user ⏪ during a loop wrap)
-// don't interleave their from/to reads — each call captures `from` only
-// once the previous seek + emit have completed. The generation token
-// lets session teardown invalidate queued seeks so they don't run against
-// the new player and emit a stale song:seek.
-let _audioSeekChain = Promise.resolve();
-let _audioSeekGen = 0;
-function _resetAudioSeekState() {
-    // Bump the generation — in-flight chain callbacks see the mismatch on
-    // their next guard check and short-circuit (no emit, no further state
-    // mutation by us). Don't reset the chain head: new seeks must still
-    // queue behind the in-flight old seek's IPC so two `jucePlayer.seek()`
-    // calls can't race in the JUCE backing engine. The queue drains
-    // quickly because each subsequent old-gen step bails on the first
-    // guard the moment its predecessor resolves.
-    _audioSeekGen++;
-}
-// Time-box the JUCE IPC so a single hung seek can't block the global
-// _audioSeekChain forever (which would freeze every subsequent reposition
-// path: seekBy, loop-wrap, jump-fix, shimmed audio.currentTime).
-const _JUCE_SEEK_TIMEOUT_MS = 2000;
-function _juceSeekWithTimeout(s) {
-    let timer;
-    const seekP = jucePlayer.seek(s);
-    const timeoutP = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('JUCE seek timed out')), _JUCE_SEEK_TIMEOUT_MS);
-    });
-    // Clear the timer once the race settles either way; without this the
-    // pending timeout keeps the event loop alive (and eventually rejects
-    // an unawaited promise) even after a successful seek.
-    return Promise.race([seekP, timeoutP]).finally(() => clearTimeout(timer));
-}
-// Resolves to `{ completed, from, to }`:
-//   - completed: true if the seek ran to completion and emitted song:seek;
-//                false if cancelled by a teardown gen bump (or threw).
-//   - from: chart clock just before the seek (NaN on cancel before from-read).
-//   - to:   verified post-seek clock (NaN on cancel/throw).
-// Callers that fire follow-up work after the seek (count-in, arrangement
-// restore, etc.) should check `completed` so they don't act on a torn-down
-// session. Callers that need the actual landed position (because JUCE may
-// clamp or HTML5 may snap to the seekable range) should read `to` rather
-// than re-using the requested `s`.
 async function _audioSeek(s, reason) {
     // Single funnel for every audio repositioning. Emits song:seek so
     // plugins (notedetect detection-suppression during seek transients,
@@ -3427,36 +3371,10 @@ async function _audioSeek(s, reason) {
     // jump regardless of which UI path triggered it. `reason` is a
     // free-form short string ('seek-by', 'loop-wrap', 'loop-set',
     // 'arrangement-restore', 'jump-fix') so subscribers can filter.
-    const gen = _audioSeekGen;
-    _audioSeekChain = _audioSeekChain.then(async () => {
-        if (gen !== _audioSeekGen) return { completed: false, from: NaN, to: NaN };
-        const from = _audioTime();
-        if (window._juceMode) await _juceSeekWithTimeout(s);
-        else audio.currentTime = s;
-        if (gen !== _audioSeekGen) return { completed: false, from, to: NaN };
-        // Read the verified post-seek position rather than the requested `s`
-        // so plugins observe the actual clock — JUCE may clamp or roll back,
-        // and HTML5 may snap to the nearest seekable range.
-        const to = _audioTime();
-        // Sync the jump-fix tracker so the next 60Hz tick doesn't see a
-        // legitimate far seek (e.g. saved-loop jump > 30s) as a browser
-        // bug and revert it.
-        lastAudioTime = to;
-        // Sync the chart clock too so any song:* emit fired right after
-        // _audioSeek resolves (e.g. the auto-resume song:play in
-        // changeArrangement) sees an in-sync chartT via _songEventPayload.
-        // Without this, chartT lags by one 60Hz tick after a seek.
-        if (typeof highway !== 'undefined' && highway && typeof highway.setTime === 'function') {
-            highway.setTime(to);
-        }
-        window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
-        return { completed: true, from, to };
-    }).catch((err) => {
-        // Don't let one failed seek poison subsequent ones.
-        console.warn('[_audioSeek]', err);
-        return { completed: false, from: NaN, to: NaN };
-    });
-    return _audioSeekChain;
+    const from = _audioTime();
+    if (window._juceMode) await jucePlayer.seek(s);
+    else audio.currentTime = s;
+    window.slopsmith.emit('song:seek', { from, to: s, reason: reason || null });
 }
 let currentFilename = '';
 // Plugin context API — lightweight event bus for plugin integration
@@ -3676,29 +3594,7 @@ async function changeArrangement(index) {
         highway._onReady = async () => {
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
-            const r = await _audioSeek(time, 'arrangement-restore');
-            // Don't auto-resume on cancel OR off-target landing — same
-            // 50 ms tolerance as loop-wrap / loop-set. Resuming play from
-            // a different position than the user's previous play position
-            // would be jarring; better to leave them at the post-seek
-            // (likely close-but-not-equal) position without auto-play.
-            if (!r.completed || Math.abs(r.to - time) > 0.05) {
-                // changeArrangement paused audio at entry (line 3032) but
-                // didn't update the button or emit song:pause — those were
-                // meant to be no-ops if the auto-resume succeeded. On
-                // abort, sync the transport: button -> 'Play',
-                // sm.isPlaying = false, emit song:pause so plugins see the
-                // paused state.
-                if (wasPlaying) {
-                    document.getElementById('btn-play').textContent = '▶ Play';
-                    if (window.slopsmith) {
-                        window.slopsmith.isPlaying = false;
-                        window.slopsmith.emit('song:pause', _songEventPayload());
-                    }
-                }
-                highway._onReady = null;
-                return;
-            }
+            await _audioSeek(time, 'arrangement-restore');
             if (wasPlaying) {
                 if (window._juceMode) {
                     const started = await jucePlayer.play();
@@ -4448,29 +4344,13 @@ async function loadSavedLoop(loopId) {
         delBtn.classList.add('hidden');
         return;
     }
-    let ok = false;
-    try {
-        // Pass raw strings — setLoop's Number() coercion is stricter than
-        // parseFloat (rejects "12abc") so malformed dataset values throw
-        // and fall into the catch instead of silently truncating.
-        ok = await setLoop(opt.dataset.start, opt.dataset.end);
-    } catch (err) {
-        // Malformed dataset (server returned bad data): treat the same as
-        // a failed seek so the dropdown resyncs and we don't propagate an
-        // uncaught rejection out of the onchange handler.
-        console.warn('[loadSavedLoop] setLoop threw:', err);
-        ok = false;
-    }
-    if (!ok) {
-        // Seek aborted, landed off-target, or input was malformed.
-        // Resync the dropdown with the still-active loop so the UI
-        // doesn't lie about which loop is loaded.
-        _syncSavedLoopSelection();
-        return;
-    }
-    // Success path: setLoop already called _syncSavedLoopSelection,
-    // which surfaces the delete button when the new loop matches a
-    // saved option (which the dropdown selection guarantees here).
+    loopA = parseFloat(opt.dataset.start);
+    loopB = parseFloat(opt.dataset.end);
+    await _audioSeek(loopA, 'loop-set');
+    document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    updateLoopUI();
+    delBtn.classList.remove('hidden');
 }
 
 async function saveCurrentLoop() {
@@ -4581,44 +4461,12 @@ async function startCountIn() {
             // Rewind done — set final position and start count.
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
-            _audioSeek(loopA, 'loop-wrap').then((r) => {
-                if (gen !== _countInGen) return; // teardown during seek
-                // Abort the loop restart in two cases:
-                //   1. Cancelled (player torn down): don't beginCount on a
-                //      new session.
-                //   2. Off-target landing (JUCE rollback / clamp far from
-                //      loopA): proceeding would emit loop:restart and start
-                //      a count-in from the wrong position. Audio is at
-                //      r.from / r.to, which is not where the loop wants to
-                //      resume — better to drop this iteration than play out
-                //      of sync.
-                // 50 ms tolerance: well within JUCE's normal seek precision
-                // but tight enough to catch a real rollback or no-op.
-                if (!r.completed || Math.abs(r.to - loopA) > 0.05) {
-                    // startCountIn paused audio at entry but left isPlaying
-                    // alone — beginCount would have set it on resume. On
-                    // abort, sync the transport: audio is paused, so
-                    // isPlaying must reflect that and the button + plugin
-                    // host must agree.
-                    _countingIn = false;
-                    if (isPlaying) {
-                        isPlaying = false;
-                        document.getElementById('btn-play').textContent = '▶ Play';
-                        if (window.slopsmith) {
-                            window.slopsmith.isPlaying = false;
-                            window.slopsmith.emit('song:pause', _songEventPayload());
-                        }
-                    }
-                    return;
-                }
-                // Use the verified post-seek clock for the chart so audio
-                // and chart stay in sync if JUCE clamped to slightly
-                // before/after loopA. The loop:restart event keeps `time:
-                // loopA` because subscribers treat that as the semantic
-                // marker for "new iteration starts at A", not the actual
-                // audio position.
-                lastAudioTime = r.to;
-                highway.setTime(r.to);
+            _audioSeek(loopA, 'loop-wrap').then(() => {
+                lastAudioTime = loopA;
+                highway.setTime(loopA);
+                // Emit before beginCount so plugins that capture per-iteration
+                // state (notedetect drill-mode score capture) see the wrap at
+                // the same moment chartTime resets, not after the 4-beat count.
                 window.slopsmith.emit('loop:restart', { loopA, loopB, time: loopA });
                 beginCount();
             });
@@ -4684,10 +4532,6 @@ setInterval(() => {
         else if (!window._juceMode && isPlaying && Math.abs(ct - lastAudioTime) > 30 && lastAudioTime > 0) {
             console.warn(`Audio time jumped from ${lastAudioTime.toFixed(1)} to ${ct.toFixed(1)}, resetting`);
             _audioSeek(lastAudioTime, 'jump-fix');
-            // Treat the corrected position as canonical for the rest of this
-            // tick. Otherwise we'd write the stale jumped `ct` into
-            // lastAudioTime below and ping-pong on the next tick.
-            ct = lastAudioTime;
         }
         lastAudioTime = ct;
         document.getElementById('hud-time').textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
