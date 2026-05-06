@@ -4347,61 +4347,22 @@ function clearLoop() {
     document.getElementById('saved-loops').value = '';
 }
 
-// Resync #saved-loops + #btn-loop-delete with the currently-active
-// loopA/loopB. Used by both setLoop's success path (so plugin-driven
-// loops show up correctly in the dropdown) and loadSavedLoop's
-// failure path (so a cancelled selection reverts to the still-active
-// loop). Without this sync, deleteSelectedLoop could target a stale
-// option that doesn't match the active loop.
-function _syncSavedLoopSelection() {
-    const sel = document.getElementById('saved-loops');
-    const delBtn = document.getElementById('btn-loop-delete');
-    if (!sel || !delBtn) return;
-    let selected = '';
-    if (loopA !== null && loopB !== null) {
-        for (const opt of sel.options) {
-            if (Number(opt.dataset.start) === loopA && Number(opt.dataset.end) === loopB) {
-                selected = opt.value;
-                break;
-            }
-        }
-    }
-    sel.value = selected;
-    delBtn.classList.toggle('hidden', !selected);
-}
-
 // Programmatically set both loop endpoints and seek to A. The dropdown
 // path (loadSavedLoop) and the plugin-API path (window.slopsmith.setLoop)
 // both funnel through here so the UI state stays canonical regardless of
 // who triggered the loop.
-//
-// Returns true if the seek landed at A and the loop is now active;
-// returns false if the seek was cancelled by teardown or landed off-target
-// (JUCE clamp / HTML5 snap > 50ms from A). On false, loopA/loopB are NOT
-// committed and the UI is not painted — the prior loop (if any) stays
-// active. Throws on invalid inputs.
 async function setLoop(a, b) {
     const aNum = Number(a);
     const bNum = Number(b);
     if (!Number.isFinite(aNum) || !Number.isFinite(bNum) || bNum <= aNum) {
         throw new Error(`setLoop: requires finite a and b with b > a (got a=${a}, b=${b})`);
     }
-    // Don't arm loopA/loopB before the seek lands — the 60Hz tick's wrap
-    // detector (`ct >= loopB`) would trigger startCountIn against
-    // half-applied state.
-    const r = await _audioSeek(aNum, 'loop-set');
-    if (!r.completed || Math.abs(r.to - aNum) > 0.05) return false;
     loopA = aNum;
     loopB = bNum;
+    await _audioSeek(loopA);
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
-    // Sync the saved-loops dropdown so a plugin-driven setLoop call
-    // surfaces the matching saved option (and Delete button) — otherwise
-    // the dropdown can stay on a stale selection and deleteSelectedLoop
-    // would target the wrong record.
-    _syncSavedLoopSelection();
-    return true;
 }
 
 function updateLoopUI() {
@@ -4423,21 +4384,152 @@ function updateLoopUI() {
 async function loadSavedLoops() {
     const sel = document.getElementById('saved-loops');
     const delBtn = document.getElementById('btn-loop-delete');
-    if (!currentFilename) { sel.classList.add('hidden'); delBtn.classList.add('hidden'); return; }
+    const mgrBtn = document.getElementById('btn-loop-manage');
+    if (!currentFilename) {
+        sel.classList.add('hidden');
+        delBtn.classList.add('hidden');
+        if (mgrBtn) mgrBtn.classList.add('hidden');
+        return;
+    }
 
     const resp = await fetch(`/api/loops?filename=${encodeURIComponent(decodeURIComponent(currentFilename))}`);
     const loops = await resp.json();
 
     sel.innerHTML = '<option value="">Saved Loops</option>';
     for (const l of loops) {
-        sel.innerHTML += `<option value="${l.id}" data-start="${l.start}" data-end="${l.end}">${esc(l.name)} (${formatTime(l.start)}→${formatTime(l.end)})</option>`;
+        const star = l.is_favorite ? '★ ' : '';
+        sel.innerHTML += `<option value="${l.id}" data-start="${l.start}" data-end="${l.end}">${star}${esc(l.name)} (${formatTime(l.start)}→${formatTime(l.end)})</option>`;
     }
     if (loops.length > 0) {
         sel.classList.remove('hidden');
+        if (mgrBtn) mgrBtn.classList.remove('hidden');
     } else {
         sel.classList.add('hidden');
+        if (mgrBtn) mgrBtn.classList.add('hidden');
     }
     delBtn.classList.add('hidden');
+}
+
+// ── Loop Manager modal ──────────────────────────────────────────────────
+// Shows all saved loops for the current song with inline rename, ★
+// favorite toggle, single-click load, and delete. Replaces the
+// minimal saved-loops <select> for power use; the dropdown stays for
+// quick access. User reported "the saved loops interface is HORRID" —
+// this is the fix.
+async function openLoopManager() {
+    if (!currentFilename) return;
+    const decoded = decodeURIComponent(currentFilename);
+    let loops = [];
+    try {
+        const r = await fetch(`/api/loops?filename=${encodeURIComponent(decoded)}`);
+        loops = await r.json();
+    } catch (e) {
+        console.warn('[loop-manager] fetch failed:', e);
+        return;
+    }
+    const existing = document.getElementById('loop-manager-modal');
+    if (existing) existing.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'loop-manager-modal';
+    modal.className = 'fixed inset-0 z-[300] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+    modal.innerHTML = `
+        <div class="bg-dark-800 border border-gray-700 rounded-xl shadow-2xl w-[640px] max-w-[92vw] max-h-[85vh] overflow-hidden flex flex-col">
+            <div class="px-5 py-3 border-b border-gray-700 flex items-center justify-between">
+                <div class="text-gray-200 font-semibold">Saved Loops</div>
+                <button id="loop-mgr-close" class="text-gray-500 hover:text-gray-200 text-3xl leading-none px-2">×</button>
+            </div>
+            <div id="loop-mgr-list" class="overflow-y-auto"></div>
+            <div class="px-5 py-2 border-t border-gray-700 text-[11px] text-gray-500">
+                ★ favorites surface first · click a row to load · pencil to rename
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const closeMgr = () => {
+        modal.remove();
+        document.removeEventListener('keydown', onEsc);
+    };
+    const onEsc = (e) => { if (e.key === 'Escape') closeMgr(); };
+    modal.querySelector('#loop-mgr-close').onclick = closeMgr;
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeMgr(); });
+    document.addEventListener('keydown', onEsc);
+
+    const list = modal.querySelector('#loop-mgr-list');
+    if (!loops.length) {
+        list.innerHTML = '<div class="px-5 py-6 text-gray-500 text-sm italic text-center">No saved loops for this song. Set A/B and click Save to create one.</div>';
+        return;
+    }
+    list.innerHTML = loops.map(l => `
+        <div class="flex items-center gap-3 px-5 py-2 border-b border-gray-800 hover:bg-dark-700 transition" data-loop-id="${l.id}">
+            <button class="loop-fav text-xl leading-none ${l.is_favorite ? 'text-yellow-400' : 'text-gray-600 hover:text-yellow-300'}" title="${l.is_favorite ? 'Unfavorite' : 'Favorite'}">★</button>
+            <div class="flex-1 min-w-0 cursor-pointer">
+                <div class="loop-name text-gray-200 text-sm font-medium truncate" title="Click to load">${esc(l.name)}</div>
+                <div class="text-gray-500 text-[11px] font-mono">${formatTime(l.start)} → ${formatTime(l.end)} · ${(l.end - l.start).toFixed(1)}s</div>
+            </div>
+            <button class="loop-rename text-gray-500 hover:text-blue-300 px-1 text-sm" title="Rename">✎</button>
+            <button class="loop-delete text-gray-500 hover:text-red-400 px-1 text-sm" title="Delete">🗑</button>
+        </div>
+    `).join('');
+    list.querySelectorAll('[data-loop-id]').forEach(row => {
+        const id = parseInt(row.getAttribute('data-loop-id'), 10);
+        const loop = loops.find(l => l.id === id);
+        if (!loop) return;
+        const loadRow = async () => {
+            await loadLoopFromManager(loop);
+            closeMgr();
+        };
+        row.querySelector('.loop-name').onclick = loadRow;
+        row.querySelector('.flex-1').onclick = loadRow;
+        row.querySelector('.loop-fav').onclick = async (e) => {
+            e.stopPropagation();
+            await fetch(`/api/loops/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ is_favorite: !loop.is_favorite }),
+            });
+            await loadSavedLoops();
+            closeMgr();
+            openLoopManager();  // reopen with refreshed sort
+        };
+        row.querySelector('.loop-rename').onclick = async (e) => {
+            e.stopPropagation();
+            const next = prompt('Rename loop:', loop.name);
+            if (next == null) return;
+            const trimmed = next.trim();
+            if (!trimmed || trimmed === loop.name) return;
+            await fetch(`/api/loops/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: trimmed }),
+            });
+            await loadSavedLoops();
+            closeMgr();
+            openLoopManager();
+        };
+        row.querySelector('.loop-delete').onclick = async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Delete loop "${loop.name}"?`)) return;
+            await fetch(`/api/loops/${id}`, { method: 'DELETE' });
+            await loadSavedLoops();
+            closeMgr();
+            openLoopManager();
+        };
+    });
+}
+
+// Load a loop's range and update player UI. Used by the manager
+// modal so a row click sets A/B and seeks without round-tripping
+// through the saved-loops <select>.
+async function loadLoopFromManager(loop) {
+    loopA = parseFloat(loop.start);
+    loopB = parseFloat(loop.end);
+    try { await _audioSeek(loopA, 'loop-set-from-manager'); } catch {}
+    document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    updateLoopUI();
+    await loadSavedLoops();
 }
 
 async function loadSavedLoop(loopId) {
@@ -4448,29 +4540,8 @@ async function loadSavedLoop(loopId) {
         delBtn.classList.add('hidden');
         return;
     }
-    let ok = false;
-    try {
-        // Pass raw strings — setLoop's Number() coercion is stricter than
-        // parseFloat (rejects "12abc") so malformed dataset values throw
-        // and fall into the catch instead of silently truncating.
-        ok = await setLoop(opt.dataset.start, opt.dataset.end);
-    } catch (err) {
-        // Malformed dataset (server returned bad data): treat the same as
-        // a failed seek so the dropdown resyncs and we don't propagate an
-        // uncaught rejection out of the onchange handler.
-        console.warn('[loadSavedLoop] setLoop threw:', err);
-        ok = false;
-    }
-    if (!ok) {
-        // Seek aborted, landed off-target, or input was malformed.
-        // Resync the dropdown with the still-active loop so the UI
-        // doesn't lie about which loop is loaded.
-        _syncSavedLoopSelection();
-        return;
-    }
-    // Success path: setLoop already called _syncSavedLoopSelection,
-    // which surfaces the delete button when the new loop matches a
-    // saved option (which the dropdown selection guarantees here).
+    await setLoop(parseFloat(opt.dataset.start), parseFloat(opt.dataset.end));
+    delBtn.classList.remove('hidden');
 }
 
 async function saveCurrentLoop() {

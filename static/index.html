@@ -483,7 +483,9 @@
                 <option value="">Saved Loops</option>
             </select>
             <button onclick="deleteSelectedLoop()" id="btn-loop-delete" class="px-2 py-1.5 bg-dark-600 hover:bg-red-900/50 rounded-lg text-xs text-gray-500 hover:text-red-400 transition hidden" title="Delete selected loop">✕</button>
-            <button onclick="showScreen('home')" class="ml-auto px-3 py-1.5 bg-dark-600 hover:bg-red-900/50 rounded-lg text-xs text-gray-400 hover:text-red-400 transition">✕ Close</button>
+            <button onclick="openLoopManager()" id="btn-loop-manage" class="px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 hover:text-white transition hidden" title="Manage saved loops">⚙ Loops</button>
+            <button id="pg-tour-btn" onclick="window.slopsmithTour?.start('player_guide')" class="ml-auto px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 hover:text-white transition" title="Player controls guide">?</button>
+            <button onclick="showScreen('home')" class="px-3 py-1.5 bg-dark-600 hover:bg-red-900/50 rounded-lg text-xs text-gray-400 hover:text-red-400 transition">✕ Close</button>
         </div>
     </div>
 

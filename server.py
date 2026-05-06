@@ -301,6 +301,12 @@ class MetadataDB:
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Idempotent migration: add is_favorite column to existing
+        # databases. PRAGMA table_info is the cheapest way to detect
+        # whether the column already exists across SQLite versions.
+        loops_cols = [r[1] for r in self.conn.execute("PRAGMA table_info(loops)").fetchall()]
+        if "is_favorite" not in loops_cols:
+            self.conn.execute("ALTER TABLE loops ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
         self._lock = threading.Lock()
 
@@ -2276,11 +2282,17 @@ def toggle_favorite(data: dict):
 
 @app.get("/api/loops")
 def list_loops(filename: str):
+    # Favorites surface first so the loop manager and the player's
+    # saved-loops dropdown both prioritize the user's pinned spots.
     rows = meta_db.conn.execute(
-        "SELECT id, name, start_time, end_time FROM loops WHERE filename = ? ORDER BY start_time",
+        "SELECT id, name, start_time, end_time, is_favorite FROM loops "
+        "WHERE filename = ? ORDER BY is_favorite DESC, start_time",
         (filename,)
     ).fetchall()
-    return [{"id": r[0], "name": r[1], "start": r[2], "end": r[3]} for r in rows]
+    return [
+        {"id": r[0], "name": r[1], "start": r[2], "end": r[3], "is_favorite": bool(r[4])}
+        for r in rows
+    ]
 
 
 @app.post("/api/loops")
@@ -2309,6 +2321,35 @@ def save_loop(data: dict):
 def delete_loop(loop_id: int):
     with meta_db._lock:
         meta_db.conn.execute("DELETE FROM loops WHERE id = ?", (loop_id,))
+        meta_db.conn.commit()
+    return {"ok": True}
+
+
+@app.patch("/api/loops/{loop_id}")
+def update_loop(loop_id: int, data: dict):
+    """Partial update: rename and/or toggle favorite status. Body
+    accepts `name` (str) and/or `is_favorite` (bool); only provided
+    fields are written. Used by the loop manager UI for inline rename
+    and ★ favorite toggle.
+    """
+    sets = []
+    params: list = []
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            return {"error": "name cannot be empty"}
+        sets.append("name = ?")
+        params.append(name)
+    if "is_favorite" in data:
+        sets.append("is_favorite = ?")
+        params.append(1 if data.get("is_favorite") else 0)
+    if not sets:
+        return {"error": "no updatable fields supplied"}
+    params.append(loop_id)
+    with meta_db._lock:
+        meta_db.conn.execute(
+            f"UPDATE loops SET {', '.join(sets)} WHERE id = ?", params
+        )
         meta_db.conn.commit()
     return {"ok": True}
 
