@@ -2536,8 +2536,8 @@ window.slopsmith = Object.assign(new EventTarget(), {
     emit(event, detail) {
         this.dispatchEvent(new CustomEvent(event, { detail }));
     },
-    on(event, fn) { this.addEventListener(event, fn); },
-    off(event, fn) { this.removeEventListener(event, fn); }
+    on(event, fn, options) { this.addEventListener(event, fn, options); },
+    off(event, fn, options) { this.removeEventListener(event, fn, options); }
 });
 if (_slopsmithExisting) {
     for (const key of Object.keys(_slopsmithExisting)) {
@@ -2795,6 +2795,12 @@ if (window.slopsmith) {
     window.slopsmith.on('viz:reverted', (e) => {
         const sel = document.getElementById('viz-picker');
         if (sel) sel.value = 'default';
+        // Cancel any pending viz:renderer:ready label listener — the renderer
+        // that was queued never became (or stayed) active.
+        if (_cancelPendingAutoLabel) { _cancelPendingAutoLabel(); _cancelPendingAutoLabel = null; }
+        // Clear any Auto-resolved label — the renderer that was advertised
+        // never became (or stayed) active.
+        _setAutoVizLabel(null);
         try { localStorage.setItem('vizSelection', 'default'); } catch (_) {}
         console.warn(
             `viz picker: reverted to default renderer (${e.detail?.reason || 'unknown'}).`
@@ -3094,6 +3100,15 @@ function setViz(id) {
         highway.setRenderer(null);
     };
 
+    // When switching away from Auto, reset the closed-state label so the
+    // Auto option shows base text the next time the user opens the dropdown.
+    // Also cancel any pending viz:renderer:ready listener from the previous
+    // Auto match cycle so it can't set a stale label after we've moved on.
+    if (id !== 'auto') {
+        if (_cancelPendingAutoLabel) { _cancelPendingAutoLabel(); _cancelPendingAutoLabel = null; }
+        _setAutoVizLabel(null);
+    }
+
     if (id === 'default' || !id) {
         try { localStorage.setItem('vizSelection', id || 'default'); } catch (_) {}
         const _sel = document.getElementById('viz-picker');
@@ -3155,11 +3170,39 @@ function setViz(id) {
 // Enumerates viz plugins by walking the picker's own <option> list —
 // that's the canonical set built by _populateVizPicker above and keeps
 // us from needing a second module-level registry.
+// Helper: update the closed-state label of the Auto option to show what was resolved.
+// Resets to the base label when called with no argument (at evaluation start).
+// _autoVizBaseLabel is captured from the DOM on first call so the reset text
+// always matches the initial markup rather than a hardcoded duplicate.
+let _autoVizBaseLabel = null;
+function _setAutoVizLabel(resolvedText) {
+    const opt = document.querySelector('#viz-picker option[value="auto"]');
+    if (!opt) return;
+    if (_autoVizBaseLabel === null) _autoVizBaseLabel = opt.text;
+    opt.text = resolvedText != null ? `Auto \u2192 ${resolvedText}` : _autoVizBaseLabel;
+}
+
+// Holds a cleanup function for the pending viz:renderer:ready listener
+// registered by _autoMatchViz(). Called at the start of each new evaluation
+// to remove any listener left over from the previous match cycle.
+let _cancelPendingAutoLabel = null;
+
 function _autoMatchViz() {
     const sel = document.getElementById('viz-picker');
     if (!sel) return;
+    // Cancel any pending viz:renderer:ready listener from a previous match
+    // cycle. The song may change before the previous renderer's async init
+    // settles; we don't want that stale listener to clobber the new label.
+    if (_cancelPendingAutoLabel) { _cancelPendingAutoLabel(); _cancelPendingAutoLabel = null; }
+    // Reset label at evaluation start so a stale resolved label never persists
+    // if the song changes or the picker re-evaluates with a different outcome.
+    _setAutoVizLabel(null);
     const songInfo = (typeof highway !== 'undefined' && typeof highway.getSongInfo === 'function')
         ? (highway.getSongInfo() || {}) : {};
+    // Only update the label when a real song is loaded. Before the first
+    // song_info frame, getSongInfo() returns {} — leaving the reset state
+    // ("Auto (match arrangement)") is correct; we haven't evaluated yet.
+    const hasSong = Object.keys(songInfo).length > 0;
     // Options are stable in DOM order, which matches what users see in
     // the picker. The underlying order comes from /api/plugins →
     // _populateVizPicker, and /api/plugins reflects the order the
@@ -3179,13 +3222,15 @@ function _autoMatchViz() {
         .map(o => o.value)
         .filter(v => v !== 'auto' && v !== 'default');
     for (const id of candidateIds) {
-        // 3D Highway gates on WebGL2; if the browser can't run it, skip
-        // it during Auto evaluation so the next candidate (or the 2D
-        // fallback at the end of the loop) takes over instead of
-        // installing a renderer that'll fail at init.
-        if (id === 'highway_3d' && !_canRun3D()) continue;
         const factory = window['slopsmithViz_' + id];
         if (typeof factory !== 'function') continue;
+        // If the factory statically declares contextType='webgl2', gate on
+        // WebGL2 availability so a match never installs a renderer that'll
+        // fail at init. This is the generic version of the old hard-coded
+        // highway_3d check — any future WebGL2 viz gets the same protection
+        // for free without needing a special-case here.
+        const factoryCtxType = typeof factory.contextType === 'string' ? factory.contextType : '2d';
+        if (factoryCtxType === 'webgl2' && !_canRun3D()) continue;
         const predicate = factory.matchesArrangement;
         if (typeof predicate !== 'function') continue;
         let matched = false;
@@ -3207,18 +3252,37 @@ function _autoMatchViz() {
         }
         // Deliberately NOT persisting id — vizSelection stays 'auto' so
         // the next song:ready re-evaluates against the new arrangement.
+        //
+        // Register the viz:renderer:ready listener BEFORE setRenderer() so we
+        // don't miss the event for sync renderers (no readyPromise), which emit
+        // it immediately inside setRenderer(). The _onReady guard still checks
+        // sel.value so a sync init failure (viz:reverted → sel.value='default')
+        // that fires during setRenderer() is handled correctly — the listener
+        // fires but finds sel.value !== 'auto' and skips the label update.
+        if (hasSong) {
+            const matchedOpt = Array.from(sel.options).find(o => o.value === id);
+            const labelText = matchedOpt ? matchedOpt.text : id;
+            function _onReady() { if (sel.value === 'auto') _setAutoVizLabel(labelText); }
+            window.slopsmith.on('viz:renderer:ready', _onReady, { once: true });
+            _cancelPendingAutoLabel = () => window.slopsmith.off('viz:renderer:ready', _onReady);
+        }
         highway.setRenderer(renderer);
         return;
     }
     // No match — restore the built-in 2D highway. setRenderer(null) is
-    // a no-op when the default is already active. KNOWN LIMITATION:
-    // when the previous Auto pick was a WebGL renderer, the canvas has
-    // been locked to 'webgl' by that renderer's init; reverting to the
-    // default 2D renderer will fail silently (see CLAUDE.md "first
-    // context wins"). That's the same limitation manual picker swaps
-    // already have — a future wave will teach highway to recreate the
-    // canvas on context-type change.
+    // a no-op when the default is already active. If the previous Auto
+    // pick was a WebGL renderer, highway.setRenderer() handles the
+    // context-type change by replacing the canvas element (cloneNode +
+    // replaceWith) so the default 2D renderer's getContext('2d') always
+    // succeeds — no canvas-lock limitation here.
     highway.setRenderer(null);
+    // Update the label so the user can see Auto resolved to the built-in
+    // highway. Read from the DOM rather than hard-coding the name so a
+    // future rename of the default entry is automatically reflected.
+    if (hasSong) {
+        const defaultOpt = Array.from(sel.options).find(o => o.value === 'default');
+        _setAutoVizLabel(defaultOpt ? defaultOpt.text : null);
+    }
 }
 
 function formatTime(s) { return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
@@ -3684,6 +3748,7 @@ function showScanBanner() {
             </div>
             <div class="progress-bar"><div class="fill" id="scan-bar" style="width:0%"></div></div>
             <p class="text-xs text-gray-500 mt-1 truncate" id="scan-file">Starting...</p>
+            <p class="text-xs text-blue-400/70 mt-1 hidden" id="scan-first-note">First-time import — results are cached for future launches</p>
         </div>
         <button onclick="hideScanBanner()" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition flex-shrink-0">Dismiss</button>`;
     document.body.appendChild(el);
@@ -3705,8 +3770,10 @@ async function pollScanStatus() {
             showScanBanner();
             const file = document.getElementById('scan-file');
             const prog = document.getElementById('scan-progress');
+            const firstNote = document.getElementById('scan-first-note');
             if (file) { file.textContent = 'Scan failed: ' + data.error; file.classList.add('text-red-400'); }
             if (prog) prog.textContent = 'Error';
+            if (firstNote) firstNote.classList.add('hidden');
             clearInterval(_scanPollId);
             _scanPollId = null;
             return;
@@ -3717,12 +3784,14 @@ async function pollScanStatus() {
             const bar = document.getElementById('scan-bar');
             const prog = document.getElementById('scan-progress');
             const file = document.getElementById('scan-file');
+            const firstNote = document.getElementById('scan-first-note');
             if (bar) bar.style.width = pct + '%';
             if (prog) prog.textContent = `${data.done} / ${data.total} (${pct}%)`;
             if (file) {
                 const name = (data.current || '').replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
                 file.textContent = name || (data.stage === 'listing' ? 'Listing DLC folder...' : 'Processing...');
             }
+            if (firstNote) firstNote.classList.toggle('hidden', !data.is_first_scan);
         } else {
             if (document.getElementById('scan-banner')) {
                 hideScanBanner();
@@ -3740,6 +3809,8 @@ async function checkScanAndLoad() {
     const data = await resp.json();
     if (data.running) {
         showScanBanner();
+        const firstNote = document.getElementById('scan-first-note');
+        if (firstNote) firstNote.classList.toggle('hidden', !data.is_first_scan);
         _scanPollId = setInterval(pollScanStatus, 1000);
     }
     loadLibrary();
