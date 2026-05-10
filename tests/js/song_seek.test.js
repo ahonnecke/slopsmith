@@ -169,7 +169,7 @@ test('every documented seek callsite passes a reason', () => {
     for (const line of callLines) {
         assert.match(
             line,
-            /['"][a-z-]+['"]/,
+            /['"][a-z]+(?:-[a-z]+)+['"]/,
             `_audioSeek call missing kebab-case reason arg: ${line.trim()}`,
         );
     }
