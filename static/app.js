@@ -3370,8 +3370,14 @@ function _audioDuration() { return window._juceMode ? jucePlayer.duration : audi
 let _audioSeekChain = Promise.resolve();
 let _audioSeekGen = 0;
 function _resetAudioSeekState() {
+    // Bump the generation — in-flight chain callbacks see the mismatch on
+    // their next guard check and short-circuit (no emit, no further state
+    // mutation by us). Don't reset the chain head: new seeks must still
+    // queue behind the in-flight old seek's IPC so two `jucePlayer.seek()`
+    // calls can't race in the JUCE backing engine. The queue drains
+    // quickly because each subsequent old-gen step bails on the first
+    // guard the moment its predecessor resolves.
     _audioSeekGen++;
-    _audioSeekChain = Promise.resolve();
 }
 // Resolves to `{ completed, from, to }`:
 //   - completed: true if the seek ran to completion and emitted song:seek;
@@ -4501,13 +4507,21 @@ async function startCountIn() {
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
             _audioSeek(loopA, 'loop-wrap').then((r) => {
-                // If the player was torn down mid-seek (user navigated away,
-                // new song started), don't run beginCount or emit on the new
-                // session — the seek was cancelled. Clear _countingIn so the
-                // 60Hz tick can resume normal time/jump-fix processing
-                // instead of staying frozen waiting for a count-in that
-                // will never finish.
-                if (!r.completed) { _countingIn = false; return; }
+                // Abort the loop restart in two cases:
+                //   1. Cancelled (player torn down): don't beginCount on a
+                //      new session.
+                //   2. Off-target landing (JUCE rollback / clamp far from
+                //      loopA): proceeding would emit loop:restart and start
+                //      a count-in from the wrong position. Audio is at
+                //      r.from / r.to, which is not where the loop wants to
+                //      resume — better to drop this iteration than play out
+                //      of sync.
+                // 50 ms tolerance: well within JUCE's normal seek precision
+                // but tight enough to catch a real rollback or no-op.
+                if (!r.completed || Math.abs(r.to - loopA) > 0.05) {
+                    _countingIn = false;
+                    return;
+                }
                 // Use the verified post-seek clock for the chart so audio
                 // and chart stay in sync if JUCE clamped to slightly
                 // before/after loopA. The loop:restart event keeps `time:

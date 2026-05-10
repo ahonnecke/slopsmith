@@ -69,7 +69,9 @@ function loadFunctions(sandbox, src) {
         ${extractFunction(src, 'async function seekBy(')}
         globalThis.__audioSeek = _audioSeek;
         globalThis.__seekBy = seekBy;
-        globalThis.__bumpGen = () => { _audioSeekGen++; _audioSeekChain = Promise.resolve(); };
+        // Mirror _resetAudioSeekState exactly: bump only — chain stays so
+        // new seeks queue behind in-flight ones and don't race the IPC.
+        globalThis.__bumpGen = () => { _audioSeekGen++; };
     `;
     vm.runInContext(code, sandbox);
 }
