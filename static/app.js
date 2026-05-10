@@ -4498,8 +4498,11 @@ async function startCountIn() {
             _audioSeek(loopA, 'loop-wrap').then((completed) => {
                 // If the player was torn down mid-seek (user navigated away,
                 // new song started), don't run beginCount or emit on the new
-                // session — the seek was cancelled.
-                if (!completed) return;
+                // session — the seek was cancelled. Clear _countingIn so the
+                // 60Hz tick can resume normal time/jump-fix processing
+                // instead of staying frozen waiting for a count-in that
+                // will never finish.
+                if (!completed) { _countingIn = false; return; }
                 lastAudioTime = loopA;
                 highway.setTime(loopA);
                 // Emit before beginCount so plugins that capture per-iteration

@@ -159,6 +159,31 @@ test('queued seeks cancel cleanly when generation bumps mid-flight', async () =>
     assert.equal(result, false, 'cancelled seek must resolve to false so callers can bail');
 });
 
+test('queued seek bails when generation bumps DURING the JUCE seek', async () => {
+    // Covers the second gen-check (the one after `await jucePlayer.seek`).
+    // The previous test bumps before the chain callback starts; this one
+    // lets the callback enter, reach the seek await, and then bumps so the
+    // post-await guard is what catches the cancellation.
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const sandbox = buildSandbox({ juceMode: true, currentTime: 5 });
+    let bumpedDuringSeek = false;
+    sandbox.jucePlayer.seek = (s) => new Promise((resolve) => setTimeout(() => {
+        sandbox.jucePlayer.currentTime = s;
+        // Bump while the seek is mid-flight: we're past the first guard
+        // (it ran when the chain callback entered), but before the second.
+        if (!bumpedDuringSeek) { sandbox.__bumpGen(); bumpedDuringSeek = true; }
+        resolve();
+    }, 5));
+    loadFunctions(sandbox, src);
+
+    const result = await sandbox.__audioSeek(99, 'mid-seek-cancel');
+
+    assert.equal(bumpedDuringSeek, true, 'sanity: bump must have fired inside the seek');
+    const seeks = sandbox.__emitCalls.filter((c) => c.event === 'song:seek');
+    assert.equal(seeks.length, 0, 'mid-seek cancel must not emit song:seek');
+    assert.equal(result, false, 'mid-seek cancel must resolve to false');
+});
+
 test('_audioSeek resolves to true on a successful run', async () => {
     const src = fs.readFileSync(APP_JS, 'utf8');
     const sandbox = buildSandbox({ juceMode: false, currentTime: 5 });
