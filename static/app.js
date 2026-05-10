@@ -890,9 +890,10 @@ async function showScreen(id) {
     }
     if (id !== 'player') {
         highway.stop();
-        // Cancel any queued seeks before stopping playback so a slow
-        // jucePlayer.seek that resolves after stopBacking can't reposition
-        // the now-stopped engine or emit a stale song:seek.
+        // Cancel any queued seeks AND in-flight shim closures before
+        // stopping playback so neither path can mutate the torn-down
+        // session (mirrors the same dual reset in playSong()).
+        _resetJuceAudioShimChain();
         _resetAudioSeekState();
         if (window._juceMode) {
             // HTML5 emits 'pause' via the media-element listener below;
@@ -3243,7 +3244,8 @@ let _resetJuceAudioShimChain = function () {};
         const seekTime = batch.seekTime;
         if (wantsPause && seekTime !== undefined) {
             enqueue(async (gen) => {
-                await _audioSeek(seekTime, 'audio-element-shim');
+                const completed = await _audioSeek(seekTime, 'audio-element-shim');
+                if (!completed) return; // seek cancelled by teardown
                 if (gen !== _juceShimGen) return;
                 if (!forUpcomingPlay) {
                     await jucePlayer.pause();
@@ -3276,7 +3278,8 @@ let _resetJuceAudioShimChain = function () {};
         }
         if (seekTime !== undefined) {
             enqueue(async (gen) => {
-                await _audioSeek(seekTime, 'audio-element-shim');
+                const completed = await _audioSeek(seekTime, 'audio-element-shim');
+                if (!completed) return; // seek cancelled by teardown
                 if (gen !== _juceShimGen) return;
                 audio.dispatchEvent(new Event('seeked'));
             });
@@ -4375,7 +4378,9 @@ async function loadSavedLoop(loopId) {
     }
     loopA = parseFloat(opt.dataset.start);
     loopB = parseFloat(opt.dataset.end);
-    await _audioSeek(loopA, 'loop-set');
+    const completed = await _audioSeek(loopA, 'loop-set');
+    // Don't repaint loop UI if the seek was cancelled by teardown.
+    if (!completed) return;
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
