@@ -67,10 +67,9 @@ function buildSandbox() {
         highway: { setTime() {}, getBPM: () => 120 },
 
         // Stubbed app.js helpers.
-        // Resolve with the real shape `{ completed, from, to }` so
-        // startCountIn's loop-wrap callback sees completed=true and uses
-        // r.to for highway.setTime / lastAudioTime.
-        _audioSeek: (s) => Promise.resolve({ completed: true, from: 20, to: s }),
+        // Resolve with `true` to mirror the real _audioSeek's "seek
+        // completed, post-emit" return; startCountIn now bails on falsy.
+        _audioSeek: () => Promise.resolve(true),
         playClick: () => {},
         showCountOverlay: () => {},
         hideCountOverlay: () => {},

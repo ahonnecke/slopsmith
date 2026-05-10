@@ -890,12 +890,9 @@ async function showScreen(id) {
     }
     if (id !== 'player') {
         highway.stop();
-        // Cancel any queued seeks, in-flight shim closures, AND active
-        // count-in timers before stopping playback so none of these paths
-        // can mutate the torn-down session (mirrors the same triple reset
-        // in playSong()).
-        _cancelCountIn();
-        _resetJuceAudioShimChain();
+        // Cancel any queued seeks before stopping playback so a slow
+        // jucePlayer.seek that resolves after stopBacking can't reposition
+        // the now-stopped engine or emit a stale song:seek.
         _resetAudioSeekState();
         if (window._juceMode) {
             // HTML5 emits 'pause' via the media-element listener below;
@@ -3365,10 +3362,19 @@ function _audioDuration() { return window._juceMode ? jucePlayer.duration : audi
 // Serializes seeks so concurrent callers (e.g. user ⏪ during a loop wrap)
 // don't interleave their from/to reads — each call captures `from` only
 // once the previous seek + emit have completed. The generation token
-// lets song teardown invalidate queued seeks so they don't run against
-// the new song's player and emit a stale song:seek.
+// lets session teardown invalidate queued seeks so they don't run against
+// the new player and emit a stale song:seek.
 let _audioSeekChain = Promise.resolve();
 let _audioSeekGen = 0;
+function _resetAudioSeekState() {
+    _audioSeekGen++;
+    _audioSeekChain = Promise.resolve();
+}
+// Returns `true` if the seek ran to completion and emitted song:seek;
+// `false` if the seek was cancelled by a teardown gen bump (or threw).
+// Callers that fire follow-up work after the seek (count-in, arrangement
+// restore, etc.) should check the return so they don't act on a torn-down
+// session.
 async function _audioSeek(s, reason) {
     // Single funnel for every audio repositioning. Emits song:seek so
     // plugins (notedetect detection-suppression during seek transients,
@@ -3378,19 +3384,21 @@ async function _audioSeek(s, reason) {
     // 'arrangement-restore', 'jump-fix') so subscribers can filter.
     const gen = _audioSeekGen;
     _audioSeekChain = _audioSeekChain.then(async () => {
-        if (gen !== _audioSeekGen) return; // session torn down before our turn
+        if (gen !== _audioSeekGen) return false; // torn down before our turn
         const from = _audioTime();
         if (window._juceMode) await jucePlayer.seek(s);
         else audio.currentTime = s;
-        if (gen !== _audioSeekGen) return; // session torn down during seek
+        if (gen !== _audioSeekGen) return false; // torn down during seek
         // Read the verified post-seek position rather than the requested `s`
         // so plugins observe the actual clock — JUCE may clamp or roll back,
         // and HTML5 may snap to the nearest seekable range.
         const to = _audioTime();
         window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
+        return true;
     }).catch((err) => {
         // Don't let one failed seek poison subsequent ones.
         console.warn('[_audioSeek]', err);
+        return false;
     });
     return _audioSeekChain;
 }
@@ -3536,8 +3544,7 @@ async function playSong(filename, arrangement) {
     // Cancel queued _audioSeek calls from the previous song: bumping the
     // generation makes their chained callbacks bail out, and the fresh
     // chain head means new callers don't await the old chain's tail.
-    _audioSeekGen++;
-    _audioSeekChain = Promise.resolve();
+    _resetAudioSeekState();
     if (window._juceMode) {
         // Mirror the showScreen teardown: emit song:pause for the JUCE
         // path so plugins don't see a stale "playing" state on song
@@ -3614,7 +3621,9 @@ async function changeArrangement(index) {
         highway._onReady = async () => {
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
-            await _audioSeek(time, 'arrangement-restore');
+            const completed = await _audioSeek(time, 'arrangement-restore');
+            // Don't auto-resume if the player was torn down during the seek.
+            if (!completed) { highway._onReady = null; return; }
             if (wasPlaying) {
                 if (window._juceMode) {
                     const started = await jucePlayer.play();
@@ -4481,7 +4490,11 @@ async function startCountIn() {
             // Rewind done — set final position and start count.
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
-            _audioSeek(loopA, 'loop-wrap').then(() => {
+            _audioSeek(loopA, 'loop-wrap').then((completed) => {
+                // If the player was torn down mid-seek (user navigated away,
+                // new song started), don't run beginCount or emit on the new
+                // session — the seek was cancelled.
+                if (!completed) return;
                 lastAudioTime = loopA;
                 highway.setTime(loopA);
                 // Emit before beginCount so plugins that capture per-iteration

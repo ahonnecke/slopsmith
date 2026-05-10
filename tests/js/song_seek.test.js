@@ -151,11 +151,20 @@ test('queued seeks cancel cleanly when generation bumps mid-flight', async () =>
     // Enqueue a seek but bump the generation before the chain's microtask runs.
     const p = sandbox.__audioSeek(99, 'cancel-test');
     sandbox.__bumpGen();
-    await p;
+    const result = await p;
 
     const seeks = sandbox.__emitCalls.filter((c) => c.event === 'song:seek');
     assert.equal(seeks.length, 0, 'cancelled seek must not emit song:seek');
     assert.equal(sandbox.jucePlayer.currentTime, 5, 'cancelled seek must not advance currentTime');
+    assert.equal(result, false, 'cancelled seek must resolve to false so callers can bail');
+});
+
+test('_audioSeek resolves to true on a successful run', async () => {
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const sandbox = buildSandbox({ juceMode: false, currentTime: 5 });
+    loadFunctions(sandbox, src);
+    const result = await sandbox.__audioSeek(10, 'success-test');
+    assert.equal(result, true, 'completed seek must resolve to true');
 });
 
 test('_audioSeek emits the verified post-seek clock when JUCE rolls back', async () => {
