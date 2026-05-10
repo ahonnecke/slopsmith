@@ -4420,7 +4420,16 @@ async function loadSavedLoop(loopId) {
         delBtn.classList.add('hidden');
         return;
     }
-    const ok = await setLoop(parseFloat(opt.dataset.start), parseFloat(opt.dataset.end));
+    let ok = false;
+    try {
+        ok = await setLoop(parseFloat(opt.dataset.start), parseFloat(opt.dataset.end));
+    } catch (err) {
+        // Malformed dataset (server returned bad data): treat the same as
+        // a failed seek so the dropdown resyncs and we don't propagate an
+        // uncaught rejection out of the onchange handler.
+        console.warn('[loadSavedLoop] setLoop threw:', err);
+        ok = false;
+    }
     if (!ok) {
         // Seek aborted (teardown) or landed off-target (JUCE clamp).
         // Resync the dropdown with the still-active loop state so the UI
