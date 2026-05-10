@@ -3374,7 +3374,11 @@ async function _audioSeek(s, reason) {
     const from = _audioTime();
     if (window._juceMode) await jucePlayer.seek(s);
     else audio.currentTime = s;
-    window.slopsmith.emit('song:seek', { from, to: s, reason: reason || null });
+    // Read the verified post-seek position rather than the requested `s` so
+    // plugins observe the actual clock — JUCE may clamp or roll back, and
+    // HTML5 may snap to the nearest seekable range.
+    const to = _audioTime();
+    window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
 }
 let currentFilename = '';
 // Plugin context API — lightweight event bus for plugin integration

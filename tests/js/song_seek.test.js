@@ -101,6 +101,24 @@ test('_audioSeek emits song:seek (JUCE path) after seek promise resolves', async
     assert.equal(sandbox.jucePlayer.currentTime, 99, 'JUCE player position must be advanced');
 });
 
+test('_audioSeek emits the verified post-seek clock when JUCE rolls back', async () => {
+    // Regression: `to` must reflect the actual position after seek, not
+    // the requested `s`. JUCE may clamp or no-op a seek (engine state
+    // mismatch, end-of-track, etc.); plugins that act on `to` would
+    // otherwise see a phantom jump.
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const sandbox = buildSandbox({ juceMode: true, currentTime: 7 });
+    sandbox.jucePlayer.seek = (s) => Promise.resolve(); // no-op: currentTime stays at 7
+    loadFunctions(sandbox, src);
+
+    await sandbox.__audioSeek(42, 'rollback-test');
+
+    const seek = sandbox.__emitCalls.find((c) => c.event === 'song:seek');
+    assert.equal(seek.detail.from, 7);
+    assert.equal(seek.detail.to, 7, 'to must equal post-seek clock, not requested s');
+    assert.equal(seek.detail.reason, 'rollback-test');
+});
+
 test('_audioSeek without reason emits reason: null', async () => {
     const src = fs.readFileSync(APP_JS, 'utf8');
     const sandbox = buildSandbox();
