@@ -3653,8 +3653,12 @@ async function changeArrangement(index) {
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
             const r = await _audioSeek(time, 'arrangement-restore');
-            // Don't auto-resume if the player was torn down during the seek.
-            if (!r.completed) { highway._onReady = null; return; }
+            // Don't auto-resume on cancel OR off-target landing — same
+            // 50 ms tolerance as loop-wrap / loop-set. Resuming play from
+            // a different position than the user's previous play position
+            // would be jarring; better to leave them at the post-seek
+            // (likely close-but-not-equal) position without auto-play.
+            if (!r.completed || Math.abs(r.to - time) > 0.05) { highway._onReady = null; return; }
             if (wasPlaying) {
                 if (window._juceMode) {
                     const started = await jucePlayer.play();
