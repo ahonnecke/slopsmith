@@ -4446,7 +4446,9 @@ async function loadSavedLoop(loopId) {
             }
         }
         sel.value = restored;
-        if (!restored) delBtn.classList.add('hidden');
+        // Toggle (not just hide-on-empty) so the delete button shows when
+        // we restored to a saved option's value, not just when restored=''.
+        delBtn.classList.toggle('hidden', !restored);
         return;
     }
     delBtn.classList.remove('hidden');
