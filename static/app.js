@@ -890,9 +890,11 @@ async function showScreen(id) {
     }
     if (id !== 'player') {
         highway.stop();
-        // Cancel any queued seeks AND in-flight shim closures before
-        // stopping playback so neither path can mutate the torn-down
-        // session (mirrors the same dual reset in playSong()).
+        // Cancel any queued seeks, in-flight shim closures, AND active
+        // count-in timers before stopping playback so none of these paths
+        // can mutate the torn-down session (mirrors the same triple reset
+        // in playSong()).
+        _cancelCountIn();
         _resetJuceAudioShimChain();
         _resetAudioSeekState();
         if (window._juceMode) {
@@ -3556,8 +3558,7 @@ async function playSong(filename, arrangement) {
     // outgoing song.
     _resetJuceAudioShimChain();
     // Cancel queued _audioSeek calls from the previous song: bumping the
-    // generation makes their chained callbacks bail out, and the fresh
-    // chain head means new callers don't await the old chain's tail.
+    // generation makes their chained callbacks bail out.
     _resetAudioSeekState();
     if (window._juceMode) {
         // Mirror the showScreen teardown: emit song:pause for the JUCE
@@ -4512,6 +4513,7 @@ async function startCountIn() {
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
             _audioSeek(loopA, 'loop-wrap').then((r) => {
+                if (gen !== _countInGen) return; // teardown during seek
                 // Abort the loop restart in two cases:
                 //   1. Cancelled (player torn down): don't beginCount on a
                 //      new session.

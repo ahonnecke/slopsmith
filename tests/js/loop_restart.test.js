@@ -166,6 +166,9 @@ test('loop:restart aborts when seek lands far from loopA (JUCE rollback)', async
         var loopA = ${sandbox.loopA};
         var loopB = ${sandbox.loopB};
         var _countingIn = false;
+        var _countInGen = 0;
+        var _countInTimer = null;
+        var _countInRaf = 0;
         var isPlaying = false;
         var lastAudioTime = 0;
         ${startCountInSrc}
@@ -181,6 +184,23 @@ test('loop:restart aborts when seek lands far from loopA (JUCE rollback)', async
     const restarts = sandbox.__emitCalls.filter((c) => c.event === 'loop:restart');
     assert.equal(restarts.length, 0, 'rollback must not emit loop:restart');
     assert.equal(sandbox.__getCountingIn(), false, '_countingIn must be cleared on abort');
+});
+
+test('count-in cancellation token bails delayed callbacks (rewindStep + tick)', () => {
+    // Source-level assertion: the gen-capture pattern is in place so
+    // teardown can interrupt an in-flight count-in. Behavioral simulation
+    // of timer cancellation is out of scope for the static extractor; this
+    // verifies the contract is wired into the source.
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const fn = extractFunction(src, 'async function startCountIn()');
+    // Captures gen at entry
+    assert.match(fn, /const gen = _countInGen/, 'startCountIn must capture _countInGen at entry');
+    // Each delayed callback bails on mismatch
+    const guards = [...fn.matchAll(/if \(gen !== _countInGen\) return/g)];
+    assert.ok(guards.length >= 4, `expected ≥4 gen-mismatch bails, found ${guards.length}`);
+    // RAF and timer handles tracked so _cancelCountIn can cancel them
+    assert.match(fn, /_countInRaf = requestAnimationFrame/, 'rewindStep must store its RAF handle in _countInRaf');
+    assert.match(fn, /_countInTimer = setTimeout/, 'tick scheduling must store its timer in _countInTimer');
 });
 
 test('loop:restart fires after highway.setTime, before beginCount', () => {
