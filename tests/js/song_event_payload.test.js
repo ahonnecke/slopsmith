@@ -30,10 +30,14 @@ function extractFunction(src, signature) {
     return src.slice(start, i);
 }
 
-function buildSandbox({ juceMode = false, audioT = 12.5, chartT = 11.8 } = {}) {
+function buildSandbox({ juceMode = false, audioT = 12.5, chartT = 11.8, juceT } = {}) {
+    // When juceT is omitted in JUCE mode, derive a value distinct from
+    // audioT so the JUCE-mode test actually proves _audioTime() reads
+    // from jucePlayer rather than the html5 audio element.
+    const jt = juceT !== undefined ? juceT : (juceMode ? audioT + 100 : audioT);
     const sandbox = {
         audio: { currentTime: audioT },
-        jucePlayer: { currentTime: audioT, duration: 200 },
+        jucePlayer: { currentTime: jt, duration: 200 },
         window: { _juceMode: juceMode },
         highway: {
             getTime: () => chartT,
@@ -68,10 +72,13 @@ test('_songEventPayload returns { time, audioT, chartT, perfNow } (HTML5)', () =
 
 test('_songEventPayload reads from JUCE in juce mode', () => {
     const src = fs.readFileSync(APP_JS, 'utf8');
-    const sandbox = buildSandbox({ juceMode: true, audioT: 42, chartT: 41 });
+    // audioT (audio.currentTime) and juceT (jucePlayer.currentTime) are
+    // distinct so the assertion proves we read from JUCE, not from the
+    // html5 audio element.
+    const sandbox = buildSandbox({ juceMode: true, audioT: 5, juceT: 42, chartT: 41 });
     loadFunctions(sandbox, src);
     const p = sandbox.__payload();
-    assert.equal(p.audioT, 42);
+    assert.equal(p.audioT, 42, 'JUCE mode must read jucePlayer.currentTime, not audio.currentTime');
     assert.equal(p.time, 42);
     assert.equal(p.chartT, 41);
 });
@@ -104,7 +111,9 @@ test('every song:play/pause/ended emit uses _songEventPayload', () => {
     // jucePlayer.stop() resets _pos to 0).
     const src = fs.readFileSync(APP_JS, 'utf8');
     const lines = src.split('\n');
-    const emitRe = /window\.slopsmith\.emit\(\s*['"]song:(play|pause|ended)['"]/;
+    // Accept aliased calls like `sm.emit(...)` (the JUCE shim caches
+    // window.slopsmith in `sm`) — not just literal `window.slopsmith.emit`.
+    const emitRe = /(?:window\.slopsmith|\w+)\.emit\(\s*['"]song:(play|pause|ended)['"]/;
     const okRe = /_songEventPayload\(\)|,\s*payload\s*\)/;
     const offending = [];
     for (const line of lines) {
@@ -125,7 +134,7 @@ test('there are at least 8 song:* emit sites threaded through the helper', () =>
     // count drops, someone removed an emit (regression) or refactored an
     // event away (intentional — this test then needs updating).
     const src = fs.readFileSync(APP_JS, 'utf8');
-    const matches = src.match(/window\.slopsmith\.emit\(\s*['"]song:(play|pause|ended)['"][^)]*\)/g) || [];
+    const matches = src.match(/(?:window\.slopsmith|\w+)\.emit\(\s*['"]song:(play|pause|ended)['"][^)]*\)/g) || [];
     assert.ok(
         matches.length >= 8,
         `expected ≥8 song:* emits, found ${matches.length}`,
