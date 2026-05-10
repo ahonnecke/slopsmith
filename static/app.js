@@ -3409,6 +3409,10 @@ async function _audioSeek(s, reason) {
         // so plugins observe the actual clock — JUCE may clamp or roll back,
         // and HTML5 may snap to the nearest seekable range.
         const to = _audioTime();
+        // Sync the jump-fix tracker so the next 60Hz tick doesn't see a
+        // legitimate far seek (e.g. saved-loop jump > 30s) as a browser
+        // bug and revert it.
+        lastAudioTime = to;
         window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
         return { completed: true, from, to };
     }).catch((err) => {

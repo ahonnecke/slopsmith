@@ -63,6 +63,10 @@ function loadFunctions(sandbox, src) {
     const code = `
         let _audioSeekChain = Promise.resolve();
         let _audioSeekGen = 0;
+        // _audioSeek now syncs the jump-fix tracker so far seeks don't
+        // trigger an immediate revert; declare it here so the sandbox
+        // assignment lands on a real binding rather than an implicit global.
+        let lastAudioTime = 0;
         ${extractFunction(src, 'function _audioTime()')}
         ${extractFunction(src, 'function _audioDuration()')}
         ${extractFunction(src, 'async function _audioSeek(')}
