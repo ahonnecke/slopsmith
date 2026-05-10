@@ -3658,7 +3658,23 @@ async function changeArrangement(index) {
             // a different position than the user's previous play position
             // would be jarring; better to leave them at the post-seek
             // (likely close-but-not-equal) position without auto-play.
-            if (!r.completed || Math.abs(r.to - time) > 0.05) { highway._onReady = null; return; }
+            if (!r.completed || Math.abs(r.to - time) > 0.05) {
+                // changeArrangement paused audio at entry (line 3032) but
+                // didn't update the button or emit song:pause — those were
+                // meant to be no-ops if the auto-resume succeeded. On
+                // abort, sync the transport: button -> 'Play',
+                // sm.isPlaying = false, emit song:pause so plugins see the
+                // paused state.
+                if (wasPlaying) {
+                    document.getElementById('btn-play').textContent = '▶ Play';
+                    if (window.slopsmith) {
+                        window.slopsmith.isPlaying = false;
+                        window.slopsmith.emit('song:pause', { time: _audioTime() });
+                    }
+                }
+                highway._onReady = null;
+                return;
+            }
             if (wasPlaying) {
                 if (window._juceMode) {
                     const started = await jucePlayer.play();
