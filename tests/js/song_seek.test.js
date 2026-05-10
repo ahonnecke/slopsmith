@@ -156,7 +156,7 @@ test('queued seeks cancel cleanly when generation bumps mid-flight', async () =>
     const seeks = sandbox.__emitCalls.filter((c) => c.event === 'song:seek');
     assert.equal(seeks.length, 0, 'cancelled seek must not emit song:seek');
     assert.equal(sandbox.jucePlayer.currentTime, 5, 'cancelled seek must not advance currentTime');
-    assert.equal(result, false, 'cancelled seek must resolve to false so callers can bail');
+    assert.equal(result.completed, false, 'cancelled seek must resolve to {completed: false} so callers can bail');
 });
 
 test('queued seek bails when generation bumps DURING the JUCE seek', async () => {
@@ -181,15 +181,17 @@ test('queued seek bails when generation bumps DURING the JUCE seek', async () =>
     assert.equal(bumpedDuringSeek, true, 'sanity: bump must have fired inside the seek');
     const seeks = sandbox.__emitCalls.filter((c) => c.event === 'song:seek');
     assert.equal(seeks.length, 0, 'mid-seek cancel must not emit song:seek');
-    assert.equal(result, false, 'mid-seek cancel must resolve to false');
+    assert.equal(result.completed, false, 'mid-seek cancel must resolve to {completed: false}');
 });
 
-test('_audioSeek resolves to true on a successful run', async () => {
+test('_audioSeek resolves to {completed, from, to} on a successful run', async () => {
     const src = fs.readFileSync(APP_JS, 'utf8');
     const sandbox = buildSandbox({ juceMode: false, currentTime: 5 });
     loadFunctions(sandbox, src);
     const result = await sandbox.__audioSeek(10, 'success-test');
-    assert.equal(result, true, 'completed seek must resolve to true');
+    assert.equal(result.completed, true, 'completed seek must resolve to completed:true');
+    assert.equal(result.from, 5, 'from must be the pre-seek clock');
+    assert.equal(result.to, 10, 'to must be the verified post-seek clock');
 });
 
 test('_audioSeek emits the verified post-seek clock when JUCE rolls back', async () => {

@@ -3244,8 +3244,8 @@ let _resetJuceAudioShimChain = function () {};
         const seekTime = batch.seekTime;
         if (wantsPause && seekTime !== undefined) {
             enqueue(async (gen) => {
-                const completed = await _audioSeek(seekTime, 'audio-element-shim');
-                if (!completed) return; // seek cancelled by teardown
+                const r = await _audioSeek(seekTime, 'audio-element-shim');
+                if (!r.completed) return; // seek cancelled by teardown
                 if (gen !== _juceShimGen) return;
                 if (!forUpcomingPlay) {
                     await jucePlayer.pause();
@@ -3278,8 +3278,8 @@ let _resetJuceAudioShimChain = function () {};
         }
         if (seekTime !== undefined) {
             enqueue(async (gen) => {
-                const completed = await _audioSeek(seekTime, 'audio-element-shim');
-                if (!completed) return; // seek cancelled by teardown
+                const r = await _audioSeek(seekTime, 'audio-element-shim');
+                if (!r.completed) return; // seek cancelled by teardown
                 if (gen !== _juceShimGen) return;
                 audio.dispatchEvent(new Event('seeked'));
             });
@@ -3373,11 +3373,16 @@ function _resetAudioSeekState() {
     _audioSeekGen++;
     _audioSeekChain = Promise.resolve();
 }
-// Returns `true` if the seek ran to completion and emitted song:seek;
-// `false` if the seek was cancelled by a teardown gen bump (or threw).
+// Resolves to `{ completed, from, to }`:
+//   - completed: true if the seek ran to completion and emitted song:seek;
+//                false if cancelled by a teardown gen bump (or threw).
+//   - from: chart clock just before the seek (NaN on cancel before from-read).
+//   - to:   verified post-seek clock (NaN on cancel/throw).
 // Callers that fire follow-up work after the seek (count-in, arrangement
-// restore, etc.) should check the return so they don't act on a torn-down
-// session.
+// restore, etc.) should check `completed` so they don't act on a torn-down
+// session. Callers that need the actual landed position (because JUCE may
+// clamp or HTML5 may snap to the seekable range) should read `to` rather
+// than re-using the requested `s`.
 async function _audioSeek(s, reason) {
     // Single funnel for every audio repositioning. Emits song:seek so
     // plugins (notedetect detection-suppression during seek transients,
@@ -3387,21 +3392,21 @@ async function _audioSeek(s, reason) {
     // 'arrangement-restore', 'jump-fix') so subscribers can filter.
     const gen = _audioSeekGen;
     _audioSeekChain = _audioSeekChain.then(async () => {
-        if (gen !== _audioSeekGen) return false; // torn down before our turn
+        if (gen !== _audioSeekGen) return { completed: false, from: NaN, to: NaN };
         const from = _audioTime();
         if (window._juceMode) await jucePlayer.seek(s);
         else audio.currentTime = s;
-        if (gen !== _audioSeekGen) return false; // torn down during seek
+        if (gen !== _audioSeekGen) return { completed: false, from, to: NaN };
         // Read the verified post-seek position rather than the requested `s`
         // so plugins observe the actual clock — JUCE may clamp or roll back,
         // and HTML5 may snap to the nearest seekable range.
         const to = _audioTime();
         window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
-        return true;
+        return { completed: true, from, to };
     }).catch((err) => {
         // Don't let one failed seek poison subsequent ones.
         console.warn('[_audioSeek]', err);
-        return false;
+        return { completed: false, from: NaN, to: NaN };
     });
     return _audioSeekChain;
 }
@@ -3624,9 +3629,9 @@ async function changeArrangement(index) {
         highway._onReady = async () => {
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
-            const completed = await _audioSeek(time, 'arrangement-restore');
+            const r = await _audioSeek(time, 'arrangement-restore');
             // Don't auto-resume if the player was torn down during the seek.
-            if (!completed) { highway._onReady = null; return; }
+            if (!r.completed) { highway._onReady = null; return; }
             if (wasPlaying) {
                 if (window._juceMode) {
                     const started = await jucePlayer.play();
@@ -4378,9 +4383,9 @@ async function loadSavedLoop(loopId) {
     }
     loopA = parseFloat(opt.dataset.start);
     loopB = parseFloat(opt.dataset.end);
-    const completed = await _audioSeek(loopA, 'loop-set');
+    const r = await _audioSeek(loopA, 'loop-set');
     // Don't repaint loop UI if the seek was cancelled by teardown.
-    if (!completed) return;
+    if (!r.completed) return;
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
@@ -4495,19 +4500,22 @@ async function startCountIn() {
             // Rewind done — set final position and start count.
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
-            _audioSeek(loopA, 'loop-wrap').then((completed) => {
+            _audioSeek(loopA, 'loop-wrap').then((r) => {
                 // If the player was torn down mid-seek (user navigated away,
                 // new song started), don't run beginCount or emit on the new
                 // session — the seek was cancelled. Clear _countingIn so the
                 // 60Hz tick can resume normal time/jump-fix processing
                 // instead of staying frozen waiting for a count-in that
                 // will never finish.
-                if (!completed) { _countingIn = false; return; }
-                lastAudioTime = loopA;
-                highway.setTime(loopA);
-                // Emit before beginCount so plugins that capture per-iteration
-                // state (notedetect drill-mode score capture) see the wrap at
-                // the same moment chartTime resets, not after the 4-beat count.
+                if (!r.completed) { _countingIn = false; return; }
+                // Use the verified post-seek clock for the chart so audio
+                // and chart stay in sync if JUCE clamped to slightly
+                // before/after loopA. The loop:restart event keeps `time:
+                // loopA` because subscribers treat that as the semantic
+                // marker for "new iteration starts at A", not the actual
+                // audio position.
+                lastAudioTime = r.to;
+                highway.setTime(r.to);
                 window.slopsmith.emit('loop:restart', { loopA, loopB, time: loopA });
                 beginCount();
             });

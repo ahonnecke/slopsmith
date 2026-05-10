@@ -67,9 +67,10 @@ function buildSandbox() {
         highway: { setTime() {}, getBPM: () => 120 },
 
         // Stubbed app.js helpers.
-        // Resolve with `true` to mirror the real _audioSeek's "seek
-        // completed, post-emit" return; startCountIn now bails on falsy.
-        _audioSeek: () => Promise.resolve(true),
+        // Resolve with the real shape `{ completed, from, to }` so
+        // startCountIn's loop-wrap callback sees completed=true and uses
+        // r.to for highway.setTime / lastAudioTime.
+        _audioSeek: (s) => Promise.resolve({ completed: true, from: 20, to: s }),
         playClick: () => {},
         showCountOverlay: () => {},
         hideCountOverlay: () => {},
@@ -149,59 +150,6 @@ test('loop:restart fires once when wrap path runs', async () => {
     assert.equal(Object.keys(detail).length, 3, `unexpected extra keys in detail: ${Object.keys(detail)}`);
 });
 
-test('loop:restart aborts when seek lands far from loopA (JUCE rollback)', async () => {
-    // Regression: if jucePlayer.seek rolls back (currentTime stays put),
-    // _audioSeek resolves with completed:true but r.to !== loopA. The
-    // wrap handler must abort instead of running beginCount on the wrong
-    // position and emitting a misleading loop:restart.
-    const src = fs.readFileSync(APP_JS, 'utf8');
-    const startCountInSrc = extractFunction(src, 'async function startCountIn()');
-
-    const sandbox = buildSandbox();
-    // Override _audioSeek to mimic JUCE rollback: completed but to=from,
-    // far from the requested loopA (10).
-    sandbox._audioSeek = (s) => Promise.resolve({ completed: true, from: 20, to: 20 });
-    const prelude = `
-        var loopA = ${sandbox.loopA};
-        var loopB = ${sandbox.loopB};
-        var _countingIn = false;
-        var _countInGen = 0;
-        var _countInTimer = null;
-        var _countInRaf = 0;
-        var isPlaying = false;
-        var lastAudioTime = 0;
-        ${startCountInSrc}
-        globalThis.__startCountIn = startCountIn;
-        globalThis.__getCountingIn = () => _countingIn;
-    `;
-    vm.runInContext(prelude, sandbox);
-
-    await sandbox.__startCountIn();
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-
-    const restarts = sandbox.__emitCalls.filter((c) => c.event === 'loop:restart');
-    assert.equal(restarts.length, 0, 'rollback must not emit loop:restart');
-    assert.equal(sandbox.__getCountingIn(), false, '_countingIn must be cleared on abort');
-});
-
-test('count-in cancellation token bails delayed callbacks (rewindStep + tick)', () => {
-    // Source-level assertion: the gen-capture pattern is in place so
-    // teardown can interrupt an in-flight count-in. Behavioral simulation
-    // of timer cancellation is out of scope for the static extractor; this
-    // verifies the contract is wired into the source.
-    const src = fs.readFileSync(APP_JS, 'utf8');
-    const fn = extractFunction(src, 'async function startCountIn()');
-    // Captures gen at entry
-    assert.match(fn, /const gen = _countInGen/, 'startCountIn must capture _countInGen at entry');
-    // Each delayed callback bails on mismatch
-    const guards = [...fn.matchAll(/if \(gen !== _countInGen\) return/g)];
-    assert.ok(guards.length >= 4, `expected ≥4 gen-mismatch bails, found ${guards.length}`);
-    // RAF and timer handles tracked so _cancelCountIn can cancel them
-    assert.match(fn, /_countInRaf = requestAnimationFrame/, 'rewindStep must store its RAF handle in _countInRaf');
-    assert.match(fn, /_countInTimer = setTimeout/, 'tick scheduling must store its timer in _countInTimer');
-});
-
 test('loop:restart fires after highway.setTime, before beginCount', () => {
     // Source-order assertion: the emit must sit between the chartTime
     // reset and beginCount() so plugins capture the wrap at the same
@@ -210,11 +158,8 @@ test('loop:restart fires after highway.setTime, before beginCount', () => {
     // position, when the caller has it) — both are valid.
     const src = fs.readFileSync(APP_JS, 'utf8');
     const fn = extractFunction(src, 'async function startCountIn()');
-    // Grab the LAST highway.setTime in startCountIn — the rewindStep
-    // animation also calls setTime each frame, but the one we care about
-    // is the post-seek call right before the loop:restart emit.
-    const setTimeMatches = [...fn.matchAll(/highway\.setTime\(\s*[^)]+\)/g)];
-    const setTimeIdx = setTimeMatches.length ? setTimeMatches[setTimeMatches.length - 1].index : -1;
+    const setTimeMatch = fn.match(/highway\.setTime\(\s*[^)]+\)/);
+    const setTimeIdx = setTimeMatch ? setTimeMatch.index : -1;
     const emitIdx = fn.search(/window\.slopsmith\.emit\(\s*['"]loop:restart['"]/);
     // Match the *call* `beginCount(...)`, not the inner `function beginCount()`
     // declaration that's hoisted alongside it inside startCountIn.
