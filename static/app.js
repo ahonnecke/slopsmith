@@ -3364,8 +3364,11 @@ function _audioTime() { return window._juceMode ? jucePlayer.currentTime : audio
 function _audioDuration() { return window._juceMode ? jucePlayer.duration : audio.duration; }
 // Serializes seeks so concurrent callers (e.g. user ⏪ during a loop wrap)
 // don't interleave their from/to reads — each call captures `from` only
-// once the previous seek + emit have completed.
+// once the previous seek + emit have completed. The generation token
+// lets song teardown invalidate queued seeks so they don't run against
+// the new song's player and emit a stale song:seek.
 let _audioSeekChain = Promise.resolve();
+let _audioSeekGen = 0;
 async function _audioSeek(s, reason) {
     // Single funnel for every audio repositioning. Emits song:seek so
     // plugins (notedetect detection-suppression during seek transients,
@@ -3373,10 +3376,13 @@ async function _audioSeek(s, reason) {
     // jump regardless of which UI path triggered it. `reason` is a
     // free-form short string ('seek-by', 'loop-wrap', 'loop-set',
     // 'arrangement-restore', 'jump-fix') so subscribers can filter.
+    const gen = _audioSeekGen;
     _audioSeekChain = _audioSeekChain.then(async () => {
+        if (gen !== _audioSeekGen) return; // session torn down before our turn
         const from = _audioTime();
         if (window._juceMode) await jucePlayer.seek(s);
         else audio.currentTime = s;
+        if (gen !== _audioSeekGen) return; // session torn down during seek
         // Read the verified post-seek position rather than the requested `s`
         // so plugins observe the actual clock — JUCE may clamp or roll back,
         // and HTML5 may snap to the nearest seekable range.
@@ -3528,8 +3534,10 @@ async function playSong(filename, arrangement) {
     // outgoing song.
     _resetJuceAudioShimChain();
     // Cancel queued _audioSeek calls from the previous song: bumping the
-    // generation makes their chained callbacks bail out.
-    _resetAudioSeekState();
+    // generation makes their chained callbacks bail out, and the fresh
+    // chain head means new callers don't await the old chain's tail.
+    _audioSeekGen++;
+    _audioSeekChain = Promise.resolve();
     if (window._juceMode) {
         // Mirror the showScreen teardown: emit song:pause for the JUCE
         // path so plugins don't see a stale "playing" state on song

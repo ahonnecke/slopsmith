@@ -62,12 +62,14 @@ function buildSandbox({ juceMode = false, currentTime = 10 } = {}) {
 function loadFunctions(sandbox, src) {
     const code = `
         let _audioSeekChain = Promise.resolve();
+        let _audioSeekGen = 0;
         ${extractFunction(src, 'function _audioTime()')}
         ${extractFunction(src, 'function _audioDuration()')}
         ${extractFunction(src, 'async function _audioSeek(')}
         ${extractFunction(src, 'async function seekBy(')}
         globalThis.__audioSeek = _audioSeek;
         globalThis.__seekBy = seekBy;
+        globalThis.__bumpGen = () => { _audioSeekGen++; _audioSeekChain = Promise.resolve(); };
     `;
     vm.runInContext(code, sandbox);
 }
@@ -131,6 +133,29 @@ test('concurrent _audioSeek calls serialize and capture from atomically', async 
     assert.equal(seeks[1].detail.from, 10, 'second seek must capture from after first resolved');
     assert.equal(seeks[1].detail.to, 20);
     assert.equal(seeks[1].detail.reason, 'second');
+});
+
+test('queued seeks cancel cleanly when generation bumps mid-flight', async () => {
+    // Simulates song teardown: a seek is enqueued, then the generation
+    // bumps before the seek's chain callback runs. The pending callback
+    // must bail out — no song:seek emit, no mutation of the new session's
+    // currentTime.
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const sandbox = buildSandbox({ juceMode: true, currentTime: 5 });
+    sandbox.jucePlayer.seek = (s) => new Promise((resolve) => setTimeout(() => {
+        sandbox.jucePlayer.currentTime = s;
+        resolve();
+    }, 5));
+    loadFunctions(sandbox, src);
+
+    // Enqueue a seek but bump the generation before the chain's microtask runs.
+    const p = sandbox.__audioSeek(99, 'cancel-test');
+    sandbox.__bumpGen();
+    await p;
+
+    const seeks = sandbox.__emitCalls.filter((c) => c.event === 'song:seek');
+    assert.equal(seeks.length, 0, 'cancelled seek must not emit song:seek');
+    assert.equal(sandbox.jucePlayer.currentTime, 5, 'cancelled seek must not advance currentTime');
 });
 
 test('_audioSeek emits the verified post-seek clock when JUCE rolls back', async () => {
