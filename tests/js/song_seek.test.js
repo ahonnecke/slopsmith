@@ -54,6 +54,11 @@ function buildSandbox({ juceMode = false, currentTime = 10 } = {}) {
             },
         },
         __emitCalls: emitCalls,
+        // _juceSeekWithTimeout uses setTimeout for its Promise.race;
+        // expose Node's setTimeout to the vm context.
+        setTimeout,
+        clearTimeout,
+        Promise,
     };
     vm.createContext(sandbox);
     return sandbox;
@@ -67,6 +72,11 @@ function loadFunctions(sandbox, src) {
         // trigger an immediate revert; declare it here so the sandbox
         // assignment lands on a real binding rather than an implicit global.
         let lastAudioTime = 0;
+        // _audioSeek wraps jucePlayer.seek in a timeout race; pull in the
+        // helper + constant. Tests can override jucePlayer.seek to vary
+        // behavior; the timeout (2 s) is well above any test setTimeout.
+        const _JUCE_SEEK_TIMEOUT_MS = 2000;
+        ${extractFunction(src, 'function _juceSeekWithTimeout(')}
         ${extractFunction(src, 'function _audioTime()')}
         ${extractFunction(src, 'function _audioDuration()')}
         ${extractFunction(src, 'async function _audioSeek(')}

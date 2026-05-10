@@ -900,15 +900,14 @@ async function showScreen(id) {
         if (window._juceMode) {
             // HTML5 emits 'pause' via the media-element listener below;
             // JUCE doesn't, so plugins would stay stuck in "playing".
-            // Snapshot the canonical payload BEFORE stop() resets _pos
-            // to 0, then emit AFTER stop completes. Mirrors the HTML5
-            // pause contract via _songEventPayload (audioT/chartT/perfNow).
-            const payload = _songEventPayload();
+            // Snapshot the position before stop() resets it, then emit
+            // song:pause to mirror the HTML5 contract.
+            const pausedAt = jucePlayer.currentTime;
             const wasPlaying = isPlaying;
             await jucePlayer.stop().catch(() => {});
             if (wasPlaying && window.slopsmith) {
                 window.slopsmith.isPlaying = false;
-                window.slopsmith.emit('song:pause', payload);
+                window.slopsmith.emit('song:pause', { time: pausedAt });
             }
             window._juceMode = false;
             window._juceAudioUrl = null;
@@ -3391,6 +3390,21 @@ function _resetAudioSeekState() {
 // session. Callers that need the actual landed position (because JUCE may
 // clamp or HTML5 may snap to the seekable range) should read `to` rather
 // than re-using the requested `s`.
+// Time-box the JUCE IPC so a single hung seek can't block the global
+// _audioSeekChain forever (which would freeze every subsequent reposition
+// path: seekBy, loop-wrap, jump-fix, shimmed audio.currentTime).
+const _JUCE_SEEK_TIMEOUT_MS = 2000;
+function _juceSeekWithTimeout(s) {
+    let timer;
+    const seekP = jucePlayer.seek(s);
+    const timeoutP = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('JUCE seek timed out')), _JUCE_SEEK_TIMEOUT_MS);
+    });
+    // Clear the timer once the race settles either way; without this the
+    // pending timeout keeps the event loop alive (and eventually rejects
+    // an unawaited promise) even after a successful seek.
+    return Promise.race([seekP, timeoutP]).finally(() => clearTimeout(timer));
+}
 async function _audioSeek(s, reason) {
     // Single funnel for every audio repositioning. Emits song:seek so
     // plugins (notedetect detection-suppression during seek transients,
@@ -3402,7 +3416,7 @@ async function _audioSeek(s, reason) {
     _audioSeekChain = _audioSeekChain.then(async () => {
         if (gen !== _audioSeekGen) return { completed: false, from: NaN, to: NaN };
         const from = _audioTime();
-        if (window._juceMode) await jucePlayer.seek(s);
+        if (window._juceMode) await _juceSeekWithTimeout(s);
         else audio.currentTime = s;
         if (gen !== _audioSeekGen) return { completed: false, from, to: NaN };
         // Read the verified post-seek position rather than the requested `s`
@@ -3568,14 +3582,12 @@ async function playSong(filename, arrangement) {
         // Mirror the showScreen teardown: emit song:pause for the JUCE
         // path so plugins don't see a stale "playing" state on song
         // change. (HTML5 fires it via the audio element 'pause' event.)
-        // Snapshot payload BEFORE stop() resets _pos so audioT/chartT
-        // capture the actual paused position.
-        const payload = _songEventPayload();
+        const pausedAt = jucePlayer.currentTime;
         const wasPlaying = isPlaying;
         await jucePlayer.stop().catch(() => {});
         if (wasPlaying && window.slopsmith) {
             window.slopsmith.isPlaying = false;
-            window.slopsmith.emit('song:pause', payload);
+            window.slopsmith.emit('song:pause', { time: pausedAt });
         }
         window._juceMode = false;
         window._juceAudioUrl = null;
