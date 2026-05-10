@@ -94,7 +94,8 @@ test('setLoop mutates loopA/loopB and seeks to A', async () => {
     const sandbox = buildSandbox();
     loadFunctions(sandbox, src);
 
-    await sandbox.__setLoop(5.5, 12.25);
+    const result = await sandbox.__setLoop(5.5, 12.25);
+    assert.equal(result, true, 'successful seek must resolve to true (plugin contract)');
     const { loopA, loopB } = sandbox.__getLoop();
     assert.equal(loopA, 5.5);
     assert.equal(loopB, 12.25);
