@@ -4547,7 +4547,20 @@ async function startCountIn() {
                 // 50 ms tolerance: well within JUCE's normal seek precision
                 // but tight enough to catch a real rollback or no-op.
                 if (!r.completed || Math.abs(r.to - loopA) > 0.05) {
+                    // startCountIn paused audio at entry but left isPlaying
+                    // alone — beginCount would have set it on resume. On
+                    // abort, sync the transport: audio is paused, so
+                    // isPlaying must reflect that and the button + plugin
+                    // host must agree.
                     _countingIn = false;
+                    if (isPlaying) {
+                        isPlaying = false;
+                        document.getElementById('btn-play').textContent = '▶ Play';
+                        if (window.slopsmith) {
+                            window.slopsmith.isPlaying = false;
+                            window.slopsmith.emit('song:pause', { time: _audioTime() });
+                        }
+                    }
                     return;
                 }
                 // Use the verified post-seek clock for the chart so audio
