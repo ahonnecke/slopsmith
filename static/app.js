@@ -4387,11 +4387,16 @@ async function loadSavedLoop(loopId) {
         delBtn.classList.add('hidden');
         return;
     }
-    loopA = parseFloat(opt.dataset.start);
-    loopB = parseFloat(opt.dataset.end);
-    const r = await _audioSeek(loopA, 'loop-set');
-    // Don't repaint loop UI if the seek was cancelled by teardown.
-    if (!r.completed) return;
+    const newA = parseFloat(opt.dataset.start);
+    const newB = parseFloat(opt.dataset.end);
+    // Don't arm loopA/loopB before the seek lands. If the seek aborts
+    // (teardown) or rolls back (JUCE clamp), leaving them set would let
+    // the 60Hz tick's wrap detector (`ct >= loopB`) trigger startCountIn
+    // even though loading the saved loop effectively failed.
+    const r = await _audioSeek(newA, 'loop-set');
+    if (!r.completed || Math.abs(r.to - newA) > 0.05) return;
+    loopA = newA;
+    loopB = newB;
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
