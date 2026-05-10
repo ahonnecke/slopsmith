@@ -29,11 +29,17 @@ function extractFunction(src, signature) {
     return src.slice(start, i);
 }
 
-function buildSandbox({ juceMode = false, currentTime = 10 } = {}) {
+function buildSandbox({ juceMode = false, currentTime = 10, duration = Infinity } = {}) {
     const emitCalls = [];
     const audio = {
+        duration,
         get currentTime() { return audio._t; },
-        set currentTime(v) { audio._t = v; },
+        // Clamp to [0, duration] like a real <audio> element so the
+        // post-seek readback for `to` reflects the landed position
+        // (the browser snaps out-of-range writes to the seekable range).
+        set currentTime(v) {
+            audio._t = Math.max(0, Math.min(v, audio.duration));
+        },
         _t: currentTime,
     };
     const jucePlayer = {
@@ -208,6 +214,20 @@ test('_audioSeek resolves to {completed, from, to} on a successful run', async (
     assert.equal(result.completed, true, 'completed seek must resolve to completed:true');
     assert.equal(result.from, 5, 'from must be the pre-seek clock');
     assert.equal(result.to, 10, 'to must be the verified post-seek clock');
+});
+
+test('_audioSeek emits the landed clock when HTML5 clamps to duration', async () => {
+    // Regression: the HTML5 path's `to` must reflect the actual landed
+    // position (clamped to seekable range), not the requested target.
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const sandbox = buildSandbox({ juceMode: false, currentTime: 10, duration: 30 });
+    loadFunctions(sandbox, src);
+
+    await sandbox.__audioSeek(99, 'html5-clamp');
+
+    const seek = sandbox.__emitCalls.find((c) => c.event === 'song:seek');
+    assert.equal(seek.detail.from, 10);
+    assert.equal(seek.detail.to, 30, 'to must be the clamped landed position, not the requested target');
 });
 
 test('_audioSeek emits the verified post-seek clock when JUCE rolls back', async () => {
