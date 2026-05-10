@@ -61,6 +61,7 @@ function buildSandbox({ juceMode = false, currentTime = 10 } = {}) {
 
 function loadFunctions(sandbox, src) {
     const code = `
+        let _audioSeekChain = Promise.resolve();
         ${extractFunction(src, 'function _audioTime()')}
         ${extractFunction(src, 'function _audioDuration()')}
         ${extractFunction(src, 'async function _audioSeek(')}
@@ -99,6 +100,37 @@ test('_audioSeek emits song:seek (JUCE path) after seek promise resolves', async
     assert.equal(seeks[0].detail.to, 99);
     assert.equal(seeks[0].detail.reason, 'juce-test');
     assert.equal(sandbox.jucePlayer.currentTime, 99, 'JUCE player position must be advanced');
+});
+
+test('concurrent _audioSeek calls serialize and capture from atomically', async () => {
+    // Without serialization, two overlapping JUCE seeks would both read
+    // `from` before either resolved, making the second emit's `from` stale.
+    // The chain ensures each call's from/to bracket only its own seek.
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const sandbox = buildSandbox({ juceMode: true, currentTime: 0 });
+    // Make jucePlayer.seek slow so the second call genuinely overlaps the
+    // first if there's no serialization.
+    sandbox.jucePlayer.seek = (s) => new Promise((resolve) => setTimeout(() => {
+        sandbox.jucePlayer.currentTime = s;
+        resolve();
+    }, 5));
+    loadFunctions(sandbox, src);
+
+    // Fire two seeks back-to-back without awaiting the first.
+    const p1 = sandbox.__audioSeek(10, 'first');
+    const p2 = sandbox.__audioSeek(20, 'second');
+    await Promise.all([p1, p2]);
+
+    const seeks = sandbox.__emitCalls.filter((c) => c.event === 'song:seek');
+    assert.equal(seeks.length, 2);
+    // First seek: from=0 (initial), to=10
+    assert.equal(seeks[0].detail.from, 0);
+    assert.equal(seeks[0].detail.to, 10);
+    assert.equal(seeks[0].detail.reason, 'first');
+    // Second seek: from=10 (post-first, captured INSIDE the chain), to=20
+    assert.equal(seeks[1].detail.from, 10, 'second seek must capture from after first resolved');
+    assert.equal(seeks[1].detail.to, 20);
+    assert.equal(seeks[1].detail.reason, 'second');
 });
 
 test('_audioSeek emits the verified post-seek clock when JUCE rolls back', async () => {

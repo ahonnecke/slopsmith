@@ -3362,6 +3362,10 @@ let _resetJuceAudioShimChain = function () {};
 
 function _audioTime() { return window._juceMode ? jucePlayer.currentTime : audio.currentTime; }
 function _audioDuration() { return window._juceMode ? jucePlayer.duration : audio.duration; }
+// Serializes seeks so concurrent callers (e.g. user ⏪ during a loop wrap)
+// don't interleave their from/to reads — each call captures `from` only
+// once the previous seek + emit have completed.
+let _audioSeekChain = Promise.resolve();
 async function _audioSeek(s, reason) {
     // Single funnel for every audio repositioning. Emits song:seek so
     // plugins (notedetect detection-suppression during seek transients,
@@ -3369,14 +3373,20 @@ async function _audioSeek(s, reason) {
     // jump regardless of which UI path triggered it. `reason` is a
     // free-form short string ('seek-by', 'loop-wrap', 'loop-set',
     // 'arrangement-restore', 'jump-fix') so subscribers can filter.
-    const from = _audioTime();
-    if (window._juceMode) await jucePlayer.seek(s);
-    else audio.currentTime = s;
-    // Read the verified post-seek position rather than the requested `s` so
-    // plugins observe the actual clock — JUCE may clamp or roll back, and
-    // HTML5 may snap to the nearest seekable range.
-    const to = _audioTime();
-    window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
+    _audioSeekChain = _audioSeekChain.then(async () => {
+        const from = _audioTime();
+        if (window._juceMode) await jucePlayer.seek(s);
+        else audio.currentTime = s;
+        // Read the verified post-seek position rather than the requested `s`
+        // so plugins observe the actual clock — JUCE may clamp or roll back,
+        // and HTML5 may snap to the nearest seekable range.
+        const to = _audioTime();
+        window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
+    }).catch((err) => {
+        // Don't let one failed seek poison subsequent ones.
+        console.warn('[_audioSeek]', err);
+    });
+    return _audioSeekChain;
 }
 let currentFilename = '';
 // Plugin context API — lightweight event bus for plugin integration
@@ -4534,6 +4544,10 @@ setInterval(() => {
         else if (!window._juceMode && isPlaying && Math.abs(ct - lastAudioTime) > 30 && lastAudioTime > 0) {
             console.warn(`Audio time jumped from ${lastAudioTime.toFixed(1)} to ${ct.toFixed(1)}, resetting`);
             _audioSeek(lastAudioTime, 'jump-fix');
+            // Treat the corrected position as canonical for the rest of this
+            // tick. Otherwise we'd write the stale jumped `ct` into
+            // lastAudioTime below and ping-pong on the next tick.
+            ct = lastAudioTime;
         }
         lastAudioTime = ct;
         document.getElementById('hud-time').textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
