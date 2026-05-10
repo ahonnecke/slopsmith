@@ -4395,7 +4395,24 @@ async function loadSavedLoop(loopId) {
     // the 60Hz tick's wrap detector (`ct >= loopB`) trigger startCountIn
     // even though loading the saved loop effectively failed.
     const r = await _audioSeek(newA, 'loop-set');
-    if (!r.completed || Math.abs(r.to - newA) > 0.05) return;
+    if (!r.completed || Math.abs(r.to - newA) > 0.05) {
+        // Resync the dropdown with the still-active loop state so the UI
+        // doesn't lie about which loop is loaded. Find the option whose
+        // bounds match the current loopA/loopB; fall back to "" (no
+        // selection) when no match exists.
+        let restored = '';
+        if (loopA !== null && loopB !== null) {
+            for (const o of sel.options) {
+                if (parseFloat(o.dataset.start) === loopA && parseFloat(o.dataset.end) === loopB) {
+                    restored = o.value;
+                    break;
+                }
+            }
+        }
+        sel.value = restored;
+        if (!restored) delBtn.classList.add('hidden');
+        return;
+    }
     loopA = newA;
     loopB = newB;
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
