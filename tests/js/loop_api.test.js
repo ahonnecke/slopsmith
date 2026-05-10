@@ -46,6 +46,10 @@ function buildSandbox() {
                 className: '',
                 textContent: '',
                 value: '',
+                // _syncSavedLoopSelection iterates over <select>.options.
+                // An empty option list is fine for these unit tests; the
+                // sync becomes a no-op (no matching option found).
+                options: [],
                 classList: { add() {}, remove() {}, toggle() {} },
             }),
         },
@@ -74,6 +78,7 @@ function loadFunctions(sandbox, src) {
         var loopA = null;
         var loopB = null;
         ${extractFunction(src, 'function clearLoop()')}
+        ${extractFunction(src, 'function _syncSavedLoopSelection()')}
         ${extractFunction(src, 'async function setLoop(')}
         ${extractFunction(src, 'function updateLoopUI()')}
         // Expose for the test runner.
