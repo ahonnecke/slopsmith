@@ -449,12 +449,18 @@ def parse_arrangement(xml_path: str) -> Arrangement:
     if el is not None and el.text:
         arr_name = el.text
 
-    # Tuning
+    # Tuning. RS schema has string0..string5; extended-range arrangements
+    # (7/8-string guitar, 5/6-string bass authored via GP import) carry
+    # additional string6/string7 attributes that we preserve when present.
     tuning = [0] * 6
     el = root.find("tuning")
     if el is not None:
         for i in range(6):
             tuning[i] = _int(el, f"string{i}")
+        i = 6
+        while el.get(f"string{i}") is not None:
+            tuning.append(_int(el, f"string{i}"))
+            i += 1
 
     # Capo
     capo = 0
@@ -465,16 +471,21 @@ def parse_arrangement(xml_path: str) -> Arrangement:
         except ValueError:
             pass
 
-    # Chord templates
+    # Chord templates. RS schema names fret0..fret5 / finger0..finger5;
+    # extended-range arrangements emit additional fret6/finger6 (and so on)
+    # which we preserve so 7/8-string chord templates round-trip correctly.
     chord_templates = []
     container = root.find("chordTemplates")
     if container is not None:
         for ct in container.findall("chordTemplate"):
+            width = 6
+            while ct.get(f"fret{width}") is not None or ct.get(f"finger{width}") is not None:
+                width += 1
             chord_templates.append(
                 ChordTemplate(
                     name=ct.get("chordName", ""),
-                    fingers=[_int(ct, f"finger{i}", -1) for i in range(6)],
-                    frets=[_int(ct, f"fret{i}", -1) for i in range(6)],
+                    fingers=[_int(ct, f"finger{i}", -1) for i in range(width)],
+                    frets=[_int(ct, f"fret{i}", -1) for i in range(width)],
                 )
             )
 
@@ -519,7 +530,7 @@ def parse_arrangement(xml_path: str) -> Arrangement:
                 cid = _int(c, "chordId")
                 if not chord_notes and cid < len(chord_templates):
                     ct = chord_templates[cid]
-                    for s in range(6):
+                    for s in range(len(ct.frets)):
                         if ct.frets[s] >= 0:
                             chord_notes.append(Note(time=t, string=s, fret=ct.frets[s]))
                 lv_chords.append(Chord(
