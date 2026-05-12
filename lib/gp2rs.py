@@ -92,11 +92,18 @@ class PlaybackEntry:
 
         output_time = (authored_secs - mh_authored_start_secs)
                       + output_start_secs + audio_offset
+
+    ``duration_secs`` is the same value the schedule used when stepping
+    ``output_start_secs`` forward, so consumers (e.g. ``song_length``
+    derivation) can compute ``output_end = output_start_secs +
+    duration_secs`` without redoing the time-signature math the schedule
+    deliberately avoids for irregular / pickup measures.
     """
     mh_index: int
     pass_index: int
     output_start_secs: float
     mh_authored_start_secs: float
+    duration_secs: float
 
 
 def _build_tempo_map(song: guitarpro.Song) -> list[TempoEvent]:
@@ -276,6 +283,7 @@ def _build_playback_schedule(
             pass_index=pass_index,
             output_start_secs=output_t,
             mh_authored_start_secs=authored_starts[idx],
+            duration_secs=durations[idx],
         ))
         output_t += durations[idx]
 
@@ -438,6 +446,7 @@ def convert_track(
     audio_offset: float = 0.0,
     arrangement_name: str = "",
     force_standard_tuning: bool = False,
+    *,
     expand_repeats: bool = True,
 ) -> str:
     """Convert a GP track to Rocksmith 2014 arrangement XML string.
@@ -660,7 +669,7 @@ def convert_track(
         last_entry = schedule[-1]
         song_length = (
             last_entry.output_start_secs
-            + _measure_duration_secs(headers[last_entry.mh_index], tempo_map)
+            + last_entry.duration_secs
             + audio_offset
         )
     else:
@@ -978,6 +987,7 @@ def convert_piano_track(
     track_index: int,
     audio_offset: float = 0.0,
     arrangement_name: str = "Keys",
+    *,
     expand_repeats: bool = True,
 ) -> str:
     """Convert a GP piano/keyboard track to Rocksmith XML using MIDI encoding.
@@ -1128,7 +1138,7 @@ def convert_piano_track(
         last_entry = schedule[-1]
         song_length = (
             last_entry.output_start_secs
-            + _measure_duration_secs(headers[last_entry.mh_index], tempo_map)
+            + last_entry.duration_secs
             + audio_offset
         )
     else:
@@ -1161,6 +1171,7 @@ def convert_drum_track(
     track_index: int,
     audio_offset: float = 0.0,
     arrangement_name: str = "Drums",
+    *,
     expand_repeats: bool = True,
 ) -> str:
     """Convert a GP drum/percussion track to Rocksmith XML using MIDI encoding.
@@ -1308,7 +1319,7 @@ def convert_drum_track(
         last_entry = schedule[-1]
         song_length = (
             last_entry.output_start_secs
-            + _measure_duration_secs(headers[last_entry.mh_index], tempo_map)
+            + last_entry.duration_secs
             + audio_offset
         )
     else:
@@ -1342,6 +1353,7 @@ def convert_file(
     audio_offset: float = 0.0,
     arrangement_names: dict[int, str] | None = None,
     force_standard_tuning: bool = False,
+    *,
     expand_repeats: bool = True,
 ) -> list[str]:
     """Convert a GP file to Rocksmith XMLs.
