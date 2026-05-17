@@ -481,6 +481,11 @@
     const ARPEGGIO_BOX_BLUE_DARK_HEX = 0x2D3190;
     /** Arpeggio rim accent and lane tint. */
     const ARPEGGIO_RIM_BLUE_HEX = 0x454BB6;
+    /** Post-hit chord-frame rim tints driven by the note-state provider
+     *  (slopsmith#254). Applied only to the teal frame during the linger
+     *  fade (chDt <= 0) when a scorer is attached. */
+    const CHORD_BOX_HIT_HEX = 0x40e060;
+    const CHORD_BOX_MISS_HEX = 0xe04040;
 
     /** Fret-number label tints — gold on approaching/active notes, muted blue when idle. */
     const FRET_LABEL_GOLD_HEX = '#D8A636';
@@ -1937,6 +1942,21 @@
         // persists exactly as long as the provider keeps reporting
         // hit/active for it.
         let _ndSizzle = [];
+        // Per-chord-occurrence verdict latch for the chord-frame rim
+        // tint. Once a chord is observed all-hit/active during its linger
+        // fade we latch 'green' here so subsequent frames can't undo it
+        // as individual constituent glows decay and getNoteState starts
+        // returning null again (which would otherwise flicker the rim
+        // back to red mid-linger). Keyed by `${ch.id}|${ch.t}` — ch.id
+        // alone is the chord *template* id and is reused across every
+        // occurrence of the same shape, so id-only latching would bleed
+        // a single clean grab onto every later occurrence of that chord.
+        // Pre-hit-line invalidation (chDt > 0 path in the rim selection)
+        // evicts a chord's latch the next time it's seen approaching, so
+        // loops/rewinds re-judge from scratch and the Map can't grow
+        // beyond the current pre-hit-line frontier. Also cleared in
+        // destroy().
+        let _chordVerdicts = new Map();
         // Per-frame timestamp captured by update() and used by its
         // prune pass for the notedetect mark arrays. drawNote itself
         // no longer reads it — pruning lives once per frame so
@@ -6347,7 +6367,56 @@
                         // strums (Frantic ~2:46), not arpeggio.
                         const isArpeggioFrame = chordHighwayLavenderArpVisual;
                         const ftSide = isArpeggioFrame ? ft * 1.55 : ft;
-                        const rimHex = isArpeggioFrame ? ARPEGGIO_RIM_BLUE_HEX : CHORD_BOX_TEAL_HEX;
+                        let rimHex = isArpeggioFrame ? ARPEGGIO_RIM_BLUE_HEX : CHORD_BOX_TEAL_HEX;
+                        // slopsmith#254 — once the chord crosses the hit
+                        // line, force the teal frame to red during its
+                        // linger fade unless every chord note is scored
+                        // as hit/active, in which case it's green. The
+                        // green verdict is latched in _chordVerdicts on
+                        // first observation: getNoteState returns null
+                        // once individual constituent glows decay, which
+                        // would otherwise flip the rim back to red mid-
+                        // linger and flicker the box on fast sequences.
+                        // Anything less than a clean grab (miss, partial,
+                        // not-yet-decided) reads as red so the player
+                        // gets a hard fail signal instead of a soft fade.
+                        // Only engages when a scorer is attached — without
+                        // one the teal default holds. Arpeggio frames
+                        // keep their blue identity.
+                        // Per-occurrence key — ch.id is the template id
+                        // (reused across same-shape chord occurrences) so
+                        // composing it with ch.t gives one entry per
+                        // physical onset in the chart.
+                        const verdictKey = ch.id != null ? `${ch.id}|${ch.t}` : `_|${ch.t}`;
+                        // Evict any stale latch the next time the chord
+                        // re-enters the pre-hit window (rewinds, section
+                        // loops, full restarts). Bounds Map growth too —
+                        // entries only live from the hit-line crossing
+                        // until the next pre-hit-line observation, so the
+                        // working set is at most "chords currently in the
+                        // linger fade."
+                        if (chDt > 0 && _chordVerdicts.has(verdictKey)) {
+                            _chordVerdicts.delete(verdictKey);
+                        }
+                        if (!isArpeggioFrame && chDt <= 0 && _ndGetNoteState) {
+                            if (_chordVerdicts.get(verdictKey) === 'green') {
+                                rimHex = CHORD_BOX_HIT_HEX;
+                            } else {
+                                let allHit = chordNotes.length > 0;
+                                for (const cn of chordNotes) {
+                                    let cs = null;
+                                    try { cs = _ndGetNoteState(cn, ch.t); } catch (e) { cs = null; }
+                                    const st = (cs && typeof cs === 'object') ? cs.state : cs;
+                                    if (st !== 'hit' && st !== 'active') { allHit = false; break; }
+                                }
+                                if (allHit) {
+                                    _chordVerdicts.set(verdictKey, 'green');
+                                    rimHex = CHORD_BOX_HIT_HEX;
+                                } else {
+                                    rimHex = CHORD_BOX_MISS_HEX;
+                                }
+                            }
+                        }
 
                         const repDim = isRepeat ? 0.78 : 1;
                         const edgeOp = fade * repDim * CHORD_BOX_EDGE_ALPHA * (isRepeat ? 0.85 : 1) * chordTailMul;
@@ -7379,11 +7448,22 @@
                             _ndGood = true;
                             _ndOutline = mGlow[s];
                             // Carry the provider's alpha (and optional color)
-                            // through to the sizzle so a struck-note fade or a
-                            // custom palette comes through (#254 review).
+                            // through to the sizzle so a struck-note fade or
+                            // a custom palette comes through (#254 review).
                             // _noteState already clamps alpha to [0,1] and only
                             // returns the object when alpha > 0.
-                            if (_ndSizzle.length < 40) {
+                            //
+                            // Skip sizzle on chord constituents: chord plays
+                            // already get rich feedback from the chord-rim
+                            // color (green for a clean grab, red otherwise)
+                            // plus the bright string-tinted gem. The 2D sparkle particles are
+                            // per-note and chord-heavy songs would spawn 4-6×
+                            // sparkles per chord every frame, which became a
+                            // measurable framerate hit once Rocksmith-style
+                            // lenient chord scoring flagged every chord
+                            // constituent as a hit. Standalone single notes
+                            // still sparkle.
+                            if (!fromChord && _ndSizzle.length < 40) {
                                 const _a = (_isObj && Number.isFinite(_cs.alpha)) ? Math.max(0, Math.min(1, _cs.alpha)) : 1;
                                 const _col = (_isObj && typeof _cs.color === 'string') ? _cs.color : null;
                                 _ndSizzle.push({ x, y: y + techniqueYNow, z: noteZ, s, alpha: _a, color: _col });
@@ -7980,6 +8060,7 @@
             _ndMissMarks = [];
             _ndLabels = [];
             _ndSizzle = [];
+            _chordVerdicts = new Map();
             _bgUnmountStyle();
             bgGroup = null; _bgLastT = 0;
             _diagChord = null; _diagPrev = null; _diagPrevOpacity = 0; _diagPrevStartOpacity = 0; _diagPrevStartT = null;
