@@ -29,7 +29,7 @@ tests/
 
 ## Plugin System
 
-Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` with a `plugin.json` manifest:
+Plugins are the primary extension point. Each plugin lives in `plugins/<name>/` with a `plugin.json` manifest. Plugins are typically their own git repositories — see [CONTRIBUTING.md](CONTRIBUTING.md) for the licensing policy (curated plugins should be AGPL-3.0 or AGPL-compatible: MIT, BSD, Apache-2.0).
 
 ```json
 {
@@ -147,15 +147,29 @@ window.slopsmithViz_my_viz = function () {
             // notes, chords, anchors (all difficulty-filter-aware),
             // beats, sections, chordTemplates, stringCount, lyrics,
             // toneChanges, toneBase, mastery, hasPhraseData, inverted,
-            // lefty, renderScale, lyricsVisible, plus the 2D coordinate
-            // helpers project and fretX. `stringCount` is the active
-            // arrangement's string count (4 for bass, 6 for guitar,
-            // 7+ for extended-range GP imports — size string-indexed
-            // geometry against this, not a hardcoded 6). If your
-            // renderer needs lefty-aware text rendering, check
+            // lefty, renderScale, lyricsVisible, the 2D coordinate
+            // helpers project and fretX, and getNoteState (see below).
+            // `stringCount` is the active arrangement's string count (4
+            // for bass, 6 for guitar, 7+ for extended-range GP imports —
+            // size string-indexed geometry against this, not a hardcoded
+            // 6). If your renderer needs lefty-aware text rendering, check
             // bundle.lefty and apply the mirror transform yourself —
             // a bundle-level helper isn't provided because it would
             // need your renderer's own context, not the factory's.
+            //
+            // bundle.getNoteState(note, chartTime) (slopsmith#254) — call
+            // this per visible chart note / chord-note to find out whether
+            // a scorer (note_detect) has flagged it 'hit' / 'active' (a
+            // sustain currently being held correctly) / 'miss', so the gem
+            // itself can light up / a held sustain can glow instead of
+            // relying on an overlay ring. Returns null when no provider is
+            // registered or it reports nothing for this note; otherwise
+            // { state: 'hit'|'active'|'miss', alpha: 0..1, color: string|null }.
+            // For chord notes pass the chord's time (note_detect keys its
+            // judgments by `${time}_${string}_${fret}`). 'hit' and 'active'
+            // are both "lit" — a renderer may treat them identically; the
+            // provider owns all fade timing via `alpha` and by simply
+            // ceasing to return state when the effect should end.
         },
         resize(w, h) {
             // Optional. Canvas dims already updated; re-create WebGL
@@ -196,6 +210,17 @@ Selecting this plugin in the main-player viz picker — or in splitscreen's per-
     });
     ```
     Plugins that re-query `document.getElementById('highway')` lazily inside their own event handlers don't need this listener — they pick up the new element automatically (it keeps `id="highway"`).
+  - **`highway:visibility`** — fired on `window.slopsmith` whenever the highway canvas transitions between displayed and hidden. Detection is DOM-based via `canvas.offsetParent === null` (catches `display:none` on the canvas or any ancestor — e.g. splitscreen's `#highway` hide) or whatever a host explicitly sets via `highway.setVisible(bool)`. While `visible === false`, core skips the rAF `renderer.draw(bundle)` call AND the default 2D draw, so renderers don't have to no-op themselves. The event is emitted only on transitions (including the first one after `init()`), not every frame. Payload `{ visible, canvas }` lives on `event.detail`:
+    ```js
+    window.slopsmith.on('highway:visibility', (event) => {
+        const { visible, canvas } = event.detail;
+        // Toggle any sibling DOM your renderer mounts. The 3D Highway
+        // renderer hides its `.h3d-wrap` overlay here so `display:none`
+        // on `#highway` actually hides the visible output.
+    });
+    ```
+    Renderers that only paint to the slopsmith canvas don't need this listener — the rAF skip is enough. Renderers that mount sibling DOM (separate WebGL contexts, overlays, etc.) do.
+  - **`highway.setVisible(bool | null)`** — forces the visibility state regardless of `offsetParent`. Pass `null` to clear the override and resume DOM-based detection. Useful when the host hides the highway via `visibility:hidden`, `opacity:0`, transforms, or clipping rather than `display:none`. The override re-emits any resulting transition immediately rather than waiting for the next rAF tick.
   - Default-renderer ctx is closure-cached. The replace path nulls the closure ctx so stale draw paths short-circuit; the next default-renderer `init()` re-acquires the 2D context from the new canvas cleanly.
 - `draw(bundle)` receives difficulty-filtered arrays — never read from `_filteredNotes` or other internals.
 - `_drawHooks` fire for the default 2D renderer (the factory calls them at the end of each frame). Custom WebGL renderers that maintain a 2D overlay canvas (like the bundled 3D highway) also call `window.highway.fireDrawHooks(ctx, W, H)` on that overlay so overlay plugins continue to work regardless of which renderer is active. Custom renderers without a 2D overlay context should not attempt to fire hooks.
@@ -238,6 +263,7 @@ Overlays do NOT appear in the viz picker and do NOT declare `"type": "visualizat
 - **Own your rAF + canvas** — don't piggyback on `_drawHooks` or on `createHighway`'s rendering context. Draw hooks fire for the default 2D renderer and for custom renderers that explicitly call `window.highway.fireDrawHooks(ctx, W, H)` (e.g. the bundled 3D highway fires them on its 2D overlay canvas), but not for every custom renderer.
 - **Re-read state every frame** — overlay output must track whatever the current renderer is drawing. Don't cache note positions across frames.
 - **Respect lefty + invert toggles** — if the overlay depicts strings or frets, mirror using the same transforms the active renderer would.
+- **If you position with `highway.project` / `highway.fretX` (the 2D-highway geometry), gate on `highway.isDefaultRenderer()`** — those helpers describe the *built-in 2D* highway's depth curve and fret zoom. When a custom renderer (3D highway, piano, …) is active your draw hook still fires (on that renderer's 2D overlay layer), but those coordinates won't match its scene — markers land in arbitrary places. Skip rendering when `isDefaultRenderer()` is false; the custom renderer owns that feedback. Renderer-agnostic overlays (fretboard diagram, chord-label HUD — they use `getNotes()`/`getChordTemplates()` + their own layout) don't need this guard.
 - **Clean up on toggle-off** — cancel rAF and remove/hide the overlay canvas so inactive overlays aren't wasting frames.
 
 Reference: [fretboard plugin](https://github.com/byrongamatos/slopsmith-plugin-fretboard) — canonical overlay implementation (navbar toggle, own canvas, 80ms active-note window).
@@ -245,6 +271,32 @@ Reference: [fretboard plugin](https://github.com/byrongamatos/slopsmith-plugin-f
 **Why two?** setRenderer plugs into an existing highway — main-player or splitscreen-panel — reusing its WebSocket and data parsing, so the common "I want a different look for the same data" case is zero boilerplate AND multi-instance for free. Overlays compose with whatever renderer is active — they decorate rather than replace, so multiple can stack (fretboard + chord labels + practice feedback) without fighting over the canvas.
 
 A previous standalone-pane contract (`window.createMyVisualization({ container })` with its own WebSocket per pane) was used by splitscreen pre-Wave-C. It's been retired now that splitscreen calls `setRenderer` on per-panel `createHighway()` instances; if you find references in older plugin docs or external integration guides, those describe the legacy path.
+
+#### 3. Note-state provider — for scorers that want renderers to "light up" notes (slopsmith#254)
+
+A scoring plugin (note_detect) can publish a per-note judgment so whichever renderer is active draws the **gem itself** lit on a correct hit, and keeps a sustain trail glowing while it's still being played correctly — instead of a separate overlay ring floating near the note.
+
+```js
+// In the plugin (after resolving the highway instance):
+highway.setNoteStateProvider((note, chartTime) => {
+    // `note` is the chart note object ({ t, s, f, sus, ... }); for chord
+    // notes `chartTime` is the chord's time. Return one of:
+    //   - falsy  → no special state (render normally)
+    //   - 'hit'    — struck correctly; renderer lights the gem
+    //   - 'active' — a sustained note is right now being held correctly
+    //   - 'miss'   — missed; renderer may red-wash the gem
+    //   - { state: <one of the above>, alpha?: 0..1, color?: '#rrggbb' }
+    // You own all fade timing: return a decaying `alpha` for a struck-note
+    // glow, `alpha: 1` (or a bare string) for a held sustain, and stop
+    // returning state when the effect should end. Keep it cheap — it's
+    // called per visible note per renderer per frame.
+});
+// On teardown:  highway.setNoteStateProvider(null);
+```
+
+- Only one provider is active at a time (last `setNoteStateProvider` wins). `highway.getNoteStateProvider()` returns the current one (or null).
+- The built-in 2D highway consults it in `drawNote` / `drawSustains` / the chord-frame path: 'hit'/'active' → bright string colour + additive halo + a contained "sizzle" (crackling sparks, throbbing core, a shockwave ring on a fresh strike) on the gem and a bright (vs dim) sustain trail; 'miss' → faint red wash. The bundled **3D highway** reads the same data via `bundle.getNoteState` (bright string-tinted outline + bright body + glowing sustain + a contained sparkle hugging the note rect on hit/active; red outline + suppressed body on miss). Custom renderers that want it call `bundle.getNoteState(note, chartTime)` — it null-guards and returns the normalized `{ state, alpha, color }` (or null).
+- This is orthogonal to the overlay contract: note_detect remains an overlay (HUD, diagnostic miss markers, the "currently detected" indicator) *and* a scorer that feeds this provider. A renderer that ignores `getNoteState` simply doesn't light gems — nothing breaks.
 
 ### Audio mixer fader registration (slopsmith#87)
 
@@ -311,6 +363,45 @@ window.slopsmith.diagnostics.contribute('my_plugin', {
 
 Loaded from `static/diagnostics.js` ASAP in `<head>` so the console-wrap is in place before any other script runs. Available on the `window.slopsmith.diagnostics` namespace alongside `snapshotConsole()`, `snapshotHardware()`, `snapshotUa()`, `snapshotLocalStorage()`, `snapshotContributions()`. Keep your payload small (< 100 KB) and don't include secrets — bundles are shared with maintainers.
 
+### Keyboard Shortcuts
+
+Plugins can register keyboard shortcuts via the global `window.registerShortcut()` function. Shortcuts appear in the `?` help panel.
+
+```js
+window.registerShortcut({
+    key: 'k',                       // key value (e.key) or key code (e.code)
+    description: 'Toggle my view',  // shown in the help panel
+    scope: 'player',                // 'global' | 'player' | 'library' | 'settings' | 'plugin-{id}'
+    condition: () => _isMyViewActive, // optional guard
+    handler: (e) => _myAction()      // called when shortcut triggers
+});
+```
+
+**Scope** controls when the shortcut is active:
+- `global` — works on any screen
+- `player` — only on the player screen
+- `library` — only on the home/favorites screens
+- `settings` — only on the settings screen
+- `plugin-{id}` — only when your plugin's screen is active
+
+**Panel-scoped shortcuts:** For plugins that create multiple panels (e.g., splitscreen), shortcuts are automatically scoped to the active panel. Use `const panel = window.createShortcutPanel(id)` to create a panel (it returns the panel object — keep the reference so you can call `panel.clearShortcuts()` during cleanup) and `window.setActiveShortcutPanel(id)` to switch between them. Each panel has its own shortcut registry, so multiple panels can have the same key without collisions.
+
+**Condition** is an optional guard function. If it returns false, the shortcut is skipped even if in scope.
+
+**Key matching:** The handler matches against both `e.key` (character produced) and `e.code` (physical key). Use `e.key` for letters/symbols that depend on keyboard layout, and `e.code` for special keys (e.g. `Space`, `ArrowLeft`).
+
+**Built-in shortcuts:**
+
+| Key | Description |
+|-----|-------------|
+| `?` | Show keyboard shortcuts panel (global) |
+| `Space` | Play/Pause (player only) |
+| `←` / `→` | Seek ±5 seconds (player only) |
+| `Escape` | Back to library (player only) |
+| `[` / `]` | Audio offset ±10ms (Shift: ±50ms) (player only) |
+
+**Debugging:** Open browser console and type `_listShortcuts()` to inspect registered shortcuts.
+
 ### General plugin guidelines
 
 - Wrap your plugin code in an IIFE: `(function () { 'use strict'; ... })();`
@@ -318,6 +409,7 @@ Loaded from `static/diagnostics.js` ASAP in `<head>` so the console-wrap is in p
 - If hooking `window.playSong`, always call the original and `await` it
 - If hooking `window.showScreen`, clean up your state when leaving the player screen
 - Use `window.slopsmith.emit()` / `window.slopsmith.on()` for inter-plugin communication
+- Use `window.registerShortcut()` to add keyboard shortcuts. Clean up with `window.unregisterShortcut(key, scope)` — pass the same scope you registered with, since the default is `'global'` and won't match `player`/`library`/`settings`/`plugin-*` bindings. For panel-scoped shortcuts, prefer `panel.clearShortcuts()`.
 
 ## Song Formats
 
@@ -391,10 +483,24 @@ pytest -k "round_trip" -v      # Pattern match
 - CI: GitHub Actions runs pytest on push/PR to main (Python 3.12)
 - Test dependencies: `requirements-test.txt`
 
+## Tuning the note_detect plugin
+
+Detection quality is hard to judge by eye — a player UI that "feels worse" after a code change isn't a regression you can defend in review. The plugin ships with a record-replay-sweep workflow so changes to the detector, the matcher, or the user's environment (A/V offset, latency, channel) can be measured against a single reference take.
+
+Quick orientation:
+- **Reference recording** lives in the gear popover on the player (gated behind Settings → Note Detection → "Detection tuning (advanced)"). Arm before pressing Play; auto-saves a WAV to `static/note_detect_recordings/` on song-end. The directory is bind-mounted, so the host-side harness can read it without a copy step.
+- **Benchmark sloppak** ships in-tree at [docs/benchmarks/note_detect_v1/note_detect_benchmark_v1.sloppak](docs/benchmarks/note_detect_v1/note_detect_benchmark_v1.sloppak) — 8 sections each isolating a different failure mode (low-freq mono, sustained holds, hammer/pull, power chords, dense open chords, bends). Drop it directly into your sloppak DLC folder to install (don't rename — slopsmith keys off the `.sloppak` suffix even though the file is a zip under the hood). The unzipped form lands at `static/sloppak_cache/note_detect_benchmark_v1.sloppak/` after first play. Builder: [docs/benchmarks/note_detect_v1/build_benchmark.py](docs/benchmarks/note_detect_v1/build_benchmark.py).
+- **Headless harness** at [`tools/harness.js`](https://github.com/byrongamatos/slopsmith-plugin-notedetect/blob/main/tools/harness.js) in the note_detect plugin's own repo (cloned into `plugins/note_detect/` locally) runs the same `processFrame` / `matchNotes` / `checkMisses` code path off Node, in seconds per run. Same `note_detect.diagnostic.v1` schema as the in-app Download Diagnostic button.
+- **A/V auto-calibrate** (Settings → Note Detection) reads `timing_error_ms_hits.median` and proposes the av-offset that drives it to zero. Iterative: usually converges in 2–3 Apply rounds.
+
+**Always record at 1.0× playback speed** — half-speed takes produce all-miss garbage because chart times are absolute. **Always use `timing_error_ms_hits` (not all-matched) as a calibration signal** — the all-matched median pins near a constant when the offset is wrong, because the matcher silently snaps to neighbouring chart notes.
+
+Full developer reference (workflow recipes, harness flag table, diagnostic schema, common pitfalls): [docs/note-detect-tuning.md](docs/note-detect-tuning.md).
+
 ## Versioning
 
 - **`VERSION`** (repo root) — single source of truth; plain semver string (e.g. `0.2.4`). Bind-mounted into the container and copied by the Dockerfile so it's always available at `/app/VERSION`.
-- **`GET /api/version`** — returns `{"version": "<contents of VERSION>"}`. Displayed as a badge in the navbar.
+- **`GET /api/version`** — returns `{"version": "<contents of VERSION>", "source_url": "...", "license_url": "..."}`. The version drives the navbar badge; `source_url` / `license_url` populate the Settings → About links. `source_url` is configurable via the `APP_SOURCE_URL` env var (default `https://github.com/byrongamatos/slopsmith`); `license_url` falls back to `source_url + "/blob/main/LICENSE"` (GitHub-style, default branch `main`) and is overridable via the `APP_LICENSE_URL` env var — set it explicitly when the source is hosted on a non-GitHub forge (GitLab/Gitea/self-hosted) or under a non-`main` default branch. Both env values must be `http(s)`; non-http(s) values are rejected and fall back to the safe default to prevent `javascript:`/`data:` hrefs.
 - **Auto-sync** — `.github/workflows/sync-version.yml` rewrites `VERSION` via a `repository_dispatch` (`desktop-released`) fired from `slopsmith-desktop`'s release job. As an explicit automation-only exception to the "Never push directly to main" rule in Git Workflow below, the sync job commits straight to `main` as `github-actions[bot]` (version bumps are mechanical; the PR round-trip adds no signal). Human contributors must still go through feature branches + PRs. No manual VERSION edits needed. Use the workflow's `workflow_dispatch` trigger with `version: X.Y.Z` for manual runs (recovery / out-of-band bumps).
 - **`CHANGELOG.md`** — follows [Keep a Changelog](https://keepachangelog.com/) format. Update the `[Unreleased]` section with each PR; when `slopsmith-desktop` cuts a release, rename `[Unreleased]` to the new version + date (the VERSION bump itself is automated).
 

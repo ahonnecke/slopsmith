@@ -163,6 +163,7 @@ let _lastLibSelected = null;
 // song launched from a deep-link / plugin screen still gets a sane
 // fallback ('home').
 let _playerOriginScreen = 'home';
+let _settingsOriginScreen = 'home';
 
 // One-shot flag set in `showScreen` when the user enters Home or
 // Favorites. Consumed by the very next library render so the
@@ -497,6 +498,62 @@ function _trapFocusInModal(modal) {
     });
 }
 
+// Styled async confirm dialog. Returns a Promise<boolean>. For destructive
+// prompts pass `danger: true` — confirm button turns red and Cancel gets
+// initial focus so an accidental Enter won't fire the action. `body` is
+// inserted as HTML so callers can use formatting; callers are responsible
+// for escaping any user-supplied content in it (use _escAttr).
+function _confirmDialog({ title, body = '', confirmText = 'Confirm', cancelText = 'Cancel', danger = false } = {}) {
+    return new Promise((resolve) => {
+        const previouslyFocused = document.activeElement;
+        const modal = document.createElement('div');
+        modal.className = 'slopsmith-modal fixed inset-0 z-[250] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+        modal.setAttribute('role', 'alertdialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.setAttribute('aria-label', title || 'Confirm');
+        const confirmClass = danger
+            ? 'flex-1 bg-red-600 hover:bg-red-500 px-4 py-2 rounded-xl text-sm font-semibold text-white transition focus:outline-none focus:ring-2 focus:ring-red-400/60'
+            : 'flex-1 bg-accent hover:bg-accent-light px-4 py-2 rounded-xl text-sm font-semibold text-white transition focus:outline-none focus:ring-2 focus:ring-accent/60';
+        modal.innerHTML = `
+            <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl">
+                <h3 class="text-lg font-bold text-white mb-3">${_escAttr(title || '')}</h3>
+                <div class="mb-5">${body}</div>
+                <div class="flex gap-3">
+                    <button type="button" data-confirm class="${confirmClass}">${_escAttr(confirmText)}</button>
+                    <button type="button" data-cancel class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 transition focus:outline-none focus:ring-2 focus:ring-gray-500/40">${_escAttr(cancelText)}</button>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+
+        function finish(result) {
+            modal.remove();
+            document.removeEventListener('keydown', onKey, true);
+            if (previouslyFocused && document.body.contains(previouslyFocused)) {
+                try { previouslyFocused.focus({ preventScroll: true }); } catch {}
+            }
+            resolve(result);
+        }
+        function onKey(e) {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); finish(false); }
+            else if (e.key === 'Enter' && document.activeElement === modal.querySelector('[data-confirm]')) {
+                e.preventDefault(); finish(true);
+            }
+        }
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) finish(false);
+            else if (e.target.closest('[data-confirm]')) finish(true);
+            else if (e.target.closest('[data-cancel]')) finish(false);
+        });
+        document.addEventListener('keydown', onKey, true);
+        _trapFocusInModal(modal);
+        // Focus Cancel by default for destructive prompts so an accidental
+        // Enter / Space won't fire the dangerous action; otherwise focus
+        // the confirm button so Enter accepts.
+        const focusTarget = modal.querySelector(danger ? '[data-cancel]' : '[data-confirm]');
+        if (focusTarget) focusTarget.focus({ preventScroll: true });
+    });
+}
+
 // Shortcut cheat-sheet overlay. Opens on `?` (Shift+/), closes on
 // Esc (handled by the generic modal close path) or on backdrop /
 // close-button click. The list mirrors the canonical shortcut table
@@ -506,24 +563,120 @@ function _trapFocusInModal(modal) {
 // with the version of app.js the user actually loaded.
 function _openShortcutsModal() {
     if (document.getElementById('shortcuts-modal')) return;
-    const SHORTCUTS = [
-        ['Library', [
-            ['/',          'Focus search'],
-            ['↑ ↓ ← →',    'Move selection (grid 2D, tree vertical)'],
-            ['→',          'Tree: expand header / step into open one'],
-            ['←',          'Tree: collapse header / jump to parent'],
-            ['Home / End', 'Jump to first / last item'],
-            ['Enter / Space', 'Play song; toggle artist / album header'],
-            ['c',          'Convert PSARC entry to .sloppak'],
-            ['f',          'Toggle favorite'],
-            ['e',          'Edit metadata'],
-            ['?',          'Show this cheat sheet'],
-        ]],
-        ['Modals', [
-            ['Esc',        'Close the open modal (edit metadata, this overlay)'],
-            ['Esc',        'Otherwise: clear + blur the focused search box'],
-        ]],
+
+    function _isTreeMode() {
+        // Check if we're in tree view (not grid) on the active library screen
+        const screen = document.querySelector('.screen.active');
+        if (!screen) return false;
+        const tree = screen.querySelector('#lib-tree,#fav-tree');
+        return tree && !tree.classList.contains('hidden');
+    }
+
+    const ctx = _getCurrentContext();
+
+    // Library shortcuts that are handled by the navigation system (not in registry)
+    const navShortcuts = [
+        { keys: '↑ ↓', desc: 'Move selection' },
+        { keys: '→', desc: 'Step in', condition: _isTreeMode },
+        { keys: '←', desc: 'Step out', condition: _isTreeMode },
+        { keys: 'Home / End', desc: 'Jump to first / last item' },
+        { keys: 'Enter / Space', desc: 'Activate selection (play song / toggle header)' },
     ];
+
+    // Filter out items whose condition returns false
+    const filterNavItems = (items) => items.filter(item => !item.condition || item.condition());
+
+    // Format a shortcut entry for display, including modifier prefixes
+    const formatShortcut = (s) => {
+        const mods = s.modifiers || {};
+        let label = '';
+        if (mods.ctrl) label += 'Ctrl+';
+        if (mods.alt) label += 'Alt+';
+        if (mods.shift) label += 'Shift+';
+        if (mods.meta) label += 'Meta+';
+        return label + s.key;
+    };
+
+    // Get shortcuts from active panel by scope
+    const getPanelShortcuts = (panel, scope) => {
+        const shortcuts = [];
+        for (const [key, s] of panel.shortcuts) {
+            if (s.scope === scope) {
+                shortcuts.push({ keys: formatShortcut(s), desc: s.description });
+            }
+        }
+        return shortcuts;
+    };
+
+    const activePanel = _panels.get(_activePanel);
+    const defaultPanel = _panels.get('default');
+
+    // Merge shortcuts from both active and default panel for display
+    const mergeShortcuts = (scope) => {
+        const result = [];
+        if (activePanel) result.push(...getPanelShortcuts(activePanel, scope));
+        if (defaultPanel && defaultPanel !== activePanel) result.push(...getPanelShortcuts(defaultPanel, scope));
+        return result;
+    };
+
+    const playerShortcuts = mergeShortcuts('player');
+    const globalShortcuts = mergeShortcuts('global');
+    const libraryShortcuts = mergeShortcuts('library');
+
+    // Get plugin shortcuts for current plugin screen
+    const pluginShortcuts = [];
+    if (ctx.isPlugin && activePanel) {
+        for (const [key, s] of activePanel.shortcuts) {
+            if (s.scope.startsWith('plugin-') && s.scope === ctx.screen) {
+                pluginShortcuts.push({ keys: formatShortcut(s), desc: s.description });
+            }
+        }
+    }
+
+    // Get shortcuts from other panels (if multiple panels exist)
+    const otherPanelShortcuts = [];
+    if (_panels.size > 1) {
+        for (const [panelId, panel] of _panels) {
+            if (panelId === _activePanel) continue;
+            for (const [key, s] of panel.shortcuts) {
+                otherPanelShortcuts.push({ keys: formatShortcut(s), desc: s.description, panel: panelId });
+            }
+        }
+    }
+
+    // Build sections based on current context
+    const sections = [];
+    if (ctx.isSettings) {
+        sections.push({ heading: 'Settings', items: mergeShortcuts('settings') });
+    } else if (ctx.isLibrary) {
+        sections.push({ heading: 'Library', items: [
+            ...filterNavItems(navShortcuts),
+            ...libraryShortcuts,
+            { keys: 'Esc', desc: 'Clear search' }
+        ]});
+    }
+    if (ctx.isPlayer) {
+        sections.push({ heading: 'Player', items: playerShortcuts });
+    }
+    if (!ctx.isSettings && globalShortcuts.length > 0) {
+        sections.push({ heading: 'Global', items: globalShortcuts });
+    }
+    if (pluginShortcuts.length > 0) {
+        sections.push({ heading: 'Current Plugin', items: pluginShortcuts });
+    }
+    if (otherPanelShortcuts.length > 0) {
+        // Group other panel shortcuts by panel
+        const byPanel = new Map();
+        for (const item of otherPanelShortcuts) {
+            if (!byPanel.has(item.panel)) {
+                byPanel.set(item.panel, []);
+            }
+            byPanel.get(item.panel).push(item);
+        }
+        for (const [panelId, items] of byPanel) {
+            sections.push({ heading: `Panel ${panelId}`, items });
+        }
+    }
 
     const modal = document.createElement('div');
     modal.id = 'shortcuts-modal';
@@ -540,8 +693,8 @@ function _openShortcutsModal() {
         && _scModal && _scModal.contains(_lastLibSelected))
         ? _lastLibSelected : null;
 
-    const sections = SHORTCUTS.map(([heading, rows]) => {
-        const items = rows.map(([keys, desc]) => `
+    const sectionsHtml = sections.map(section => {
+        const itemsHtml = section.items.map(({ keys, desc }) => `
             <div class="flex items-baseline justify-between gap-4 py-1.5">
                 <span class="text-sm text-gray-300">${esc(desc)}</span>
                 <kbd class="text-xs font-mono px-2 py-0.5 rounded bg-dark-600 border border-gray-700 text-gray-200 whitespace-nowrap">${esc(keys)}</kbd>
@@ -549,8 +702,8 @@ function _openShortcutsModal() {
         `).join('');
         return `
             <section class="mb-4 last:mb-0">
-                <h4 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">${esc(heading)}</h4>
-                ${items}
+                <h4 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">${esc(section.heading)}</h4>
+                ${itemsHtml}
             </section>
         `;
     }).join('');
@@ -560,12 +713,12 @@ function _openShortcutsModal() {
             <div class="flex items-center justify-between mb-4">
                 <h3 class="text-lg font-bold text-white">Keyboard shortcuts</h3>
                 <button type="button" data-shortcuts-close
-                        class="text-gray-500 hover:text-white transition" aria-label="Close shortcuts">
+                        class="text-gray-500 hover:text-white transition flex items-center gap-1.5" aria-label="Close shortcuts">
+                    <span class="text-xs text-gray-600">Esc</span>
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                 </button>
             </div>
-            ${sections}
-            <p class="text-[11px] text-gray-500 mt-4">Tip: shortcuts bail out while you're typing in inputs, so you can always type the literal keys.</p>
+            ${sectionsHtml}
         </div>
     `;
 
@@ -710,6 +863,8 @@ document.addEventListener('keydown', (e) => {
 
 // ── Screen Navigation ─────────────────────────────────────────────────────
 async function showScreen(id) {
+    // Capture the previous screen before changing active classes
+    const prevScreenId = document.querySelector('.screen.active')?.id;
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById(id).classList.add('active');
     // Mark the next render as a screen-entry so it scrolls the
@@ -721,17 +876,49 @@ async function showScreen(id) {
     _bumpLibNavGeneration();
     if (id === 'home') { _libScrollOnNextRender.home = true; loadLibrary(); }
     if (id === 'favorites') { _libScrollOnNextRender.favorites = true; loadFavorites(); }
-    if (id === 'settings') loadSettings();
+    if (id === 'settings') {
+        // Record where we came from so Esc can go back. The player screen
+        // is torn down by the `id !== 'player'` branch below, so
+        // re-entering it via showScreen() would land on a dead screen —
+        // fall back to the player's own origin (or 'home') instead.
+        if (prevScreenId && prevScreenId !== 'settings') {
+            _settingsOriginScreen = prevScreenId === 'player'
+                ? (_playerOriginScreen || 'home')
+                : prevScreenId;
+        }
+        loadSettings();
+    }
     if (id !== 'player') {
         highway.stop();
+        // Cancel any queued seeks, in-flight shim closures, AND active
+        // count-in timers before stopping playback so none of these paths
+        // can mutate the torn-down session (mirrors the same triple reset
+        // in playSong()).
+        _cancelCountIn();
+        _resetJuceAudioShimChain();
+        _resetAudioSeekState();
         if (window._juceMode) {
+            // HTML5 emits 'pause' via the media-element listener below;
+            // JUCE doesn't, so plugins would stay stuck in "playing".
+            // Snapshot the canonical payload BEFORE stop() resets _pos
+            // to 0, then emit AFTER stop completes. Mirrors the HTML5
+            // pause contract via _songEventPayload (audioT/chartT/perfNow).
+            const payload = _songEventPayload();
+            const wasPlaying = isPlaying;
             await jucePlayer.stop().catch(() => {});
+            if (wasPlaying && window.slopsmith) {
+                window.slopsmith.isPlaying = false;
+                window.slopsmith.emit('song:pause', payload);
+            }
             window._juceMode = false;
             window._juceAudioUrl = null;
         }
         const audio = document.getElementById('audio');
         audio.pause();
         audio.src = '';
+        window._currentSongAudio = null;
+        // Reloading any song later should get a fresh JUCE routing attempt.
+        window._clearJuceRerouteMemo?.();
         isPlaying = false;
         document.getElementById('btn-play').textContent = '▶ Play';
     }
@@ -755,7 +942,7 @@ const _LIB_SORT_VALUES = new Set([
     'artist', 'artist-desc', 'title', 'title-desc',
     'recent', 'year-desc', 'year', 'tuning',
 ]);
-const _LIB_FORMAT_VALUES = new Set(['', 'psarc', 'sloppak']);
+const _LIB_FORMAT_VALUES = new Set(['', 'psarc', 'sloppak', 'loose']);
 // Tree-view expand/collapse persistence. Three states per tree:
 //   '1'  → user asked to expand all
 //   '0'  → user asked to collapse all
@@ -1253,6 +1440,9 @@ function formatBadge(fmt, stemCount) {
     if (fmt === 'sloppak') {
         return `<span class="fmt-badge absolute top-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-900/80 text-green-200 border border-green-700">SLOPPAK</span>`;
     }
+    if (fmt === 'loose') {
+        return `<span class="fmt-badge absolute top-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-900/80 text-amber-200 border border-amber-700">FOLDER</span>`;
+    }
     return `<span class="fmt-badge absolute top-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/80 text-blue-200 border border-blue-700">PSARC</span>`;
 }
 
@@ -1262,6 +1452,9 @@ function formatBadgeInline(fmt, stemCount) {
     }
     if (fmt === 'sloppak') {
         return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-900/60 text-green-300">SLOPPAK</span>`;
+    }
+    if (fmt === 'loose') {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-900/60 text-amber-300">FOLDER</span>`;
     }
     return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300">PSARC</span>`;
 }
@@ -1761,7 +1954,11 @@ async function loadSettings() {
 let _avOffsetMs = 0;
 let _avSaveDebounce = null;
 function setAvOffsetMs(ms, skipPersist) {
-    _avOffsetMs = Number(ms) || 0;
+    // Clamp to the same bounds the Settings/player-bar sliders enforce
+    // (-1000..1000 ms). Defends against bad values from /api/settings
+    // landing as `value` on <input type=range>.
+    const n = Number(ms);
+    _avOffsetMs = Math.max(-1000, Math.min(1000, Number.isFinite(n) ? n : 0));
     // Drive the highway's render-time shift. getTime() still returns
     // the audio-aligned chart time so plugins (note detection, etc.)
     // keep scoring against the real chart clock regardless of visual
@@ -1772,6 +1969,14 @@ function setAvOffsetMs(ms, skipPersist) {
     if (avSlider) avSlider.value = _avOffsetMs;
     const avVal = document.getElementById('setting-av-offset-val');
     if (avVal) avVal.textContent = Math.round(_avOffsetMs);
+    // Sync the inline player-bar slider (live-tunable while playing)
+    const playerAvSlider = document.getElementById('player-av-offset-slider');
+    if (playerAvSlider) playerAvSlider.value = _avOffsetMs;
+    const playerAvLabel = document.getElementById('player-av-offset-label');
+    if (playerAvLabel) {
+        const rounded = Math.round(_avOffsetMs);
+        playerAvLabel.textContent = `${rounded >= 0 ? '+' : ''}${rounded}ms`;
+    }
     // Update the player HUD readout (hidden when offset = 0 to
     // avoid clutter; the keyboard shortcut is documented in the
     // Settings help text so it stays discoverable).
@@ -2244,6 +2449,191 @@ async function exportDiagnostics() {
     }
 }
 
+async function uploadSongs(fileList) {
+    if (!fileList || fileList.length === 0) return;
+    const all = Array.from(fileList);
+    // Optional UI element — only present when on the Settings screen.
+    // The navbar entry triggers uploads from any screen, where these aren't.
+    const status = document.getElementById('rescan-status');
+    const setStatus = (s) => { if (status) status.textContent = s; };
+
+    // Client-side extension filter so we don't waste a round-trip on
+    // clearly-invalid picks. The server validates again.
+    const failures = [];
+    const files = [];
+    for (const f of all) {
+        const lower = f.name.toLowerCase();
+        if (lower.endsWith('.psarc') || lower.endsWith('.sloppak')) {
+            files.push(f);
+        } else {
+            failures.push(`${f.name}: only .psarc or .sloppak accepted`);
+        }
+    }
+    if (files.length === 0) {
+        if (failures.length) alert(failures.join('\n'));
+        return;
+    }
+
+    // The backend caps batches at _MAX_UPLOAD_FILES (50). Chunk if needed so a
+    // big drag-and-drop of an album folder still works end-to-end.
+    const BATCH = 50;
+    const chunks = [];
+    for (let i = 0; i < files.length; i += BATCH) chunks.push(files.slice(i, i + BATCH));
+
+    let uploaded = 0;
+
+    const postChunk = async (chunk, overwrite) => {
+        const form = new FormData();
+        for (const f of chunk) form.append('file', f);
+        const url = '/api/songs/upload' + (overwrite ? '?overwrite=1' : '');
+        const resp = await fetch(url, { method: 'POST', body: form });
+        if (!resp.ok) {
+            let data = {};
+            try { data = await resp.json(); } catch (_) {}
+            // Whole-request rejection (DLC misconfig, payload too large, etc.).
+            throw new Error(data.error || resp.statusText || `HTTP ${resp.status}`);
+        }
+        const body = await resp.json();
+        return body.results || [];
+    };
+
+    for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const label = chunks.length > 1
+            ? `Uploading batch ${i + 1}/${chunks.length} (${chunk.length} files)...`
+            : `Uploading ${chunk.length} file${chunk.length === 1 ? '' : 's'}...`;
+        setStatus(label);
+
+        let results;
+        try {
+            results = await postChunk(chunk, false);
+        } catch (e) {
+            for (const f of chunk) failures.push(`${f.name}: ${e.message}`);
+            continue;
+        }
+
+        // Index file objects by name so a follow-up overwrite request can
+        // resend the same blobs. Names within a chunk are unique on disk
+        // (DLC dir is flat for this purpose), but two distinct user picks
+        // could share a name — Map.set keeps the last one, which matches
+        // server-side last-write-wins semantics.
+        const byName = new Map(chunk.map(f => [f.name, f]));
+
+        const conflicts = [];
+        for (const r of results) {
+            if (r.status === 'ok') {
+                uploaded++;
+            } else if (r.status === 'exists') {
+                conflicts.push(r);
+            } else {
+                failures.push(`${r.filename}: ${r.error || 'upload failed'}`);
+            }
+        }
+
+        if (conflicts.length > 0) {
+            const names = conflicts.map(c => c.filename);
+            const preview = names.slice(0, 5).join(', ') + (names.length > 5 ? `, +${names.length - 5} more` : '');
+            const ok = confirm(
+                `${conflicts.length} file${conflicts.length === 1 ? '' : 's'} already exist in your DLC folder:\n${preview}\n\nOverwrite?`
+            );
+            if (!ok) {
+                for (const c of conflicts) failures.push(`${c.filename}: skipped (already exists)`);
+                continue;
+            }
+            const retryFiles = conflicts
+                .map(c => byName.get(c.filename))
+                .filter(Boolean);
+            setStatus(`Overwriting ${retryFiles.length} file${retryFiles.length === 1 ? '' : 's'}...`);
+            let retryResults;
+            try {
+                retryResults = await postChunk(retryFiles, true);
+            } catch (e) {
+                for (const f of retryFiles) failures.push(`${f.name}: ${e.message}`);
+                continue;
+            }
+            for (const r of retryResults) {
+                if (r.status === 'ok') uploaded++;
+                else failures.push(`${r.filename}: ${r.error || 'upload failed'}`);
+            }
+        }
+    }
+
+    if (failures.length === 0) {
+        setStatus(`Uploaded ${uploaded} file${uploaded === 1 ? '' : 's'}. Scanning...`);
+    } else {
+        // Denominator is the full user selection (`all.length`), not just the
+        // post-filter `files.length`. Otherwise picking one valid file plus
+        // one `.txt` would show "Uploaded 1/1" with a failure listed below,
+        // overstating the success rate.
+        const total = all.length;
+        const msg = `Uploaded ${uploaded}/${total}. ${failures.length} failed:\n` + failures.join('\n');
+        alert(msg);
+        setStatus(`Uploaded ${uploaded}/${total}, ${failures.length} failed.`);
+    }
+    if (uploaded > 0) {
+        // Server kicked off a background scan after the batch finished; poll
+        // for completion and refresh the library when it finishes.
+        _pollScanAndRefresh(status);
+    }
+}
+
+let _uploadScanPoller = null;
+
+function _pollScanAndRefresh(statusEl) {
+    const setStatus = (s) => { if (statusEl) statusEl.textContent = s; };
+    if (_uploadScanPoller) _uploadScanPoller.stop();
+
+    const MAX_FAILURES = 5;
+    const INTERVAL_MS = 1000;
+    let stopped = false;
+    let timerId = null;
+    let failures = 0;
+    const stop = () => {
+        stopped = true;
+        if (timerId) { clearTimeout(timerId); timerId = null; }
+        if (_uploadScanPoller && _uploadScanPoller.stop === stop) _uploadScanPoller = null;
+    };
+    _uploadScanPoller = { stop };
+
+    const tick = async () => {
+        timerId = null;
+        try {
+            const sr = await fetch('/api/scan-status');
+            if (!sr.ok) throw new Error(`HTTP ${sr.status}`);
+            const sd = await sr.json();
+            if (stopped) return;
+            failures = 0;
+            if (sd.running) {
+                const cur = sd.current ? ` · ${sd.current}` : '';
+                setStatus(`${sd.done} / ${sd.total} scanned${cur}...`);
+            } else {
+                stop();
+                if (sd.error) setStatus(`Error: ${sd.error}`);
+                else setStatus('Done!');
+                _treeStats = null;
+                _tuningNames = null;
+                // Mirror the delete path: refresh whichever collection is
+                // currently visible. Overwriting a favorited song while
+                // viewing Favorites otherwise leaves a stale entry.
+                const activeScreen = document.querySelector('.screen.active');
+                if (activeScreen?.id === 'favorites') loadFavorites();
+                else loadLibrary();
+                return;
+            }
+        } catch (e) {
+            if (stopped) return;
+            failures++;
+            if (failures >= MAX_FAILURES) {
+                stop();
+                setStatus(`Scan status unavailable: ${e.message || e}`);
+                return;
+            }
+        }
+        if (!stopped) timerId = setTimeout(tick, INTERVAL_MS);
+    };
+    timerId = setTimeout(tick, INTERVAL_MS);
+}
+
 async function rescanLibrary() {
     const btn = document.getElementById('btn-rescan');
     const status = document.getElementById('rescan-status');
@@ -2504,11 +2894,569 @@ const jucePlayer = {
 };
 window.jucePlayer = jucePlayer;
 
+// ── Engine start/stop → re-route song audio (HTML5 ⇄ JUCE) ──────────────────
+// window._juceMode is otherwise decided once, at song-load time (highway.js),
+// from isAudioRunning(). If the JUCE audio engine is started or stopped *after*
+// a song is already loaded (e.g. the user presses CHAIN / AMP), that decision
+// goes stale: the song stays on the HTML5 <audio> element while the engine
+// grabs the device in exclusive mode (audible guitar, silent song), or it stays
+// on a dead JUCE backing transport. This watcher migrates the loaded song
+// between the two paths whenever the engine's running state changes, preserving
+// playback position and play/pause state.
+(function _installJuceEngineRoutingWatcher() {
+    const juceApi = window.slopsmithDesktop?.audio;
+    if (!juceApi || typeof juceApi.isAudioRunning !== 'function') return;
+
+    let _rerouteInFlight = false;
+    // URL that JUCE's loadBackingTrack *explicitly rejected* (ok === false —
+    // e.g. a codec it can't read). The poll below would otherwise retry the
+    // same doomed track every 350 ms; remember it and skip until the song
+    // changes. Only a hard JUCE reject is memoised here — transient failures
+    // (a network blip on /api/audio-local-path, an isAudioRunning() race
+    // during a device restart) are deliberately NOT memoised so they retry.
+    let _rerouteRejectedUrl = null;
+    // Returns true when window._currentSongAudio no longer references the exact
+    // snapshot object captured at reroute entry — i.e. the song was swapped (or
+    // cleared) mid-flight. Staleness is detected by object-reference identity,
+    // not by URL value.
+    function _isStale(songAudio) {
+        return window._currentSongAudio !== songAudio;
+    }
+
+    // Migrates the loaded song from the HTML5 element onto the JUCE backing
+    // transport. Throws only on transient/unexpected failures.
+    // `songAudio` is the snapshot captured at reroute entry; if it stops being
+    // the current song mid-flight we abort without mutating global routing.
+    // Returns a distinct string outcome — the caller must NOT conflate them:
+    //   'switched' — song now plays via JUCE.
+    //   'rejected' — JUCE hard-rejected the track (codec). Caller memoises it.
+    //   'stale'    — the loaded song changed mid-flight; aborted, NOT memoised.
+    // (a transient transport-start failure throws instead — also not memoised.)
+    async function _switchHtml5ToJuce(songAudio) {
+        const url = songAudio.url;
+        const wasPlaying = isPlaying;
+        const pos = audio.currentTime || 0;
+        // Mark a reroute in progress so the <audio> 'play'/'pause' listeners
+        // suppress their song:play / song:pause emissions: the migration is
+        // transparent — playback genuinely continues — so plugin state and
+        // window.slopsmith.isPlaying must NOT flip. This also silences the
+        // "Audio paused unexpectedly" diagnostic. A REFCOUNT (not a boolean)
+        // lets an overlapping reroute's deferred release coexist: each switch
+        // increments on entry and decrements after its own timeout; listeners
+        // treat any count > 0 as "reroute active".
+        window._juceRerouteInProgress = (window._juceRerouteInProgress || 0) + 1;
+        audio.pause();
+        try {
+            const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(url)}`);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const { path } = await res.json();
+            if (_isStale(songAudio)) return 'stale';   // song changed mid-fetch
+            const ok = await juceApi.loadBackingTrack(path);
+            if (ok === false) {
+                // JUCE rejected the track — stay on HTML5, resume if needed.
+                console.warn('[juce-reroute] loadBackingTrack rejected; staying on HTML5');
+                // Only resume if the element still has a source. In the normal
+                // flow audio.src is intact here, but a prior HTML5→JUCE switch
+                // clears it — re-point + load before resuming so a bounced
+                // reroute doesn't try to play() an empty element.
+                if (isPlaying && !_isStale(songAudio)) {
+                    if (!audio.src) { audio.src = url; audio.load(); }
+                    try { await audio.play(); } catch (_) { /* ignore */ }
+                }
+                return 'rejected';
+            }
+            if (_isStale(songAudio)) return 'stale';
+            const dur = await juceApi.getBackingDuration();
+            await juceApi.seekBacking(pos);
+            // Start the new transport BEFORE committing global routing state, so
+            // a play() failure can't leave us in "JUCE mode, nothing playing"
+            // (the silent-song state this watcher exists to prevent).
+            // jucePlayer.play() RETURNS false (it does not throw) when
+            // startBacking fails — check the result, don't just await it.
+            // A play() failure is a TRANSIENT transport-start issue, not a hard
+            // codec reject: throw (rather than returning 'rejected') so the
+            // caller's catch path handles it WITHOUT memoising the URL, leaving
+            // it free to retry on the next poll. Only 'rejected' is memoised.
+            // Re-read isPlaying as late as possible: the user can press Pause
+            // during the multi-await fetch/IPC chain above. Starting the JUCE
+            // transport off a stale `wasPlaying` snapshot would resume a song
+            // the user just paused. Only start it if playback is still wanted.
+            if (isPlaying) {
+                const started = await jucePlayer.play();
+                if (started === false) {
+                    if (!_isStale(songAudio) && isPlaying) {
+                        try { await audio.play(); } catch (_) { /* ignore */ }
+                    }
+                    throw new Error('jucePlayer.play() failed (transient transport start)');
+                }
+            }
+            if (_isStale(songAudio)) {
+                // Song changed while JUCE was spinning up — undo and bail.
+                await jucePlayer.pause().catch(() => {});
+                return 'stale';
+            }
+            if (window.jucePlayer) {
+                jucePlayer._dur = dur;
+                jucePlayer._pos = pos;
+                jucePlayer._pollAt = performance.now();
+            }
+            window._juceMode = true;
+            window._juceAudioUrl = url;
+            audio.src = '';
+            try {
+                const apply = window.slopsmith?.audio?.applySongVolume;
+                if (typeof apply === 'function') await apply();
+            } catch (_) { /* best-effort */ }
+            console.log('[juce-reroute] HTML5 → JUCE @', pos.toFixed(2), 's playing=', wasPlaying);
+            return 'switched';
+        } catch (err) {
+            // Path lookup, JSON parse, or a JUCE IPC call threw partway through.
+            // audio.pause() already ran above; restore HTML5 playback so a
+            // previously playing song isn't left silently paused, then re-throw
+            // so the caller logs it. The caller does NOT memoise this URL —
+            // transient failures must retry on the next poll.
+            if (isPlaying && !window._juceMode && !_isStale(songAudio)) {
+                if (!audio.src) { audio.src = url; audio.load(); }
+                try { await audio.play(); } catch (_) { /* ignore */ }
+            }
+            throw err;
+        } finally {
+            // Clearing audio.src above dispatches a 'pause' event in a later
+            // task, after this synchronous finally. Defer the refcount
+            // decrement so that trailing event is still suppressed; a 0ms
+            // timeout lands after the pending pause-event task. Decrementing
+            // (rather than zeroing) leaves any overlapping reroute's own
+            // suppression intact.
+            setTimeout(() => {
+                window._juceRerouteInProgress = Math.max(
+                    0, (window._juceRerouteInProgress || 1) - 1);
+            }, 0);
+        }
+    }
+
+    async function _switchJuceToHtml5(songAudio) {
+        const url = songAudio.url;
+        const wasPlaying = isPlaying;
+        const pos = (window.jucePlayer ? jucePlayer.currentTime : 0) || 0;
+        // Mark a reroute in progress (refcount) so the <audio> 'play' listener
+        // suppresses its song:play emission — the migration is transparent and
+        // playback genuinely continues, so plugin state must not flip. Held
+        // until after the (possibly deferred) audio.play() event has fired.
+        window._juceRerouteInProgress = (window._juceRerouteInProgress || 0) + 1;
+        let _suppressionReleased = false;
+        const _releaseSuppression = () => {
+            if (_suppressionReleased) return;
+            _suppressionReleased = true;
+            // Defer so the 'play' (or 'pause') event task fires while still
+            // suppressed; a 0ms timeout lands after it.
+            setTimeout(() => {
+                window._juceRerouteInProgress = Math.max(
+                    0, (window._juceRerouteInProgress || 1) - 1);
+            }, 0);
+        };
+        let _resumeScheduled = false;
+        try {
+            await jucePlayer.pause().catch(() => {});
+            if (_isStale(songAudio)) return;           // song changed mid-pause
+            window._juceMode = false;
+            window._juceAudioUrl = null;
+            audio.src = url;
+            audio.load();
+            // Resume only AFTER the seek so playback starts at `pos`, not at 0
+            // with an audible jump once metadata arrives.
+            const resumeAtPos = () => {
+                try {
+                    // The metadata event can land after a fast song switch —
+                    // bail before touching currentTime so a stale callback
+                    // doesn't seek the newly loaded song to the old position.
+                    if (_isStale(songAudio)) return;
+                    try { audio.currentTime = pos; } catch (_) { /* ignore */ }
+                    // Re-read isPlaying (not the entry snapshot): the user may
+                    // have pressed Pause during jucePlayer.pause()/metadata
+                    // load — don't resume a song they just paused.
+                    if (isPlaying) {
+                        audio.play().catch(() => { /* ignore */ });
+                    }
+                } finally {
+                    _releaseSuppression();
+                }
+            };
+            _resumeScheduled = true;
+            if (audio.readyState >= 1) {
+                resumeAtPos();
+            } else {
+                // Wait for metadata to resume at `pos`. But metadata may never
+                // arrive (bad URL, network error) — that would leak the
+                // suppression refcount and permanently silence song:play /
+                // song:pause. Guard with the element's 'error' event AND a
+                // backstop timeout; whichever fires first wins, the others are
+                // detached. _releaseSuppression is idempotent regardless.
+                let _settled = false;
+                const _onMeta = () => { finish(true); };
+                const _onErr = () => { finish(false); };
+                let _backstop;
+                function finish(reachedMetadata) {
+                    if (_settled) return;
+                    _settled = true;
+                    clearTimeout(_backstop);
+                    audio.removeEventListener('loadedmetadata', _onMeta);
+                    audio.removeEventListener('error', _onErr);
+                    if (reachedMetadata) {
+                        resumeAtPos();             // resumeAtPos releases suppression
+                    } else {
+                        _releaseSuppression();     // no resume — just release
+                    }
+                }
+                audio.addEventListener('loadedmetadata', _onMeta, { once: true });
+                audio.addEventListener('error', _onErr, { once: true });
+                // 10s is well beyond a normal local-file metadata load.
+                _backstop = setTimeout(() => { finish(false); }, 10000);
+            }
+        } finally {
+            // resumeAtPos owns the release once scheduled; if we returned
+            // early (stale, before scheduling) release here instead.
+            // _releaseSuppression is idempotent so an overlap is harmless.
+            if (!_resumeScheduled) _releaseSuppression();
+        }
+        try {
+            const apply = window.slopsmith?.audio?.applySongVolume;
+            if (typeof apply === 'function') await apply();
+        } catch (_) { /* best-effort */ }
+        console.log('[juce-reroute] JUCE → HTML5 @', pos.toFixed(2), 's playing=', wasPlaying);
+    }
+
+    async function _reevaluateJuceRouting() {
+        if (_rerouteInFlight) return;
+        const songAudio = window._currentSongAudio;
+        // Only /audio/ songs are JUCE-routable; sloppak stems stay on HTML5.
+        if (!songAudio || !songAudio.juceEligible) return;
+        // Don't race highway.js's own initial song-load routing: it owns
+        // _juceMode until _juceRoutingPromise settles. Re-running our switch
+        // concurrently would double-call loadBackingTrack for the same URL.
+        if (window._highwayJuceRoutingPending) return;
+
+        // Claim the in-flight guard SYNCHRONOUSLY, before the first await. The
+        // watcher is driven by a 350ms setInterval; if isAudioRunning() (or any
+        // later await) stalls past the poll period, a second tick would
+        // otherwise pass the `if (_rerouteInFlight) return` check above and run
+        // a concurrent switch — duplicate loadBackingTrack IPCs racing on
+        // _juceMode / audio.src. Setting it here closes that window.
+        _rerouteInFlight = true;
+        try {
+            let running;
+            try { running = await juceApi.isAudioRunning(); }
+            catch (_) { return; }
+            if (_isStale(songAudio)) return;               // song changed during IPC
+            if (!!running === !!window._juceMode) return;  // routing already consistent
+
+            const wantJuce = running && !window._juceMode;
+            // Don't keep retrying a track JUCE explicitly rejected.
+            if (wantJuce && songAudio.url === _rerouteRejectedUrl) return;
+
+            if (running) {
+                const outcome = await _switchHtml5ToJuce(songAudio);
+                // Memoise ONLY an explicit hard JUCE reject. A successful
+                // switch clears the memo; a 'stale' abort (song changed
+                // mid-flight) leaves it untouched — it must never be
+                // misclassified as a reject, even if the song object was
+                // swapped and then restored before this point.
+                if (outcome === 'rejected') {
+                    _rerouteRejectedUrl = songAudio.url;
+                } else if (outcome === 'switched') {
+                    _rerouteRejectedUrl = null;
+                }
+                // outcome === 'stale': leave _rerouteRejectedUrl as-is.
+            } else {
+                await _switchJuceToHtml5(songAudio);
+                // The engine just stopped. Clear any hard-reject memo so a
+                // later engine restart re-evaluates the track at least once —
+                // the rejection may have been a transient device/decoder state.
+                _rerouteRejectedUrl = null;
+            }
+        } catch (e) {
+            // Transient failure — log but do NOT memoise, so the next poll retries.
+            console.warn('[juce-reroute] re-route failed (will retry):', e);
+        } finally {
+            _rerouteInFlight = false;
+        }
+    }
+    window._reevaluateJuceRouting = _reevaluateJuceRouting;
+
+    // Clears the hard-reject memo. Called from the song-teardown sites that
+    // null window._currentSongAudio (showScreen, playSong) so that reloading
+    // the same file later gets a fresh routing attempt — a prior reject may
+    // have been a transient JUCE/device state, not a permanent codec issue.
+    window._clearJuceRerouteMemo = function () { _rerouteRejectedUrl = null; };
+
+    // The engine can be started/stopped from several places (the desktop Audio
+    // Engine panel, the audio_engine plugin, note_detect) and via setDevice
+    // restarts — and the contextBridge api object is frozen, so its methods
+    // can't be wrapped. Poll isAudioRunning() while a song is loaded; the check
+    // is a cheap IPC boolean and no-ops once routing is already consistent.
+    // Skip the poll while the document is hidden (background tab / minimised
+    // window) — engine toggles there will be reconciled on the first poll
+    // after the tab is visible again.
+    setInterval(() => {
+        if (document.hidden) return;
+        if (window._currentSongAudio) void _reevaluateJuceRouting();
+    }, 350);
+})();
+
+// Desktop JUCE backing uses an empty <audio> element; plugins such as Section Map
+// still seek via audio.currentTime / pause / play. Mirror those onto jucePlayer
+// while _juceMode is active. Same-tick pause+seek coalesce into a single seek
+// (no stopBacking before seek — HTML5 needed that for buffering; JUCE does not).
+let _resetJuceAudioShimChain = function () {};
+(function _installJuceAudioElementShim() {
+    if (!window.slopsmithDesktop?.audio) return;
+
+    const mediaProto = HTMLMediaElement.prototype;
+    const ctDesc = Object.getOwnPropertyDescriptor(mediaProto, 'currentTime');
+    const pausedDesc = Object.getOwnPropertyDescriptor(mediaProto, 'paused');
+    if (!ctDesc?.get || !ctDesc?.set || !pausedDesc?.get) return;
+
+    const nativePlay = mediaProto.play;
+    const nativePause = mediaProto.pause;
+
+    let chain = Promise.resolve();
+    /** Same-tick pause + seek (Section Map): coalesce to one seek — no stopBacking before seek. */
+    let _juceShimBatch = null;
+    let _juceShimBatchFlushScheduled = false;
+    let _juceShimGen = 0;
+    function enqueue(fn) {
+        const gen = _juceShimGen;
+        const p = chain.then(async () => {
+            if (gen !== _juceShimGen) return;
+            return fn(gen);
+        });
+        chain = p.catch((e) => {
+            console.warn('[juce-audio-shim]', e);
+        });
+        return p;
+    }
+    // forUpcomingPlay: caller will enqueue a play() right after, so don't
+    // emit pause-state side effects for a wantsPause batch — play() will
+    // overwrite them anyway.
+    function flushJuceShimBatchNow({ forUpcomingPlay = false } = {}) {
+        _juceShimBatchFlushScheduled = false;
+        const batch = _juceShimBatch;
+        _juceShimBatch = null;
+        if (!batch || !window._juceMode) return;
+        const wantsPause = !!batch.wantsPause;
+        const seekTime = batch.seekTime;
+        if (wantsPause && seekTime !== undefined) {
+            enqueue(async (gen) => {
+                const r = await _audioSeek(seekTime, 'audio-element-shim');
+                if (!r.completed) return; // seek cancelled by teardown
+                if (gen !== _juceShimGen) return;
+                if (!forUpcomingPlay) {
+                    await jucePlayer.pause();
+                    if (gen !== _juceShimGen) return;
+                    isPlaying = false;
+                    document.getElementById('btn-play').textContent = '▶ Play';
+                    const sm = window.slopsmith;
+                    if (sm) {
+                        sm.isPlaying = false;
+                        sm.emit('song:pause', _songEventPayload());
+                    }
+                }
+                audio.dispatchEvent(new Event('seeked'));
+            });
+            return;
+        }
+        if (wantsPause) {
+            enqueue(async (gen) => {
+                await jucePlayer.pause();
+                if (gen !== _juceShimGen) return;
+                isPlaying = false;
+                document.getElementById('btn-play').textContent = '▶ Play';
+                const sm = window.slopsmith;
+                if (sm) {
+                    sm.isPlaying = false;
+                    sm.emit('song:pause', _songEventPayload());
+                }
+            });
+            return;
+        }
+        if (seekTime !== undefined) {
+            enqueue(async (gen) => {
+                const r = await _audioSeek(seekTime, 'audio-element-shim');
+                if (!r.completed) return; // seek cancelled by teardown
+                if (gen !== _juceShimGen) return;
+                audio.dispatchEvent(new Event('seeked'));
+            });
+        }
+    }
+    function scheduleJuceShimBatchFlush() {
+        if (_juceShimBatchFlushScheduled) return;
+        _juceShimBatchFlushScheduled = true;
+        const flushGen = _juceShimGen;
+        queueMicrotask(() => {
+            if (flushGen !== _juceShimGen) {
+                _juceShimBatchFlushScheduled = false;
+                return;
+            }
+            flushJuceShimBatchNow();
+        });
+    }
+    _resetJuceAudioShimChain = function () {
+        chain = Promise.resolve();
+        _juceShimBatch = null;
+        _juceShimBatchFlushScheduled = false;
+        _juceShimGen++;
+    };
+
+    Object.defineProperty(audio, 'currentTime', {
+        get() {
+            if (window._juceMode) return jucePlayer.currentTime;
+            return ctDesc.get.call(this);
+        },
+        set(v) {
+            if (window._juceMode) {
+                const t = Math.max(0, Number(v) || 0);
+                _juceShimBatch = _juceShimBatch || {};
+                _juceShimBatch.seekTime = t;
+                scheduleJuceShimBatchFlush();
+                return;
+            }
+            ctDesc.set.call(this, v);
+        },
+        configurable: true,
+    });
+
+    Object.defineProperty(audio, 'paused', {
+        get() {
+            if (window._juceMode) return !isPlaying;
+            return pausedDesc.get.call(this);
+        },
+        configurable: true,
+    });
+
+    audio.pause = function () {
+        if (window._juceMode) {
+            _juceShimBatch = _juceShimBatch || {};
+            _juceShimBatch.wantsPause = true;
+            scheduleJuceShimBatchFlush();
+            return;
+        }
+        nativePause.call(audio);
+    };
+
+    audio.play = function () {
+        if (window._juceMode) {
+            if (_juceShimBatch != null) flushJuceShimBatchNow({ forUpcomingPlay: true });
+            const p = enqueue(async (gen) => {
+                const started = await jucePlayer.play();
+                if (gen !== _juceShimGen || !started) return;
+                isPlaying = true;
+                document.getElementById('btn-play').textContent = '⏸ Pause';
+                const sm = window.slopsmith;
+                if (sm) {
+                    sm.isPlaying = true;
+                    sm.emit('song:play', _songEventPayload());
+                }
+            });
+            return p.then(() => undefined);
+        }
+        return nativePlay.call(audio);
+    };
+})();
+
 function _audioTime() { return window._juceMode ? jucePlayer.currentTime : audio.currentTime; }
 function _audioDuration() { return window._juceMode ? jucePlayer.duration : audio.duration; }
-async function _audioSeek(s) {
-    if (window._juceMode) return jucePlayer.seek(s);
-    else audio.currentTime = s;
+// Canonical payload for song:play/song:pause/song:ended. Plugins anchor
+// their own clocks against `perfNow` (a monotonic timestamp at the same
+// moment audio reports `audioT`) so they don't have to chase the chart
+// clock with a follow-up call. `time` is kept as an alias for `audioT`
+// because pre-existing plugins read e.detail.time.
+function _songEventPayload() {
+    const audioT = _audioTime();
+    return {
+        time: audioT,
+        audioT,
+        chartT: highway.getTime(),
+        perfNow: performance.now(),
+    };
+}
+// Serializes seeks so concurrent callers (e.g. user ⏪ during a loop wrap)
+// don't interleave their from/to reads — each call captures `from` only
+// once the previous seek + emit have completed. The generation token
+// lets session teardown invalidate queued seeks so they don't run against
+// the new player and emit a stale song:seek.
+let _audioSeekChain = Promise.resolve();
+let _audioSeekGen = 0;
+function _resetAudioSeekState() {
+    // Bump the generation — in-flight chain callbacks see the mismatch on
+    // their next guard check and short-circuit (no emit, no further state
+    // mutation by us). Don't reset the chain head: new seeks must still
+    // queue behind the in-flight old seek's IPC so two `jucePlayer.seek()`
+    // calls can't race in the JUCE backing engine. The queue drains
+    // quickly because each subsequent old-gen step bails on the first
+    // guard the moment its predecessor resolves.
+    _audioSeekGen++;
+}
+// Time-box the JUCE IPC so a single hung seek can't block the global
+// _audioSeekChain forever (which would freeze every subsequent reposition
+// path: seekBy, loop-wrap, jump-fix, shimmed audio.currentTime).
+const _JUCE_SEEK_TIMEOUT_MS = 2000;
+function _juceSeekWithTimeout(s) {
+    let timer;
+    const seekP = jucePlayer.seek(s);
+    const timeoutP = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('JUCE seek timed out')), _JUCE_SEEK_TIMEOUT_MS);
+    });
+    // Clear the timer once the race settles either way; without this the
+    // pending timeout keeps the event loop alive (and eventually rejects
+    // an unawaited promise) even after a successful seek.
+    return Promise.race([seekP, timeoutP]).finally(() => clearTimeout(timer));
+}
+// Resolves to `{ completed, from, to }`:
+//   - completed: true if the seek ran to completion and emitted song:seek;
+//                false if cancelled by a teardown gen bump (or threw).
+//   - from: chart clock just before the seek (NaN on cancel before from-read).
+//   - to:   verified post-seek clock (NaN on cancel/throw).
+// Callers that fire follow-up work after the seek (count-in, arrangement
+// restore, etc.) should check `completed` so they don't act on a torn-down
+// session. Callers that need the actual landed position (because JUCE may
+// clamp or HTML5 may snap to the seekable range) should read `to` rather
+// than re-using the requested `s`.
+async function _audioSeek(s, reason) {
+    // Single funnel for every audio repositioning. Emits song:seek so
+    // plugins (notedetect detection-suppression during seek transients,
+    // practice-journal segment tracking) can react to any chart-time
+    // jump regardless of which UI path triggered it. `reason` is a
+    // free-form short string ('seek-by', 'loop-wrap', 'loop-set',
+    // 'arrangement-restore', 'jump-fix') so subscribers can filter.
+    const gen = _audioSeekGen;
+    _audioSeekChain = _audioSeekChain.then(async () => {
+        if (gen !== _audioSeekGen) return { completed: false, from: NaN, to: NaN };
+        const from = _audioTime();
+        if (window._juceMode) await _juceSeekWithTimeout(s);
+        else audio.currentTime = s;
+        if (gen !== _audioSeekGen) return { completed: false, from, to: NaN };
+        // Read the verified post-seek position rather than the requested `s`
+        // so plugins observe the actual clock — JUCE may clamp or roll back,
+        // and HTML5 may snap to the nearest seekable range.
+        const to = _audioTime();
+        // Sync the jump-fix tracker so the next 60Hz tick doesn't see a
+        // legitimate far seek (e.g. saved-loop jump > 30s) as a browser
+        // bug and revert it.
+        lastAudioTime = to;
+        // Sync the chart clock too so any song:* emit fired right after
+        // _audioSeek resolves (e.g. the auto-resume song:play in
+        // changeArrangement) sees an in-sync chartT via _songEventPayload.
+        // Without this, chartT lags by one 60Hz tick after a seek.
+        if (typeof highway !== 'undefined' && highway && typeof highway.setTime === 'function') {
+            highway.setTime(to);
+        }
+        window.slopsmith.emit('song:seek', { from, to, reason: reason || null });
+        return { completed: true, from, to };
+    }).catch((err) => {
+        // Don't let one failed seek poison subsequent ones.
+        console.warn('[_audioSeek]', err);
+        return { completed: false, from: NaN, to: NaN };
+    });
+    return _audioSeekChain;
 }
 let currentFilename = '';
 // Plugin context API — lightweight event bus for plugin integration
@@ -2537,7 +3485,14 @@ window.slopsmith = Object.assign(new EventTarget(), {
         this.dispatchEvent(new CustomEvent(event, { detail }));
     },
     on(event, fn, options) { this.addEventListener(event, fn, options); },
-    off(event, fn, options) { this.removeEventListener(event, fn, options); }
+    off(event, fn, options) { this.removeEventListener(event, fn, options); },
+    // Loop API — plugins should never reach for #btn-loop-* directly.
+    // The script-scope `setLoop` and `clearLoop` are hoisted so these
+    // method bodies resolve them lexically; `getLoop` reads the live
+    // loopA/loopB bindings at call time.
+    setLoop(a, b) { return setLoop(a, b); },
+    clearLoop() { clearLoop(); },
+    getLoop() { return { loopA, loopB }; },
 });
 if (_slopsmithExisting) {
     for (const key of Object.keys(_slopsmithExisting)) {
@@ -2560,17 +3515,38 @@ function _readSongVolume() {
 }
 audio.volume = _readSongVolume() / 100;
 
+function _adjustSongVolume(delta) {
+    const audioApi = window.slopsmith?.audio;
+    if (!audioApi) return;
+    const current = audioApi.readSongVolume?.() ?? 80;
+    const next = Math.max(0, Math.min(100, Math.round(current + delta)));
+    const songFader = audioApi.getFaders?.().find(f => f.id === 'song');
+    if (songFader) songFader.setValue(next);
+}
+
 // Re-sync audio.volume from the persisted setting whenever a new source
 // finishes loading metadata. Belt + suspenders — some combinations of plugin
 // audio-graph routing and media-element swaps reset audio.volume to 1.0
 // (slopsmith#54). Delegates to audio-mixer's readSongVolume when loaded so
 // the in-memory fallback (for storage-blocked contexts) is authoritative.
 audio.addEventListener('loadedmetadata', () => {
-    audio.volume = (window.slopsmith?.audio?.readSongVolume?.() ?? _readSongVolume()) / 100;
+    const applySongVolume = window.slopsmith?.audio?.applySongVolume;
+    if (typeof applySongVolume === 'function') {
+        void applySongVolume();
+    } else {
+        audio.volume = (window.slopsmith?.audio?.readSongVolume?.() ?? _readSongVolume()) / 100;
+    }
 });
 
 // Debug audio issues
-audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
+audio.addEventListener('pause', () => {
+    // The JUCE engine-reroute watcher pauses the element on purpose mid-migration
+    // (and the src='' it does fires a trailing async pause too); don't flag those
+    // as unexpected — the watcher holds window._juceRerouteInProgress across it.
+    if (isPlaying && !window._juceRerouteInProgress) {
+        console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1));
+    }
+});
 audio.addEventListener('error', (e) => {
     // Ignore errors from empty src (happens during song switch cleanup)
     if (!audio.src || audio.src === window.location.href) return;
@@ -2582,16 +3558,23 @@ audio.addEventListener('ended', () => {
     console.log('Audio ended'); isPlaying = false;
     document.getElementById('btn-play').textContent = '▶ Play';
     window.slopsmith.isPlaying = false;
-    window.slopsmith.emit('song:ended', { time: audio.currentTime });
+    window.slopsmith.emit('song:ended', _songEventPayload());
 });
 audio.addEventListener('play', () => {
+    // During a JUCE engine reroute the element is paused/played as a transparent
+    // migration step — playback genuinely continues, so don't emit song:play or
+    // flip slopsmith.isPlaying (the watcher keeps the canonical state itself).
+    if (window._juceRerouteInProgress) return;
     window.slopsmith.isPlaying = true;
-    window.slopsmith.emit('song:play', { time: audio.currentTime });
+    window.slopsmith.emit('song:play', _songEventPayload());
 });
 audio.addEventListener('pause', () => {
     if (!isPlaying) return;
+    // Same as above: suppress the song:pause emitted by a reroute's deliberate
+    // audio.pause() — the migration is transparent to plugin play-state.
+    if (window._juceRerouteInProgress) return;
     window.slopsmith.isPlaying = false;
-    window.slopsmith.emit('song:pause', { time: audio.currentTime });
+    window.slopsmith.emit('song:pause', _songEventPayload());
 });
 
 // Abort controller for cancelling pending requests when entering player
@@ -2605,13 +3588,40 @@ async function playSong(filename, arrangement) {
     artAbortController = null;
 
     highway.stop();
+    // Cancel any active count-in: clear timers/RAF and bump the gen so
+    // delayed callbacks (rewind frames, post-seek then, count-in ticks,
+    // post-count play) bail before mutating the new session.
+    _cancelCountIn();
+    // Reset the JUCE shim BEFORE awaiting jucePlayer.stop() so any in-flight
+    // shim closures see a stale generation after their await and bail out
+    // before mutating isPlaying / button label / song:* events for the
+    // outgoing song.
+    _resetJuceAudioShimChain();
+    // Cancel queued _audioSeek calls from the previous song: bumping the
+    // generation makes their chained callbacks bail out.
+    _resetAudioSeekState();
     if (window._juceMode) {
+        // Mirror the showScreen teardown: emit song:pause for the JUCE
+        // path so plugins don't see a stale "playing" state on song
+        // change. (HTML5 fires it via the audio element 'pause' event.)
+        // Snapshot payload BEFORE stop() resets _pos so audioT/chartT
+        // capture the actual paused position.
+        const payload = _songEventPayload();
+        const wasPlaying = isPlaying;
         await jucePlayer.stop().catch(() => {});
+        if (wasPlaying && window.slopsmith) {
+            window.slopsmith.isPlaying = false;
+            window.slopsmith.emit('song:pause', payload);
+        }
         window._juceMode = false;
         window._juceAudioUrl = null;
     }
     audio.pause();
     audio.src = '';
+    // Stale until the incoming song's WS handler (highway.js) sets it again.
+    window._currentSongAudio = null;
+    // Fresh JUCE routing attempt for whatever song loads next.
+    window._clearJuceRerouteMemo?.();
     isPlaying = false;
     document.getElementById('btn-play').textContent = '▶ Play';
     document.getElementById('speed-slider').value = 100;
@@ -2666,14 +3676,36 @@ async function changeArrangement(index) {
         highway._onReady = async () => {
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
-            await _audioSeek(time);
+            const r = await _audioSeek(time, 'arrangement-restore');
+            // Don't auto-resume on cancel OR off-target landing — same
+            // 50 ms tolerance as loop-wrap / loop-set. Resuming play from
+            // a different position than the user's previous play position
+            // would be jarring; better to leave them at the post-seek
+            // (likely close-but-not-equal) position without auto-play.
+            if (!r.completed || Math.abs(r.to - time) > 0.05) {
+                // changeArrangement paused audio at entry (line 3032) but
+                // didn't update the button or emit song:pause — those were
+                // meant to be no-ops if the auto-resume succeeded. On
+                // abort, sync the transport: button -> 'Play',
+                // sm.isPlaying = false, emit song:pause so plugins see the
+                // paused state.
+                if (wasPlaying) {
+                    document.getElementById('btn-play').textContent = '▶ Play';
+                    if (window.slopsmith) {
+                        window.slopsmith.isPlaying = false;
+                        window.slopsmith.emit('song:pause', _songEventPayload());
+                    }
+                }
+                highway._onReady = null;
+                return;
+            }
             if (wasPlaying) {
                 if (window._juceMode) {
                     const started = await jucePlayer.play();
                     if (started) {
                         isPlaying = true;
                         window.slopsmith.isPlaying = true;
-                        window.slopsmith.emit('song:play', { time: jucePlayer.currentTime });
+                        window.slopsmith.emit('song:play', _songEventPayload());
                     }
                 } else audio.play().then(() => { isPlaying = true; }).catch(() => {});
             }
@@ -2692,14 +3724,14 @@ async function togglePlay() {
             isPlaying = false;
             document.getElementById('btn-play').textContent = '▶ Play';
             window.slopsmith.isPlaying = false;
-            window.slopsmith.emit('song:pause', { time: jucePlayer.currentTime });
+            window.slopsmith.emit('song:pause', _songEventPayload());
         } else {
             const started = await jucePlayer.play();
             if (!started) return; // startBacking() failed — IPC error already logged
             isPlaying = true;
             document.getElementById('btn-play').textContent = '⏸ Pause';
             window.slopsmith.isPlaying = true;
-            window.slopsmith.emit('song:play', { time: jucePlayer.currentTime });
+            window.slopsmith.emit('song:play', _songEventPayload());
         }
         return;
     }
@@ -2713,8 +3745,7 @@ async function togglePlay() {
 }
 
 async function seekBy(s) {
-    if (window._juceMode) { await jucePlayer.seek(Math.max(0, jucePlayer.currentTime + s)); return; }
-    audio.currentTime = Math.max(0, audio.currentTime + s);
+    await _audioSeek(Math.max(0, _audioTime() + s), 'seek-by');
 }
 function setSpeed(v) {
     if (window._juceMode) {
@@ -3316,6 +4347,63 @@ function clearLoop() {
     document.getElementById('saved-loops').value = '';
 }
 
+// Resync #saved-loops + #btn-loop-delete with the currently-active
+// loopA/loopB. Used by both setLoop's success path (so plugin-driven
+// loops show up correctly in the dropdown) and loadSavedLoop's
+// failure path (so a cancelled selection reverts to the still-active
+// loop). Without this sync, deleteSelectedLoop could target a stale
+// option that doesn't match the active loop.
+function _syncSavedLoopSelection() {
+    const sel = document.getElementById('saved-loops');
+    const delBtn = document.getElementById('btn-loop-delete');
+    if (!sel || !delBtn) return;
+    let selected = '';
+    if (loopA !== null && loopB !== null) {
+        for (const opt of sel.options) {
+            if (Number(opt.dataset.start) === loopA && Number(opt.dataset.end) === loopB) {
+                selected = opt.value;
+                break;
+            }
+        }
+    }
+    sel.value = selected;
+    delBtn.classList.toggle('hidden', !selected);
+}
+
+// Programmatically set both loop endpoints and seek to A. The dropdown
+// path (loadSavedLoop) and the plugin-API path (window.slopsmith.setLoop)
+// both funnel through here so the UI state stays canonical regardless of
+// who triggered the loop.
+//
+// Returns true if the seek landed at A and the loop is now active;
+// returns false if the seek was cancelled by teardown or landed off-target
+// (JUCE clamp / HTML5 snap > 50ms from A). On false, loopA/loopB are NOT
+// committed and the UI is not painted — the prior loop (if any) stays
+// active. Throws on invalid inputs.
+async function setLoop(a, b) {
+    const aNum = Number(a);
+    const bNum = Number(b);
+    if (!Number.isFinite(aNum) || !Number.isFinite(bNum) || bNum <= aNum) {
+        throw new Error(`setLoop: requires finite a and b with b > a (got a=${a}, b=${b})`);
+    }
+    // Don't arm loopA/loopB before the seek lands — the 60Hz tick's wrap
+    // detector (`ct >= loopB`) would trigger startCountIn against
+    // half-applied state.
+    const r = await _audioSeek(aNum, 'loop-set');
+    if (!r.completed || Math.abs(r.to - aNum) > 0.05) return false;
+    loopA = aNum;
+    loopB = bNum;
+    document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
+    updateLoopUI();
+    // Sync the saved-loops dropdown so a plugin-driven setLoop call
+    // surfaces the matching saved option (and Delete button) — otherwise
+    // the dropdown can stay on a stale selection and deleteSelectedLoop
+    // would target the wrong record.
+    _syncSavedLoopSelection();
+    return true;
+}
+
 function updateLoopUI() {
     const label = document.getElementById('loop-label');
     const hasLoop = loopA !== null && loopB !== null;
@@ -3360,13 +4448,29 @@ async function loadSavedLoop(loopId) {
         delBtn.classList.add('hidden');
         return;
     }
-    loopA = parseFloat(opt.dataset.start);
-    loopB = parseFloat(opt.dataset.end);
-    await _audioSeek(loopA);
-    document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
-    document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
-    updateLoopUI();
-    delBtn.classList.remove('hidden');
+    let ok = false;
+    try {
+        // Pass raw strings — setLoop's Number() coercion is stricter than
+        // parseFloat (rejects "12abc") so malformed dataset values throw
+        // and fall into the catch instead of silently truncating.
+        ok = await setLoop(opt.dataset.start, opt.dataset.end);
+    } catch (err) {
+        // Malformed dataset (server returned bad data): treat the same as
+        // a failed seek so the dropdown resyncs and we don't propagate an
+        // uncaught rejection out of the onchange handler.
+        console.warn('[loadSavedLoop] setLoop threw:', err);
+        ok = false;
+    }
+    if (!ok) {
+        // Seek aborted, landed off-target, or input was malformed.
+        // Resync the dropdown with the still-active loop so the UI
+        // doesn't lie about which loop is loaded.
+        _syncSavedLoopSelection();
+        return;
+    }
+    // Success path: setLoop already called _syncSavedLoopSelection,
+    // which surfaces the delete button when the new loop matches a
+    // saved option (which the dropdown selection guarantees here).
 }
 
 async function saveCurrentLoop() {
@@ -3414,6 +4518,20 @@ function playClick(high = false) {
 
 let _countingIn = false;
 let _countOverlay = null;
+// Generation token so teardown can cancel an in-progress count-in. Each
+// startCountIn() captures the gen at entry; rewindStep, the loop-wrap
+// then-callback, and beginCount's tick all bail when their captured gen
+// no longer matches. Bumped by _cancelCountIn().
+let _countInGen = 0;
+let _countInTimer = null;
+let _countInRaf = 0;
+function _cancelCountIn() {
+    _countInGen++;
+    _countingIn = false;
+    hideCountOverlay();
+    if (_countInTimer) { clearTimeout(_countInTimer); _countInTimer = null; }
+    if (_countInRaf) { cancelAnimationFrame(_countInRaf); _countInRaf = 0; }
+}
 
 function showCountOverlay(n) {
     if (!_countOverlay) {
@@ -3431,11 +4549,16 @@ function hideCountOverlay() {
 async function startCountIn() {
     if (_countingIn) return;
     _countingIn = true;
+    // Snapshot the current gen so every delayed callback (rewind frames,
+    // post-seek then, count-in ticks, post-count play) can bail if a
+    // teardown bumped the gen mid-flight via _cancelCountIn().
+    const gen = _countInGen;
     if (window._juceMode) {
         await jucePlayer.pause().catch((err) => console.error('[app] jucePlayer.pause error in count-in:', err));
     } else {
         audio.pause();
     }
+    if (gen !== _countInGen) return; // teardown during pause
 
     // Rewind animation: sweep highway time from B to A
     const rewindDuration = 400; // ms
@@ -3444,6 +4567,7 @@ async function startCountIn() {
     const toTime = loopA;
 
     function rewindStep(now) {
+        if (gen !== _countInGen) return; // teardown mid-rewind
         const elapsed = now - rewindStart;
         const t = Math.min(elapsed / rewindDuration, 1);
         // Ease out quad
@@ -3451,19 +4575,56 @@ async function startCountIn() {
         const currentT = fromTime + (toTime - fromTime) * eased;
         highway.setTime(currentT);
         if (t < 1) {
-            requestAnimationFrame(rewindStep);
+            _countInRaf = requestAnimationFrame(rewindStep);
         } else {
+            _countInRaf = 0;
             // Rewind done — set final position and start count.
             // Await the JUCE seek so the engine has repositioned before
             // we start the click track (HTML5 path is synchronous).
-            _audioSeek(loopA).then(() => {
-                lastAudioTime = loopA;
-                highway.setTime(loopA);
+            _audioSeek(loopA, 'loop-wrap').then((r) => {
+                if (gen !== _countInGen) return; // teardown during seek
+                // Abort the loop restart in two cases:
+                //   1. Cancelled (player torn down): don't beginCount on a
+                //      new session.
+                //   2. Off-target landing (JUCE rollback / clamp far from
+                //      loopA): proceeding would emit loop:restart and start
+                //      a count-in from the wrong position. Audio is at
+                //      r.from / r.to, which is not where the loop wants to
+                //      resume — better to drop this iteration than play out
+                //      of sync.
+                // 50 ms tolerance: well within JUCE's normal seek precision
+                // but tight enough to catch a real rollback or no-op.
+                if (!r.completed || Math.abs(r.to - loopA) > 0.05) {
+                    // startCountIn paused audio at entry but left isPlaying
+                    // alone — beginCount would have set it on resume. On
+                    // abort, sync the transport: audio is paused, so
+                    // isPlaying must reflect that and the button + plugin
+                    // host must agree.
+                    _countingIn = false;
+                    if (isPlaying) {
+                        isPlaying = false;
+                        document.getElementById('btn-play').textContent = '▶ Play';
+                        if (window.slopsmith) {
+                            window.slopsmith.isPlaying = false;
+                            window.slopsmith.emit('song:pause', _songEventPayload());
+                        }
+                    }
+                    return;
+                }
+                // Use the verified post-seek clock for the chart so audio
+                // and chart stay in sync if JUCE clamped to slightly
+                // before/after loopA. The loop:restart event keeps `time:
+                // loopA` because subscribers treat that as the semantic
+                // marker for "new iteration starts at A", not the actual
+                // audio position.
+                lastAudioTime = r.to;
+                highway.setTime(r.to);
+                window.slopsmith.emit('loop:restart', { loopA, loopB, time: loopA });
                 beginCount();
             });
         }
     }
-    requestAnimationFrame(rewindStep);
+    _countInRaf = requestAnimationFrame(rewindStep);
 
     function beginCount() {
         const bpm = highway.getBPM(loopA);
@@ -3471,17 +4632,19 @@ async function startCountIn() {
         let count = 0;
 
         function tick() {
+            if (gen !== _countInGen) return; // teardown mid-count
             count++;
             if (count > 4) {
                 hideCountOverlay();
                 _countingIn = false;
                 if (window._juceMode) {
                     jucePlayer.play().then((started) => {
+                        if (gen !== _countInGen) return; // teardown during play start
                         if (!started) return;
                         isPlaying = true;
                         document.getElementById('btn-play').textContent = '⏸ Pause';
                         window.slopsmith.isPlaying = true;
-                        window.slopsmith.emit('song:play', { time: jucePlayer.currentTime });
+                        window.slopsmith.emit('song:play', _songEventPayload());
                     }).catch((err) => console.error('[app] jucePlayer.play error:', err));
                 } else {
                     audio.play();
@@ -3492,16 +4655,16 @@ async function startCountIn() {
             }
             showCountOverlay(count);
             playClick(count === 1);
-            setTimeout(tick, beatInterval * 1000);
+            _countInTimer = setTimeout(tick, beatInterval * 1000);
         }
-        setTimeout(tick, 500);
+        _countInTimer = setTimeout(tick, 500);
     }
 }
 
 // Time display + highway sync
 let lastAudioTime = 0;
 setInterval(() => {
-    const ct = _audioTime();
+    let ct = _audioTime();
     const dur = _audioDuration();
     if (dur && !_countingIn) {
         // JUCE end-of-track: HTML5 fires 'ended'; JUCE needs a manual check
@@ -3509,7 +4672,7 @@ setInterval(() => {
             isPlaying = false;
             document.getElementById('btn-play').textContent = '▶ Play';
             window.slopsmith.isPlaying = false;
-            window.slopsmith.emit('song:ended', { time: ct });
+            window.slopsmith.emit('song:ended', _songEventPayload());
             jucePlayer.pause().catch((err) => console.warn('[app] end-of-track pause error:', err));
         }
         // A-B loop: count-in then seek back to A
@@ -3520,7 +4683,11 @@ setInterval(() => {
         // Detect and fix audio time jumps (browser seeking bug; skip for JUCE — position is polled)
         else if (!window._juceMode && isPlaying && Math.abs(ct - lastAudioTime) > 30 && lastAudioTime > 0) {
             console.warn(`Audio time jumped from ${lastAudioTime.toFixed(1)} to ${ct.toFixed(1)}, resetting`);
-            audio.currentTime = lastAudioTime;
+            _audioSeek(lastAudioTime, 'jump-fix');
+            // Treat the corrected position as canonical for the rest of this
+            // tick. Otherwise we'd write the stale jumped `ct` into
+            // lastAudioTime below and ping-pong on the next tick.
+            ct = lastAudioTime;
         }
         lastAudioTime = ct;
         document.getElementById('hud-time').textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
@@ -3528,20 +4695,524 @@ setInterval(() => {
     if (!_countingIn) highway.setTime(ct);
 }, 1000 / 60);
 
-// Keyboard shortcuts (player only)
+// ── Centralized Keyboard Shortcut Registry ───────────────────────────────
+//
+// Plugins can register keyboard shortcuts via window.registerShortcut().
+// Shortcuts are scope-aware (global, player, library, plugin-specific) and
+// support optional condition callbacks for dynamic enable/disable.
+//
+// Panel-scoped shortcuts:
+//   - Each panel has its own shortcut registry
+//   - Use window.createShortcutPanel(id) to create a panel
+//   - Use window.setActiveShortcutPanel(id) to set the active panel
+//   - Shortcuts are registered to the active panel
+//   - This allows multiple panels (e.g., splitscreen) to have their own shortcuts
+//
+// API:
+//   window.registerShortcut({
+//     key: string,              // Required: key value (e.key) or key code (e.code)
+//     description: string,     // Required: shown in help panel
+//     scope: 'global' | 'player' | 'library' | 'settings' | 'plugin-{id}',  // Default: 'global'
+//     condition: () => boolean,  // Optional: dynamic enable/disable guard
+//     handler: (e) => void,    // Required: callback when shortcut triggers
+//     modifiers: {              // Optional: require modifier keys
+//       ctrl?: boolean,
+//       alt?: boolean,
+//       shift?: boolean,
+//       meta?: boolean
+//     }
+//   });
+//
+// Panel API:
+//   window.createShortcutPanel(id) - Create a new panel
+//   window.setActiveShortcutPanel(id) - Set the active panel for registration
+//   window.getActiveShortcutPanel() - Get the current active panel
+//   window.isInShortcutPanel() - Check if running in a panel (not default)
+//   window.getGlobalShortcutContext() - Get default panel for truly global shortcuts
+//
+// Note: The handler receives the KeyboardEvent, so you can check
+// e.shiftKey, e.altKey, etc. directly in your handler if you need
+// behavior that depends on modifier state (e.g., different actions
+// for Shift+key vs key alone). Use the modifiers option when you
+// want the shortcut to ONLY fire with specific modifiers.
+//
+// See CLAUDE.md for full documentation.
+
+// ── Window ID system for per-window shortcuts ────────────────────────────────
+// Each window gets a unique ID so plugins can register window-specific shortcuts.
+// This is useful for popup windows (e.g., splitscreen plugin) that need their
+// own keyboard shortcuts.
+
+let _shortcutWindowId = null;
+
+window.getShortcutWindowId = () => {
+    if (_shortcutWindowId) return _shortcutWindowId;
+    // Generate a unique ID for this window
+    _shortcutWindowId = 'win-' + Math.random().toString(36).substr(2, 9);
+    return _shortcutWindowId;
+};
+
+// ── Shortcut registry ───────────────────────────────────────────────────────
+
+// ── Panel-scoped shortcut system ───────────────────────────────────────────
+// Each panel has its own shortcut registry. This allows multiple panels
+// (e.g., splitscreen) to have their own keyboard shortcuts without collisions.
+
+class ShortcutPanel {
+    constructor(id) {
+        this.id = id;
+        this.shortcuts = new Map();
+    }
+    
+    _compositeKey(key, scope) {
+        return `${scope}::${key}`;
+    }
+    
+    registerShortcut(options) {
+        const { key, description, scope = 'global', condition = null, handler, modifiers = null } = options;
+        
+        if (!key || !handler) {
+            console.error(`registerShortcut: key and handler are required`);
+            return;
+        }
+        
+        // Validate scope
+        const validScopes = ['global', 'player', 'library', 'settings'];
+        const isValidScope = validScopes.includes(scope) || 
+                             scope.startsWith('plugin-');
+        if (!isValidScope) {
+            console.warn(`registerShortcut: invalid scope '${scope}'. Valid scopes are: global, player, library, settings, or plugin-{id}`);
+        }
+        
+        // Conflict detection: warn if key+scope is already registered
+        const compositeKey = this._compositeKey(key, scope);
+        if (this.shortcuts.has(compositeKey)) {
+            console.warn(`registerShortcut [${this.id}]: '${key}' in scope '${scope}' is already registered; overwriting. Previous:`, this.shortcuts.get(compositeKey));
+        }
+        
+        this.shortcuts.set(compositeKey, { key, description, scope, condition, handler, modifiers });
+    }
+    
+    unregisterShortcut(key, scope) {
+        return this.shortcuts.delete(this._compositeKey(key, scope));
+    }
+    
+    clearShortcuts() {
+        this.shortcuts.clear();
+    }
+    
+    listShortcuts() {
+        return Array.from(this.shortcuts.entries()).map(([ck, s]) => [s.key, s]);
+    }
+}
+
+// Global panel management
+const _panels = new Map();
+let _activePanel = null;
+let _defaultPanel = null;
+
+// Create default panel on init
+const defaultPanel = new ShortcutPanel('default');
+_panels.set('default', defaultPanel);
+_defaultPanel = 'default';
+_activePanel = 'default';
+
+// ── Panel API ───────────────────────────────────────────────────────────────
+
+window.createShortcutPanel = (id) => {
+    if (_panels.has(id)) {
+        console.warn(`createShortcutPanel: panel '${id}' already exists`);
+        return _panels.get(id);
+    }
+    const panel = new ShortcutPanel(id);
+    _panels.set(id, panel);
+    return panel;
+};
+
+window.setActiveShortcutPanel = (id) => {
+    if (!_panels.has(id)) {
+        console.error(`setActiveShortcutPanel: panel '${id}' does not exist`);
+        return;
+    }
+    _activePanel = id;
+};
+
+window.getActiveShortcutPanel = () => _activePanel;
+
+window.isInShortcutPanel = () => {
+    return _activePanel !== 'default';
+};
+
+window.getGlobalShortcutContext = () => {
+    console.warn('getGlobalShortcutContext: Global shortcuts are exceptional. Consider using panel-scoped shortcuts instead.');
+    return _panels.get('default');
+};
+
+// ── Shortcut registry (routes to active panel) ───────────────────────────────
+
+window.registerShortcut = (options) => {
+    const panelId = _activePanel || _defaultPanel || 'default';
+    const panel = _panels.get(panelId);
+    
+    if (!panel) {
+        console.error(`registerShortcut: No panel found for registration: ${panelId}`);
+        return;
+    }
+    
+    panel.registerShortcut(options);
+};
+
+window.unregisterShortcut = (key, scope) => {
+    // Try the active panel first to preserve panel isolation; fall back to
+    // other panels so a shortcut registered before a panel switch is still
+    // removable.
+    const resolvedScope = scope || 'global';
+    const activePanelId = _activePanel || _defaultPanel || 'default';
+    const activePanel = _panels.get(activePanelId);
+    if (activePanel && activePanel.unregisterShortcut(key, resolvedScope)) {
+        return true;
+    }
+    for (const [panelId, panel] of _panels) {
+        if (panelId === activePanelId) continue;
+        if (panel.unregisterShortcut(key, resolvedScope)) {
+            return true;
+        }
+    }
+    return false;
+};
+
+window.clearWindowShortcuts = (windowId) => {
+    // Remove all shortcuts registered for a specific window
+    // This is for backward compatibility with window-specific shortcuts
+    let removed = 0;
+    for (const [panelId, panel] of _panels) {
+        if (panelId.startsWith(`window-${windowId}`)) {
+            panel.clearShortcuts();
+            _panels.delete(panelId);
+            removed++;
+        }
+    }
+    return removed;
+};
+
+function _getCurrentContext() {
+    const currentScreen = document.querySelector('.screen.active')?.id;
+    return {
+        screen: currentScreen,
+        windowId: window.getShortcutWindowId(),
+        activePanel: _activePanel,
+        isPlayer: currentScreen === 'player',
+        isLibrary: ['home', 'favorites'].includes(currentScreen),
+        isSettings: currentScreen === 'settings',
+        isPlugin: currentScreen?.startsWith('plugin-')
+    };
+}
+
+function _isShortcutActive(shortcut, ctx) {
+    if (shortcut.scope === 'global') return true;
+    if (shortcut.scope === 'player' && ctx.isPlayer) return true;
+    if (shortcut.scope === 'library' && ctx.isLibrary) return true;
+    if (shortcut.scope === 'settings' && ctx.isSettings) return true;
+    if (shortcut.scope.startsWith('plugin-')) {
+        const pluginId = shortcut.scope.replace('plugin-', '');
+        return ctx.screen === `plugin-${pluginId}`;
+    }
+    return false;
+}
+
+function _modifiersMatch(e, modifiers) {
+    if (!modifiers) return true;
+    if (modifiers.ctrl !== undefined && modifiers.ctrl !== e.ctrlKey) return false;
+    if (modifiers.alt !== undefined && modifiers.alt !== e.altKey) return false;
+    if (modifiers.shift !== undefined && modifiers.shift !== e.shiftKey) return false;
+    if (modifiers.meta !== undefined && modifiers.meta !== e.metaKey) return false;
+    return true;
+}
+
+// Debug mode for keyboard shortcuts
+let _DEBUG_SHORTCUTS = false;
+
+window._setDebugShortcuts = (enabled) => {
+    _DEBUG_SHORTCUTS = enabled;
+    console.log(`[Shortcuts] Debug mode ${enabled ? 'ENABLED' : 'DISABLED'}`);
+};
+
+window._listShortcuts = () => {
+    console.log('=== Registered Shortcuts ===');
+    for (const [panelId, panel] of _panels) {
+        console.log(`Panel: ${panelId}`);
+        for (const [, s] of panel.shortcuts) {
+            console.log(`  ${s.key.padEnd(15)} | ${s.scope.padEnd(10)} | ${s.description}`);
+        }
+    }
+    console.log('=== End ===');
+};
+
+window._testShortcut = (key, scope) => {
+    // Mirror the dispatcher: try the active panel first, then default.
+    const resolvedScope = scope || 'global';
+    const tried = new Set();
+    const panelOrder = [_activePanel, _defaultPanel, 'default'].filter(id => {
+        if (!id || tried.has(id)) return false;
+        tried.add(id);
+        return true;
+    });
+
+    for (const panelId of panelOrder) {
+        const panel = _panels.get(panelId);
+        if (!panel) continue;
+        const shortcut = panel.shortcuts.get(panel._compositeKey(key, resolvedScope));
+        if (!shortcut) continue;
+
+        const ctx = _getCurrentContext();
+        const active = _isShortcutActive(shortcut, ctx);
+        let conditionMet = true;
+        if (shortcut.condition) {
+            try { conditionMet = !!shortcut.condition(); }
+            catch (err) { conditionMet = `threw: ${err.message}`; }
+        }
+        console.log(`Shortcut '${key}' [${resolvedScope}] [${panelId}]:`, {
+            description: shortcut.description,
+            scope: shortcut.scope,
+            currentContext: ctx,
+            isActive: active,
+            conditionMet
+        });
+        return;
+    }
+
+    console.log(`Shortcut '${key}' (scope: ${resolvedScope}) not registered in any panel`);
+};
+
+// Expose internals for debugging (prefixed with _ to indicate private)
+// These are for development/debugging only and should not be used by plugins.
+window._panels = _panels;
+window._getCurrentContext = _getCurrentContext;
+window._isShortcutActive = _isShortcutActive;
+
+// ── Registry-based keydown handler ─────────────────────────────────────────
+//
+// This handler processes all registered shortcuts through the central registry.
+// It runs after the library navigation handler (which handles /, ?, c, f, e, etc.)
+// and before any other keydown listeners.
+
 document.addEventListener('keydown', e => {
-    if (!document.getElementById('player').classList.contains('active')) return;
-    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
-    else if (e.code === 'ArrowLeft') seekBy(-5);
-    else if (e.code === 'ArrowRight') seekBy(5);
-    else if (e.code === 'Escape') showScreen(_playerOriginScreen || 'home');
-    // A/V offset live-calibration — watch the highway and listen to
-    // the audio while tuning. Shift for coarse ±50 ms, bare key for
-    // fine ±10 ms. Match on e.key (the produced character) rather
-    // than e.code (physical-key position) so layouts where `[`/`]`
-    // are AltGr combinations (QWERTZ, AZERTY) still fire correctly.
-    else if (e.key === '[') { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ? -50 : -10); }
-    else if (e.key === ']') { e.preventDefault(); nudgeAvOffsetMs(e.shiftKey ?  50 :  10); }
+    // Don't intercept if typing in an input field
+    if (_isTextInput(e.target) || _isInsideInteractiveControl(e.target)) return;
+
+    const ctx = _getCurrentContext();
+    const activePanel = _panels.get(_activePanel);
+    const defaultPanel = _panels.get('default');
+    
+    if (!activePanel && !defaultPanel) return;
+
+    if (_DEBUG_SHORTCUTS) {
+        console.log('[Shortcuts] Key pressed:', { key: e.key, code: e.code, ctx, activePanel: _activePanel });
+    }
+
+    // Try active panel first, then fall back to default
+    const panelsToDispatch = [];
+    if (activePanel && activePanel !== defaultPanel) panelsToDispatch.push(activePanel);
+    if (defaultPanel) panelsToDispatch.push(defaultPanel);
+
+    for (const panel of panelsToDispatch) {
+        for (const [, shortcut] of panel.shortcuts) {
+        // Match on both e.key (character produced) and e.code (physical key)
+        if (e.key !== shortcut.key && e.code !== shortcut.key) continue;
+
+        // Check modifier keys if specified
+        if (!_modifiersMatch(e, shortcut.modifiers)) continue;
+
+        if (_DEBUG_SHORTCUTS) {
+            console.log('[Shortcuts] Matched shortcut:', shortcut.key, shortcut);
+        }
+
+        // Check scope
+        if (!_isShortcutActive(shortcut, ctx)) {
+            if (_DEBUG_SHORTCUTS) {
+                console.log('[Shortcuts] Not active - scope mismatch:', shortcut.scope, ctx);
+            }
+            continue;
+        }
+
+        // Check condition callback — guard against plugin errors
+        if (shortcut.condition) {
+            try {
+                if (!shortcut.condition()) {
+                    if (_DEBUG_SHORTCUTS) {
+                        console.log('[Shortcuts] Not active - condition failed');
+                    }
+                    continue;
+                }
+            } catch (err) {
+                console.error('[Shortcuts] condition() threw for key:', shortcut.key, err);
+                continue;
+            }
+        }
+
+        e.preventDefault();
+        if (_DEBUG_SHORTCUTS) {
+            console.log('[Shortcuts] Executing handler for:', shortcut.key);
+        }
+        // Guard handler against plugin errors
+        try {
+            shortcut.handler(e);
+        } catch (err) {
+            console.error('[Shortcuts] handler() threw for key:', shortcut.key, err);
+        }
+        return;
+    }
+}
+
+    if (_DEBUG_SHORTCUTS) {
+        console.log('[Shortcuts] No shortcut matched for:', e.key, e.code);
+    }
+});
+
+// ── Window cleanup ───────────────────────────────────────────────────────────
+// Clean up window-specific shortcuts when a window is closed.
+// This is important for popup windows (e.g., splitscreen plugin) that
+// may be closed by the user.
+
+window.addEventListener('beforeunload', () => {
+    const windowId = window.getShortcutWindowId();
+    const removed = window.clearWindowShortcuts(windowId);
+    if (removed > 0 && _DEBUG_SHORTCUTS) {
+        console.log(`[Shortcuts] Cleaned up ${removed} shortcuts for window ${windowId}`);
+    }
+});
+
+// ── Register built-in shortcuts ───────────────────────────────────────────
+
+// Global shortcuts
+registerShortcut({
+    key: '?',
+    description: 'Show keyboard shortcuts',
+    scope: 'global',
+    handler: () => _openShortcutsModal()
+});
+
+// Library shortcuts
+registerShortcut({
+    key: '/',
+    description: 'Focus search',
+    scope: 'library',
+    handler: () => {
+        const input = _activeSearchInput();
+        if (input) input.focus();
+    }
+});
+
+registerShortcut({
+    key: 'c',
+    description: 'Convert PSARC entry to .sloppak',
+    scope: 'library',
+    handler: () => {
+        // Handled by library navigation - this is for documentation only
+    }
+});
+
+registerShortcut({
+    key: 'f',
+    description: 'Toggle favorite',
+    scope: 'library',
+    handler: () => {
+        // Handled by library navigation - this is for documentation only
+    }
+});
+
+registerShortcut({
+    key: 'e',
+    description: 'Edit metadata',
+    scope: 'library',
+    handler: () => {
+        // Handled by library navigation - this is for documentation only
+    }
+});
+
+// Player shortcuts
+registerShortcut({
+    key: 'Space',
+    description: 'Play/Pause',
+    scope: 'player',
+    handler: () => togglePlay()
+});
+
+registerShortcut({
+    key: 'ArrowLeft',
+    description: 'Seek back 5 seconds',
+    scope: 'player',
+    handler: () => seekBy(-5)
+});
+
+registerShortcut({
+    key: 'ArrowRight',
+    description: 'Seek forward 5 seconds',
+    scope: 'player',
+    handler: () => seekBy(5)
+});
+
+registerShortcut({
+    key: 'Escape',
+    description: 'Back to library',
+    scope: 'player',
+    handler: () => showScreen(_playerOriginScreen || 'home')
+});
+
+registerShortcut({
+    key: 'Escape',
+    description: 'Go back to previous screen',
+    scope: 'settings',
+    handler: () => showScreen(_settingsOriginScreen || 'home')
+});
+
+registerShortcut({
+    key: '[',
+    description: 'Offset audio back (Shift: 50ms, else 10ms)',
+    scope: 'player',
+    handler: (e) => nudgeAvOffsetMs(e.shiftKey ? -50 : -10)
+});
+
+registerShortcut({
+    key: ']',
+    description: 'Offset audio forward (Shift: 50ms, else 10ms)',
+    scope: 'player',
+    handler: (e) => nudgeAvOffsetMs(e.shiftKey ? 50 : 10)
+});
+
+registerShortcut({
+    key: '+',
+    description: 'Volume up',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(1)
+});
+
+// Layout-portable alias — matches the physical "=/+" key (e.code === 'Equal')
+// regardless of keyboard layout or shift state, so non-US layouts that
+// don't map Shift+= to '+' still work.
+registerShortcut({
+    key: 'Equal',
+    description: 'Volume up',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(1)
+});
+
+registerShortcut({
+    key: '-',
+    description: 'Volume down',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(-1)
+});
+
+registerShortcut({
+    key: 'Minus',
+    description: 'Volume down',
+    scope: 'player',
+    modifiers: { ctrl: false, alt: false, meta: false },
+    handler: () => _adjustSongVolume(-1)
 });
 
 // ── Edit metadata modal ─────────────────────────────────────────────────
@@ -3604,6 +5275,10 @@ function openEditModal(songData, openerEl) {
                 <button data-edit-close
                     class="px-4 py-2 bg-dark-600 hover:bg-dark-500 rounded-xl text-sm text-gray-300 transition">Cancel</button>
             </div>
+            <div class="mt-4 pt-4 border-t border-gray-800">
+                <button data-delete-filename="${_escAttr(songData.f)}"
+                    class="w-full px-4 py-2 bg-red-900/30 hover:bg-red-900/60 border border-red-900/50 hover:border-red-700 rounded-xl text-sm text-red-300 hover:text-red-100 transition">Remove from library</button>
+            </div>
         </div>`;
     document.body.appendChild(modal);
 
@@ -3630,6 +5305,13 @@ function openEditModal(songData, openerEl) {
     document.getElementById('edit-art-wrapper').addEventListener('click', () => {
         document.getElementById('edit-art-file').click();
     });
+
+    const deleteBtn = modal.querySelector('[data-delete-filename]');
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', () => {
+            deleteSongFromModal(deleteBtn.dataset.deleteFilename);
+        });
+    }
 
     // Close on backdrop click or Cancel button; restore focus to opener.
     modal.addEventListener('click', (e) => {
@@ -3692,6 +5374,86 @@ async function saveEditModal(encodedFilename) {
     const activeScreen = document.querySelector('.screen.active');
     if (activeScreen?.id === 'favorites') loadFavorites();
     else loadLibrary();
+}
+
+async function deleteSongFromModal(filename) {
+    const title = (document.getElementById('edit-title')?.value || filename).trim();
+    const ok = await _confirmDialog({
+        title: 'Remove from library?',
+        body: `<p class="text-sm text-gray-300">Remove <span class="font-semibold text-white">${_escAttr(title)}</span> from your library?</p>
+               <p class="text-xs text-red-400/90 mt-2">This permanently deletes the file from disk. This cannot be undone.</p>`,
+        confirmText: 'Remove',
+        cancelText: 'Cancel',
+        danger: true,
+    });
+    if (!ok) return;
+    let resp;
+    try {
+        resp = await fetch(`/api/song/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+    } catch (e) {
+        alert(`Delete failed: ${e.message}`);
+        return;
+    }
+    if (!resp.ok) {
+        let msg = resp.statusText;
+        try { msg = (await resp.json()).error || msg; } catch (_) {}
+        alert(`Delete failed: ${msg}`);
+        return;
+    }
+    const modal = document.getElementById('edit-modal');
+    if (modal) modal.remove();
+    _treeStats = null;
+    _favTreeStats = null;
+    _tuningNames = null;
+
+    // Remove the deleted song's card from any currently-rendered grid/tree
+    // so the user sees it disappear without waiting for a refetch. A full
+    // loadLibrary() here would re-call loadGridPage(currentPage), which
+    // uses 'append' mode when currentPage > 0 and re-appends the same
+    // (now-shortened) page on top of what's already rendered — leaving
+    // the deleted card visible. Direct DOM removal also preserves scroll
+    // position, which a refetch from page 0 would lose.
+    _removeLibCardsForFilename(filename);
+
+    // Tree views group by artist with song counts; a single card removal
+    // leaves stale counts, so refresh the tree for whichever screen we're
+    // looking at (each tree-view renderer replaces innerHTML cleanly).
+    const activeScreen = document.querySelector('.screen.active');
+    if (activeScreen?.id === 'favorites') {
+        // loadFavorites() routes to either loadFavGridPage (always
+        // 'replace') or loadFavTreeView — both safe for a single delete.
+        loadFavorites();
+    } else if (libView === 'tree') {
+        loadTreeView();
+    }
+    // Main library grid view: DOM removal above is sufficient.
+}
+
+function _removeLibCardsForFilename(filename) {
+    // The grid uses data-play="<encoded filename>" on each card; the
+    // tree's song rows use the same attribute. encodeURIComponent
+    // matches what renderGridCards / the tree renderer emit.
+    const encoded = encodeURIComponent(filename);
+    const selector = `[data-play="${CSS.escape(encoded)}"]`;
+    let removed = 0;
+    for (const el of document.querySelectorAll(selector)) {
+        el.remove();
+        removed++;
+    }
+    if (removed === 0) return;
+    // Decrement the visible count badges that loadGridPage / loadTreeView
+    // populated. Counts come from the server's `total` so this is a
+    // best-effort estimate until the next refetch, but it keeps the
+    // displayed number consistent with what's on screen right now.
+    for (const id of ['lib-count', 'fav-count']) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const m = (el.textContent || '').match(/^(\d+)/);
+        if (!m) continue;
+        const next = Math.max(0, parseInt(m[1], 10) - removed);
+        el.textContent = (el.textContent || '').replace(/^\d+/, String(next));
+    }
+    _bumpLibNavGeneration();
 }
 
 // Delegated click handlers
@@ -3954,11 +5716,85 @@ async function loadPlugins() {
 
         const settingsContainer = document.getElementById('plugin-settings');
 
-        // One-shot hydration guard: always clear plugin-owned containers first.
+        // Plugins whose screen.js has already been evaluated this session
+        // at the current version AND whose DOM is still in the document.
+        // Their listeners were bound to the existing settings / screen DOM,
+        // so we must preserve that DOM — the script load guard below skips
+        // re-evaluating screen.js, and a fresh empty DOM with no listeners
+        // would leave the plugin half-hydrated on subsequent loadPlugins()
+        // calls (e.g. _scheduleStartupRehydration).
+        //
+        // The DOM-existence check is the safety net for plugins that
+        // disappeared and reappeared between calls (uninstall + reinstall,
+        // or a backend snapshot churn that drops a plugin then restores
+        // it). In that case the loadedScripts key would still be set, but
+        // any listeners are bound to elements that have since been removed
+        // — drop the stale key so screen.js re-runs against the fresh DOM
+        // we're about to inject.
+        // Map<pluginId, version> — one entry per plugin. Storing only the
+        // currently-loaded version (rather than a Set of all (id, version)
+        // pairs ever loaded) means upgrade → downgrade → upgrade cycles
+        // within one session don't leave stale keys that could mistakenly
+        // mark an old version as already-hydrated. Coerce a legacy Set, if
+        // present, to an empty Map — the previous shape never shipped.
+        let loadedScripts = window.slopsmith._loadedPluginScripts;
+        if (!(loadedScripts instanceof Map)) {
+            loadedScripts = new Map();
+            window.slopsmith._loadedPluginScripts = loadedScripts;
+        }
+        const _removePluginScriptTags = (pluginId) => {
+            // Filter via dataset rather than a CSS attribute selector —
+            // CSS.escape is not universally available, and plugin IDs
+            // aren't constrained server-side.
+            document.querySelectorAll('script[data-plugin-id]').forEach((s) => {
+                if (s.dataset.pluginId === pluginId) s.remove();
+            });
+        };
+        const existingSettingsByPluginId = new Map();
+        if (settingsContainer) {
+            for (const child of settingsContainer.children) {
+                const pid = child.dataset ? child.dataset.pluginId : null;
+                if (pid) existingSettingsByPluginId.set(pid, child);
+            }
+        }
+        const alreadyHydrated = new Set();
+        for (const p of plugins) {
+            if (!p.has_script) continue;
+            // Version must match exactly — an upgrade / downgrade has to
+            // re-run the new script against fresh DOM.
+            if (loadedScripts.get(p.id) !== (p.version || '')) continue;
+            const screenOk = !p.has_screen || !!document.getElementById(`plugin-${p.id}`);
+            const settingsOk = !p.has_settings || existingSettingsByPluginId.has(p.id);
+            if (screenOk && settingsOk) {
+                alreadyHydrated.add(p.id);
+            } else {
+                // DOM was wiped externally (uninstall + reinstall, snapshot
+                // churn) — drop the entry and remove the orphaned <script>
+                // so screen.js re-runs against fresh DOM below.
+                loadedScripts.delete(p.id);
+                _removePluginScriptTags(p.id);
+            }
+        }
+
+        // Clear plugin-owned containers, but keep already-hydrated plugins'
+        // settings / screen DOM. Nav links carry no per-plugin script state,
+        // so always rebuild them.
         navContainer.innerHTML = '';
         mobileNavContainer.innerHTML = '<span class="text-xs text-gray-600 uppercase tracking-wider">Plugins</span>';
-        if (settingsContainer) settingsContainer.innerHTML = '';
-        document.querySelectorAll('.screen[id^="plugin-"]').forEach((el) => el.remove());
+        if (settingsContainer) {
+            [...settingsContainer.children].forEach((el) => {
+                const pid = el.dataset ? el.dataset.pluginId : null;
+                if (!pid || !alreadyHydrated.has(pid)) el.remove();
+            });
+        }
+        document.querySelectorAll('.screen[id^="plugin-"]').forEach((el) => {
+            // dataset.pluginId is the source of truth (set on injection);
+            // the id-prefix fallback covers screens injected before this
+            // change shipped — both forms strip a single leading "plugin-".
+            const pid = (el.dataset && el.dataset.pluginId)
+                || el.id.replace(/^plugin-/, '');
+            if (!alreadyHydrated.has(pid)) el.remove();
+        });
 
         // Plugin settings area hosts both "Plugin Updates" and per-plugin
         // collapsibles. Reveal it whenever any plugins are installed —
@@ -3978,7 +5814,7 @@ async function loadPlugins() {
                     Plugins
                     <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
                 </button>
-                <div class="hidden absolute top-full left-0 mt-2 bg-dark-800 border border-gray-700 rounded-xl shadow-xl py-2 min-w-[180px] z-50" id="plugin-dropdown"></div>`;
+                <div class="hidden absolute top-full left-0 mt-2 bg-dark-800 border border-gray-700 rounded-xl shadow-xl py-2 min-w-[180px] max-h-[80vh] overflow-y-auto z-50" id="plugin-dropdown"></div>`;
             navContainer.appendChild(dropdown);
             const ddMenu = dropdown.querySelector('#plugin-dropdown');
 
@@ -4010,11 +5846,17 @@ async function loadPlugins() {
             try {
             const screenId = `plugin-${plugin.id}`;
 
-            // Inject screen container
-            if (plugin.has_screen) {
+            // Inject screen container. Skip for already-hydrated plugins —
+            // their existing screen DOM still has the listeners that
+            // screen.js bound on first load (rebuilding here would orphan
+            // them, since the script load guard further down won't re-run
+            // screen.js to re-bind).
+            if (plugin.has_screen && !alreadyHydrated.has(plugin.id)) {
                 const screenDiv = document.createElement('div');
                 screenDiv.id = screenId;
                 screenDiv.className = 'screen';
+                screenDiv.dataset.pluginId = plugin.id;
+                screenDiv.dataset.pluginVersion = plugin.version || '';
                 // Insert before the player screen
                 const player = document.getElementById('player');
                 player.parentNode.insertBefore(screenDiv, player);
@@ -4026,9 +5868,14 @@ async function loadPlugins() {
             // Inject settings section — wrapped in a collapsible <details>
             // per plugin so the page stays scannable as plugins accumulate.
             // Collapsed by default; <details>/<summary> handles state natively.
-            if (plugin.has_settings && settingsContainer) {
+            // Skip for already-hydrated plugins — preserved details element
+            // still carries listeners wired by its inline settings script
+            // and by screen.js on first load.
+            if (plugin.has_settings && settingsContainer && !alreadyHydrated.has(plugin.id)) {
                 const details = document.createElement('details');
                 details.className = 'bg-dark-700/40 border border-gray-800 rounded-xl overflow-hidden group';
+                details.dataset.pluginId = plugin.id;
+                details.dataset.pluginVersion = plugin.version || '';
 
                 const summary = document.createElement('summary');
                 // .plugin-settings-summary class hides the browser's native
@@ -4144,13 +5991,27 @@ async function loadPlugins() {
 
             // Load plugin JS
             if (plugin.has_script) {
-                await new Promise((resolve, reject) => {
-                    const script = document.createElement('script');
-                    script.src = `/api/plugins/${plugin.id}/screen.js`;
-                    script.onload = resolve;
-                    script.onerror = reject;
-                    document.body.appendChild(script);
-                });
+                const wantedVersion = plugin.version || '';
+                if (loadedScripts.get(plugin.id) !== wantedVersion) {
+                    // A different version (or none) was loaded previously —
+                    // remove the prior <script> tag for this plugin id so we
+                    // don't accumulate stale versions on upgrade/downgrade.
+                    _removePluginScriptTags(plugin.id);
+                    await new Promise((resolve, reject) => {
+                        const script = document.createElement('script');
+                        // Include version in URL so a plugin upgrade within the
+                        // same browser session fetches the new screen.js instead
+                        // of a cached copy keyed only by path (matches the art
+                        // URL ?v=mtime convention elsewhere in this file).
+                        const v = encodeURIComponent(wantedVersion);
+                        script.src = `/api/plugins/${plugin.id}/screen.js${v ? `?v=${v}` : ''}`;
+                        script.dataset.pluginId = plugin.id;
+                        script.dataset.pluginVersion = wantedVersion;
+                        script.onload = () => { loadedScripts.set(plugin.id, wantedVersion); resolve(); };
+                        script.onerror = (err) => { loadedScripts.delete(plugin.id); reject(err); };
+                        document.body.appendChild(script);
+                    });
+                }
             }
             } catch (e) {
                 console.warn(`Plugin '${plugin.id}' failed to load, skipping:`, e);
@@ -4218,6 +6079,27 @@ async function bootstrapPluginsAndUi() {
 // before any playSong runs — otherwise a fast click could start
 // playback with stale settings before /api/settings returned.
 (async () => {
+    // Splitscreen pop-out windows (`?ssFollower=1`) load this same app but
+    // get driven into "follower mode" by the splitscreen plugin once it
+    // loads — which is *after* this init runs. Without this, the library
+    // (`#home`, marked `active` in index.html) renders and paints first, so
+    // the popup briefly flashes the song grid before swapping to the player.
+    // Switch to the player screen up front so the popup shows player chrome
+    // (empty, then populated by the plugin) the whole time. The wasted
+    // library fetch below is negligible next to the whole-app + every-plugin
+    // re-load a popup already does.
+    const isFollowerWindow = (() => {
+        try { return new URLSearchParams(location.search).get('ssFollower') === '1'; }
+        catch (_) { return false; }
+    })();
+    if (isFollowerWindow) {
+        // Await it — showScreen is async, so a bare call would turn even a
+        // synchronous DOM error into an unhandled rejection that this try
+        // couldn't catch. Surface failures (e.g. `#player` missing/renamed)
+        // instead of silently bringing the library flash back.
+        try { await showScreen('player'); }
+        catch (e) { console.warn('[slopsmith] follower-window: showScreen("player") failed:', e); }
+    }
     // Restore library-filter UI state from localStorage before the first
     // grid fetch so the badge/chips are accurate immediately
     // (slopsmith#129).
@@ -4259,9 +6141,43 @@ async function bootstrapPluginsAndUi() {
     fetch('/api/version')
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(d => {
-            const el = document.getElementById('app-version');
             const v = typeof d.version === 'string' ? d.version.trim() : '';
-            if (el && v && v.toLowerCase() !== 'unknown') el.textContent = 'v' + v;
+            if (v && v.toLowerCase() !== 'unknown') {
+                const navEl = document.getElementById('app-version');
+                if (navEl) navEl.textContent = 'v' + v;
+                const aboutEl = document.getElementById('app-version-about');
+                if (aboutEl) aboutEl.textContent = 'v' + v;
+            }
+            // Defense-in-depth: server validates the env-var-supplied URLs,
+            // but the About <a href> values are configurable so the UI also
+            // rejects anything that isn't http(s) with a non-empty hostname.
+            // A bare regex prefix check would accept malformed values like
+            // "https://" — `new URL` + protocol + hostname catches them
+            // (and `hostname`, not `host`, so port-only authorities like
+            // "http://:80/path" are rejected too).
+            // The source and license links are checked independently so a
+            // rejected source_url doesn't gate a valid license_url.
+            const isSafeHref = (u) => {
+                if (typeof u !== 'string' || !u) return false;
+                try {
+                    const parsed = new URL(u);
+                    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+                    // `host` includes the port — "http://:80/path" has
+                    // host ":80" but no real hostname. `hostname` is what
+                    // we actually want.
+                    return !!parsed.hostname;
+                } catch (_) {
+                    return false;
+                }
+            };
+            if (isSafeHref(d.source_url)) {
+                const srcLink = document.getElementById('about-source-link');
+                if (srcLink) srcLink.href = d.source_url;
+            }
+            if (isSafeHref(d.license_url)) {
+                const licLink = document.getElementById('about-license-link');
+                if (licLink) licLink.href = d.license_url;
+            }
         })
         .catch(() => {});
 })();

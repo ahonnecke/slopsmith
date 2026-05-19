@@ -31,7 +31,8 @@ import yaml
 
 from patcher import unpack_psarc
 from song import load_song, arrangement_to_wire
-from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd
+from tones import extract_tones_for_song
+from audio import find_wem_files, _vgmstream_cmd, _ffmpeg_cmd, _ffmpeg_wav_to_ogg
 
 
 ProgressCB = Optional[Callable[[float, str, str], None]]
@@ -80,10 +81,7 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
                 f"vgmstream-cli failed: {r.stderr.decode(errors='replace')}"
             )
         out_ogg.parent.mkdir(parents=True, exist_ok=True)
-        r2 = subprocess.run(
-            [ffmpeg, "-y", "-i", str(wav), "-c:a", "libvorbis", "-q:a", "5", str(out_ogg)],
-            capture_output=True,
-        )
+        r2 = _ffmpeg_wav_to_ogg(ffmpeg, wav, out_ogg)
         if r2.returncode != 0 or not out_ogg.exists() or out_ogg.stat().st_size < 100:
             raise RuntimeError(
                 f"ffmpeg OGG encode failed: {r2.stderr.decode(errors='replace')}"
@@ -149,6 +147,28 @@ def _zip_dir(src_dir: Path, out_zip: Path) -> None:
                 zf.write(f, f.relative_to(src_dir).as_posix())
 
 
+def _remove_path(p: Path) -> None:
+    """Remove `p` whether it is a file or a directory; no-op if absent.
+
+    Sloppak outputs can be either zip-form (file) or dir-form
+    (directory), so staging / backup paths next to them may need to
+    survive crossing between the two forms — e.g. a leftover
+    `<out>.sloppak.tmp` file from a killed zip-form convert getting
+    cleaned up before a fresh `as_dir=True` convert stages its own
+    directory at the same path. Using a single helper keeps the call
+    sites symmetric and prevents `NotADirectoryError` /
+    `IsADirectoryError` from a mismatched cleanup primitive."""
+    if p.is_symlink():
+        # Symlinks should never appear inside our staging paths, but if
+        # one does, drop the link itself rather than follow it.
+        p.unlink(missing_ok=True)
+        return
+    if p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+    elif p.exists():
+        p.unlink(missing_ok=True)
+
+
 # ── PSARC → sloppak ───────────────────────────────────────────────────────────
 
 def convert_psarc_to_sloppak(
@@ -169,11 +189,27 @@ def convert_psarc_to_sloppak(
         if not song.arrangements:
             raise RuntimeError("no playable arrangements found in PSARC")
 
+        # Lift tone data (gear definitions + in-song tone changes) out of the
+        # unpacked PSARC once — PSARCs keep tones in the manifest JSON /
+        # arrangement XML, neither of which survives into the sloppak, so
+        # without this the converted sloppak loses all tones. Done in one
+        # pass (not per arrangement) to avoid re-scanning the extracted tree.
+        try:
+            tones_by_arr = extract_tones_for_song(
+                tmp_extract, [a.name for a in song.arrangements]
+            )
+        except Exception as e:
+            log.warning("tone extraction failed: %s", e, exc_info=True)
+            tones_by_arr = {}
+
         used_ids: set[str] = set()
         arr_manifest: list[dict] = []
         first = True
         for arr in song.arrangements:
             aid = _arrangement_id(arr.name, used_ids)
+            # Attach tones to the Arrangement so arrangement_to_wire owns the
+            # serialization (single source of truth for the wire schema).
+            arr.tones = tones_by_arr.get(arr.name)
             wire = arrangement_to_wire(arr)
             if first:
                 wire["beats"] = [
@@ -234,18 +270,79 @@ def convert_psarc_to_sloppak(
         )
 
         _progress(progress_cb, 0.85, "packing", "Writing output")
+        # Atomic write: build the output at a sibling `.tmp` path first,
+        # then move/rename onto `out_path`. Without this, a kill mid-write
+        # leaves a partial / truncated `.sloppak` (or worse, a half-deleted
+        # dir-form output) on disk; the host's library scan keys off the
+        # filename, so the broken file shows up as a "real" sloppak until
+        # the next successful re-conversion overwrites it.
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_out = out_path.with_name(out_path.name + ".tmp")
+        # Pre-clean stale `.tmp` from a previously-killed convert.
+        # `_remove_path` handles either form, so a zip-form `.tmp` left
+        # behind by an earlier `as_dir=False` crash doesn't block a new
+        # `as_dir=True` stage (or vice versa).
+        _remove_path(tmp_out)
         if as_dir:
+            shutil.copytree(work_dir, tmp_out)
+            # Directory rename-onto-existing isn't portable (`os.replace`
+            # raises on Windows when dst is a non-empty dir, and POSIX
+            # `rename(2)` only swaps empty dirs). Two-step swap via a
+            # `.old` sidecar so the failure window is bounded to one
+            # rename; on Windows the dst-exists case is still a brief
+            # absence rather than a partial dir.
+            backup = out_path.with_name(out_path.name + ".old")
+            # Backup slot may pre-exist as either file or dir — could
+            # be a leftover from a prior killed `as_dir=True` swap, or
+            # a stray file a user dropped there. Clear either form.
+            _remove_path(backup)
+            # `out_path` itself may pre-exist as either form (user
+            # reconverting `as_dir=True` over a previous zip-form
+            # sloppak, or vice versa). `rename` on a file works the
+            # same as on a dir, so no type sniff needed.
             if out_path.exists():
-                shutil.rmtree(out_path)
-            shutil.copytree(work_dir, out_path)
+                out_path.rename(backup)
+            try:
+                tmp_out.rename(out_path)
+            except Exception:
+                if backup.exists():
+                    backup.rename(out_path)
+                raise
+            # Backup may itself be either form (we just renamed
+            # whatever was at out_path into it); use the helper.
+            _remove_path(backup)
         else:
-            _zip_dir(work_dir, out_path)
+            _zip_dir(work_dir, tmp_out)
+            # `os.replace` can swap file-onto-file atomically, but
+            # cannot replace a non-empty directory with a file (POSIX
+            # `rename(2)` returns ENOTDIR/EISDIR; Windows fails the
+            # same way). If `out_path` is a dir-form sloppak left from
+            # a prior `as_dir=True` convert, clear it first. The brief
+            # absence window between rmtree and os.replace mirrors the
+            # dir→dir swap path's bounded gap; without this the convert
+            # would crash and the user would have to manually delete
+            # the dir to recover.
+            if out_path.is_dir():
+                _remove_path(out_path)
+            os.replace(tmp_out, out_path)
 
         _progress(progress_cb, 1.0, "done", f"Wrote {out_path.name}")
         return out_path
     finally:
         shutil.rmtree(tmp_extract, ignore_errors=True)
         shutil.rmtree(work_dir, ignore_errors=True)
+        # Clean up staging sidecars left behind if we bailed before the
+        # rename. The happy path already moved `.tmp` onto `out_path`
+        # and removed `.old`, so these are no-ops there. The `.old`
+        # leg matters specifically for kills after `out_path.rename(backup)`
+        # but before `tmp_out.rename(out_path)` in the `as_dir=True` path
+        # — without this, a stale `.old` dir accumulates next to the
+        # (re-created) `out_path` across crashes.
+        for sidecar in (
+            out_path.with_name(out_path.name + ".tmp"),
+            out_path.with_name(out_path.name + ".old"),
+        ):
+            _remove_path(sidecar)
 
 
 # ── Stem splitting via Demucs ────────────────────────────────────────────────
@@ -335,30 +432,111 @@ def _run_demucs_remote(full_ogg: Path, out_dir: Path, model: str) -> Path:
 
 def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", str(out_dir), str(full_ogg)]
-    # Point model-weight caches at the persistent config volume so we don't
-    # re-download on every container restart (~300MB per model).
     env = os.environ.copy()
     config_dir = env.get("CONFIG_DIR", "/config")
     cache_root = Path(config_dir) / "torch_cache"
     cache_root.mkdir(parents=True, exist_ok=True)
     env.setdefault("TORCH_HOME", str(cache_root))
     env.setdefault("XDG_CACHE_HOME", str(cache_root))
+    # Pin demucs to the bundled ffmpeg/ffprobe. demucs.audio probes the
+    # child's PATH for both binaries (ffprobe first, for stream metadata)
+    # and falls back to torchcodec when missing; the desktop bundle's
+    # torchcodec native shims can't load against the vgmstream-patched
+    # FFmpeg DLLs we ship, so the fallback path is broken — we have to
+    # keep demucs on the ffmpeg/ffprobe path. Resolves to resources/bin/
+    # in desktop builds (lib/sloppak_convert.py → resources/slopsmith/lib
+    # → resources/bin). Gate on vgmstream-cli's presence so we don't
+    # accidentally prepend a system /bin/ (Docker's `/app/lib/...`
+    # resolves parents[2] to `/`, and `/bin/ffprobe` exists there too) —
+    # vgmstream-cli is bundled on every desktop platform and isn't a
+    # typical system binary, so it's a precise signature for the
+    # desktop layout.
+    _bundled_bin = Path(__file__).resolve().parents[2] / "bin"
+    if any((_bundled_bin / name).is_file() for name in ("vgmstream-cli", "vgmstream-cli.exe")):
+        # On Windows the env var is conventionally `Path`, not `PATH`;
+        # os.environ is case-insensitive but os.environ.copy() returns a
+        # plain dict that preserves whatever casing the OS used. If we
+        # blindly write to env["PATH"], Windows ends up with both `Path`
+        # and `PATH` keys in the spawned subprocess's env block — and
+        # which one wins is implementation-defined. Reuse the existing
+        # key's casing (or fall through to "PATH" on Linux/macOS).
+        _path_key = next(
+            (k for k in env if k.upper() == "PATH"),
+            "PATH",
+        )
+        # Avoid producing a trailing separator when the parent PATH is
+        # empty/missing — on some platforms a trailing pathsep implicitly
+        # injects the current directory into the search path.
+        _existing_path = env.get(_path_key, "")
+        env[_path_key] = (
+            str(_bundled_bin) + os.pathsep + _existing_path
+            if _existing_path
+            else str(_bundled_bin)
+        )
     # Propagate in-process sys.path additions (plugin loader adds
     # /config/pip_packages at runtime, not via PYTHONPATH) so the child
-    # python can also find demucs/torch/torchcodec.
+    # python can also find demucs/torch/torchcodec. PYTHONPATH alone
+    # is insufficient on Windows embeddable Python, where the ._pth
+    # file forces isolated mode and the env var is ignored — so we
+    # also inject sys.path explicitly via a -c bootstrap before
+    # delegating to demucs.
     pip_target = str(Path(config_dir) / "pip_packages")
-    extra_paths = [p for p in sys.path if p and p != ""]
+    extra_paths = [p for p in sys.path if p]
+    if pip_target not in extra_paths:
+        extra_paths.insert(0, pip_target)
     merged = os.pathsep.join(
-        [pip_target] + [p for p in extra_paths if p != pip_target]
-        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        extra_paths + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     )
     env["PYTHONPATH"] = merged
+    # torchaudio>=2.11 routes .save() through save_with_torchcodec, which
+    # requires torchcodec. The desktop bundle's torchcodec native shims can't
+    # load against the vgmstream-patched FFmpeg DLLs we ship (see PATH-prepend
+    # rationale above), so the save call dies with OSError; on installs where
+    # torchcodec was dropped from requirements, .save() raises ImportError.
+    # Redirect .save() to soundfile before demucs imports so demucs's per-stem
+    # WAV writes work regardless of torchcodec's state. soundfile is NOT a
+    # transitive demucs dep — the in-app converter plugin (sloppak_converter
+    # >= 1.0.4) ships it via its own requirements.txt, and any other consumer
+    # of this module must do the same. The override stays in place even on
+    # torchaudio versions that wouldn't need it — soundfile's WAV writes are
+    # behaviorally equivalent for demucs's float32 outputs.
+    bootstrap = (
+        "import sys, json, runpy\n"
+        "sys.path[:0] = json.loads(sys.argv[1])\n"
+        "sys.argv = [sys.argv[0]] + sys.argv[2:]\n"
+        "import torchaudio as _ta, soundfile as _sf, numpy as _np\n"
+        "def _ta_save(uri, src, sample_rate, *_a, **_kw):\n"
+        # Honor channels_first (torchaudio default True). demucs calls with
+        # the default; third-party callers may not.
+        "    _cf = _kw.pop('channels_first', True)\n"
+        "    a = src.detach().cpu().numpy() if hasattr(src, 'detach') else _np.asarray(src)\n"
+        "    if a.ndim == 2 and _cf: a = a.T\n"
+        # Pick subtype that preserves bit depth: float32 -> FLOAT,
+        # float64 -> DOUBLE (avoid silent 32-bit downcast), int32 ->
+        # PCM_32, otherwise PCM_16.
+        "    if a.dtype == _np.float64:\n"
+        "        _st = 'DOUBLE'\n"
+        "    elif a.dtype.kind == 'f':\n"
+        "        _st = 'FLOAT'\n"
+        "    elif a.dtype == _np.int32:\n"
+        "        _st = 'PCM_32'\n"
+        "    else:\n"
+        "        _st = 'PCM_16'\n"
+        "    _sf.write(str(uri), a, int(sample_rate), subtype=_st)\n"
+        "_ta.save = _ta_save\n"
+        "runpy.run_module('demucs.__main__', run_name='__main__', alter_sys=True)\n"
+    )
+    cmd = [sys.executable, "-c", bootstrap, json.dumps(extra_paths),
+           "-n", model, "-o", str(out_dir), str(full_ogg)]
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
-        err_tail = (r.stderr or "").strip().splitlines()[-5:]
+        # demucs writes loader errors to stdout, not stderr -- include both
+        # so the surfaced RuntimeError actually points at the cause.
+        out_tail = (r.stdout or "").strip().splitlines()[-8:]
+        err_tail = (r.stderr or "").strip().splitlines()[-8:]
+        tail = " | ".join(out_tail + err_tail) or "(no output)"
         raise RuntimeError(
-            f"demucs exited with code {r.returncode}: " + " | ".join(err_tail)
+            f"demucs exited with code {r.returncode}: " + tail
         )
     track_stem = full_ogg.stem
     result_dir = out_dir / model / track_stem
@@ -374,11 +552,7 @@ def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
 def _encode_ogg(wav_path: Path, ogg_path: Path) -> None:
     ffmpeg = _ffmpeg_cmd() or "ffmpeg"
     ogg_path.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(
-        [ffmpeg, "-y", "-i", str(wav_path),
-         "-c:a", "libvorbis", "-q:a", "5", str(ogg_path)],
-        capture_output=True,
-    )
+    r = _ffmpeg_wav_to_ogg(ffmpeg, wav_path, ogg_path)
     if r.returncode != 0 or not ogg_path.exists():
         raise RuntimeError(
             f"ffmpeg OGG encode failed for {wav_path.name}: "
